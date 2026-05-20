@@ -20,7 +20,9 @@ from core.proof_state import ProofState
 @dataclass(frozen=True)
 class StepResult:
     """
-    The result of applying a single tactic to a proof state.
+    The result of applying a single tactic to a proof state. It is what you get back every time
+    you send a tactic to Lean via executor.step(). The search loop uses this to determine whether the tactic succeeded,
+    whether the proof is closed, and how long the step took.
 
     Exactly one of (next_state,) will be set depending on outcome:
         - Tactic succeeded: next_state is the new ProofState (may be closed)
@@ -92,7 +94,8 @@ class LeanExecutor(Protocol):
         tactic: str,
     ) -> StepResult:
         """
-        Apply a tactic to the given proof state and return the result.
+        Apply a tactic to the given proof state and return the result. Send a tactic, get back a StepResult containing the new ProofState,
+        whether the tactic succeeded, and how long it took.
 
         Args:
             state:  The current proof state. Used to restore the REPL
