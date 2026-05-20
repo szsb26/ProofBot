@@ -1,5 +1,7 @@
 """
-Mock policy for testing the search loop without any API calls.
+Mock policy for testing the search loop without any API calls so we dont blow money on API calls.
+Used mainly to debug the MCTS search infrastructure and ensure that the search loop correctly processes the tactics returned by the policy, 
+updates the proof state, and eventually finds a proof when given a fixed set of tactics that are known to solve the problem.
 
 Returns a fixed list of tactics regardless of the proof state.
 Useful for verifying that the search infrastructure works correctly
@@ -40,6 +42,11 @@ class MockPolicy:
         premises: list[str],
         k: int = 8,
     ) -> list[TacticCandidate]:
+        """
+        Ignores the proof state and premises, always returns the same tactics. Recall that ProofState contains a list of open goals, and
+        Goals contain the target and hypotheses, where hypotheses are the "given" facts we can use to solve the goal. In a real policy,
+        we would use this information to condition our tactic generation, but in MockPolicy we just return a fixed list.
+        """
         candidates = self._tactics[:k]
         # Assign descending log probs so simp is tried first
         n = len(candidates)

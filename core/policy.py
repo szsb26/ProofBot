@@ -5,6 +5,11 @@ The PolicyModel protocol defines the contract that every tactic generator
 must satisfy. The search algorithm talks exclusively to this interface —
 it never imports from policy/, lean/, or any specific implementation.
 
+policy.py is used when MCTS selects a node to expand and needs to query the LLM for candidate tactics. 
+The search loop calls get_tactics() with the current proof state and relevant premises, 
+and the policy returns a list of TacticCandidate with associated log probabilities.
+Each candidate tactic will then use executor object to send to Lean.
+
 This is the most important abstraction boundary in the codebase.
 """
 
@@ -14,11 +19,15 @@ from typing import Protocol, runtime_checkable
 
 from core.proof_state import ProofState
 
-
+# @dataclass  auto-generates init, repr, eq, and other methods based on the class fields.
 @dataclass(frozen=True)
 class TacticCandidate:
     """
     A single tactic proposed by the policy, with an associated log probability.
+    This class is a named container for what the LLM returns for each candidate tactic.
+    For ex., the tactic can be "simp", "apply Nat.add_zero", etc... Log probabilities are used
+    due to the way LLMs output probabilities, and they are more convenient for numerical stability
+    when computing UCB scores.
 
     Attributes:
         tactic:   The tactic string to send to Lean, e.g. "simp" or "apply h".
@@ -36,13 +45,16 @@ class TacticCandidate:
         return math.exp(self.log_prob)
 
     def __repr__(self) -> str:
+        # !r is equivalent to repr(self.tactic)
         return f"TacticCandidate({self.tactic!r}, log_prob={self.log_prob:.3f})"
 
-
+# @runtime_checkable allows us to use isinstance() to check if an object satisfies the PolicyModel protocol, 
+# even though it's not a concrete class. This is useful for testing and for ensuring that our policy implementations
+# conform to the expected interface.
 @runtime_checkable
 class PolicyModel(Protocol):
     """
-    Protocol that every tactic generator must satisfy.
+    Protocol that every tactic generator (for ex., LLM model) must satisfy.
 
     Implementations:
         policy/anthropic.py  -> AnthropicPolicy   (Phase 1-2, API-backed)
