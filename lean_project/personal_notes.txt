@@ -1,0 +1,20 @@
+# Notes about Lean
+
+Protocol:
+- Launch: lake exe repl from lean_project directory
+- Send:   json.dumps(payload) + "\n\n"  (blank line terminator)
+- Read:   lines until blank line, join, parse as JSON
+
+Initialize proof:
+- send: {"cmd": "theorem ... := by\n  sorry"}
+- recv: {"sorries": [{"proofState": 0, "goal": "⊢ ..."}], "env": 0}
+
+Apply tactic:
+- send: {"tactic": "simp", "proofState": 0}
+- recv (success):  {"proofState": 1, "goals": ["n : Nat\n⊢ n + 0 = n"]}
+- recv (complete): {"proofState": 2, "goals": [], "proofStatus": "Completed"}
+- recv (failure):  {"message": "Lean error:\n..."}
+
+Branching:
+- send two different tactics with same proofState N
+- → get independent proofState N+1 and N+2

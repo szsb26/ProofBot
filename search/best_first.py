@@ -6,7 +6,8 @@ At each step:
     1. Pop the highest-value state
     2. Ask the policy for k tactic candidates
     3. Verify each candidate in Lean
-    4. Push successful results back onto the queue
+    4. Push successful results back onto the queue. Remember, these are full proof states, not just tactics — 
+       they include the updated goals and hypotheses after applying the tactic.
     5. If any result closes the proof, return success
 
 This is the Phase 2 search algorithm. It handles backtracking naturally
@@ -43,7 +44,9 @@ class SearchNode:
         tactic:   The tactic that produced this node from its parent.
                   Empty string for the root node.
         depth:    Depth in the search tree (same as state.depth).
-        value:    Value estimate from the value model.
+        value:    Value estimate from the value model, which returns a heuristic score
+                  of how promising this node is for finding a proof. Higher is better.
+                  Used for priority queue ordering.
     """
     state: ProofState
     parent: Optional[SearchNode]

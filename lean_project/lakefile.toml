@@ -1,0 +1,15 @@
+name = "lean_project"
+version = "0.1.0"
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "master"
+
+[[require]]
+name = "repl"
+git = "https://github.com/leanprover-community/repl"
+rev = "master"
+
+[[lean_lib]]
+name = "LeanProject"
