@@ -23,6 +23,32 @@ Protocol (discovered via testing):
         Send two different tactics with the same proofState N.
         Each gets an independent new proofState number.
         This is how we explore multiple branches without restarting Lean.
+
+Here is the full compute hierarchy:
+
+SubprocessExecutor
+│
+│  owns:
+│  ├── _capacity (int)
+│  ├── _workers: list[LeanWorker]       # flat list, for shutdown
+│  └── _pool: asyncio.Queue[LeanWorker] # the queue workers are borrowed from
+│
+└── LeanWorker  (one per capacity slot)
+    │
+    │  owns:
+    │  ├── _proc: asyncio.subprocess.Process   ← one lake exe repl OS process
+    │  └── _proof_state_cache: dict[str, int]  ← hash → REPL integer ID
+    │
+    └── lake exe repl  (one OS process per worker)
+        │
+        │  owns (internal to Lean, not visible to Python):
+        │  ├── loaded Mathlib environment
+        │  └── proof state table: { 0: <state>, 1: <state>, 2: <state>, ... }
+
+Note that for a single theorem we want to prove, a single SubprocessExecutor with multiple workers is sufficient.
+Each worker maintains its own REPL process and proof state cache, but they all share the same underlying Lean environment on disk (the lean_project directory).
+This allows us to explore multiple branches of the proof tree in parallel without needing to restart the REPL for each branch.
+
 """
 
 from __future__ import annotations
@@ -41,6 +67,8 @@ from core.proof_state import Goal, Hypothesis, ProofState
 logger = logging.getLogger(__name__)
 
 # Path to the lean_project directory — where lake exe repl is run from
+# Think of a lean project as something that is similar to a python virtual environment - 
+# it contains the Lean files, dependencies, and compiled artifacts needed to run the REPL.
 LEAN_PROJECT_DIR = Path(__file__).parent.parent / "lean_project"
 
 
@@ -58,6 +86,9 @@ class LeanWorker:
 
     Not thread-safe — use one worker per asyncio task, or protect with
     a semaphore (which SubprocessExecutor does via its worker pool).
+
+    Each LeanWorker is a completely separate "lake exe repl" OS subprocess, and
+    there is no shared memory between lean workers.
     """
 
     def __init__(self, lean_project_dir: Path):
@@ -129,6 +160,12 @@ class LeanWorker:
 
         Sends the theorem with a sorry placeholder to get the initial
         proof state. Returns (ProofState, repl_proof_state_id).
+        Note that "sorry" is a special Lean placeholder that creates an open goal,
+        allowing us to extract the initial proof state without needing a complete proof. 
+        It allows us to get the initial goal state without proving the theorem, which is perfect for our search loop.
+        We will replace "sorry" with actual tactics as we explore the proof tree.
+        The REPL returns this initial state along with a unique proofState id that we cache
+        for future tactic applications. Think of "sorry" as a "TODO" in Lean.
 
         Args:
             theorem: A complete Lean 4 theorem statement ending with := by
@@ -286,12 +323,21 @@ class SubprocessExecutor:
     """
     Pool of LeanWorker processes implementing the LeanExecutor protocol.
 
-    Maintains a pool of `capacity` workers. Each step() call acquires
-    a worker from the pool, uses it, and returns it. This allows
-    concurrent tactic verification up to the pool size.
+    Each worker owns a separate `lake exe repl` subprocess with its own
+    proof state table. REPL proof-state IDs are process-local integers,
+    so a state created by worker A cannot be used by worker B.
+
+    To handle this, SubprocessExecutor maintains a _router that maps
+    each ProofState's stable_hash to the worker index that owns it.
+    reset() assigns a worker via round-robin; step() always routes to
+    the worker that owns the given state.
+
+    Parallelism: concurrent step() calls on states owned by different
+    workers run simultaneously. Calls on the same state are serialized
+    through its worker's lock (correct, since the REPL is single-threaded).
 
     On MacBook Air (8GB): capacity=2
-    On DGX Spark (128GB): capacity=10
+    On a larger machine like DGX Spark (128GB): capacity=10
     """
 
     def __init__(
@@ -302,7 +348,10 @@ class SubprocessExecutor:
         self._dir = lean_project_dir
         self._capacity = capacity
         self._workers: list[LeanWorker] = []
-        self._pool: asyncio.Queue[LeanWorker] = asyncio.Queue()
+        self._locks: list[asyncio.Lock] = []
+        # Maps ProofState.stable_hash() -> index into self._workers
+        self._router: dict[str, int] = {}
+        self._rr_counter = 0
         self._started = False
 
     @property
@@ -315,32 +364,44 @@ class SubprocessExecutor:
             worker = LeanWorker(self._dir)
             await worker.start()
             self._workers.append(worker)
-            await self._pool.put(worker)
+            self._locks.append(asyncio.Lock())
         self._started = True
         logger.info(f"Started {self._capacity} Lean workers")
 
     async def reset(self, theorem: str) -> ProofState:
-        """Initialize a proof attempt on any available worker."""
-        worker = await self._pool.get()
-        try:
-            state, _ = await worker.reset(theorem)
-            return state
-        finally:
-            await self._pool.put(worker)
+        """Initialize a proof attempt, assigning a worker via round-robin."""
+        idx = self._rr_counter % self._capacity
+        self._rr_counter += 1
+        async with self._locks[idx]:
+            state, _ = await self._workers[idx].reset(theorem)
+        if not state.is_error:
+            self._router[state.stable_hash()] = idx
+        return state
 
     async def step(self, state: ProofState, tactic: str) -> StepResult:
-        """Apply a tactic using any available worker."""
-        worker = await self._pool.get()
-        try:
-            return await worker.step(state, tactic)
-        finally:
-            await self._pool.put(worker)
+        """Apply a tactic, routing to the worker that owns this state."""
+        idx = self._router.get(state.stable_hash())
+        if idx is None:
+            error_state = ProofState(
+                goals=state.goals,
+                error="proof state not routable: no worker owns this state",
+                depth=state.depth,
+                tactic_trace=state.tactic_trace,
+            )
+            return StepResult(next_state=error_state, tactic=tactic)
+        async with self._locks[idx]:
+            result = await self._workers[idx].step(state, tactic)
+        if result.success:
+            self._router[result.next_state.stable_hash()] = idx
+        return result
 
     async def close(self) -> None:
         """Shut down all worker processes."""
         for worker in self._workers:
             await worker.stop()
         self._workers.clear()
+        self._locks.clear()
+        self._router.clear()
         logger.info("All Lean workers stopped")
 
 
