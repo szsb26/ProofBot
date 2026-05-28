@@ -187,3 +187,11 @@ class TestStableHash:
         h = s.stable_hash()
         assert isinstance(h, str)
         assert len(h) == 16
+
+    def test_session_id_does_not_affect_hash(self):
+        """Two sessions on the same theorem have identical goal content but
+        different session_ids. They must hash identically so the LeanWorker's
+        internal proof state cache (keyed by stable_hash) can serve both."""
+        s1 = ProofState(goals=make_proof_state(["n + 0 = n"]).goals, session_id="session-A")
+        s2 = ProofState(goals=make_proof_state(["n + 0 = n"]).goals, session_id="session-B")
+        assert s1.stable_hash() == s2.stable_hash()

@@ -58,6 +58,15 @@ class ProofState:
     The hash is deterministic so ProofState can be used as a dict key
     and cached via lru_cache.
 
+    Note that since we are using frozen dataclass decorator,__init__, __repr__, __eq__, and __hash__ methods are automatically generated,
+    so self variables like goals, error, etc... are self variables and its as if we wrote these in the __init__method. For ex.,
+    
+    def __init__(self, goals: tuple[Goal, ...], error: str | None = None, depth: int = 0, tactic_trace: tuple[str, ...] = ()):
+        self.goals = goals
+        self.error = error
+        self.depth = depth
+        self.tactic_trace = tactic_trace
+
     Attributes:
         goals:        Remaining open subgoals. Empty means proof is closed.
         error:        If the last tactic failed, the error message. None otherwise.
@@ -68,6 +77,10 @@ class ProofState:
     error: str | None = None
     depth: int = 0
     tactic_trace: tuple[str, ...] = field(default_factory=tuple)
+    # Identifies which proof search session produced this state.
+    # Set by SubprocessExecutor.reset(); excluded from stable_hash() so
+    # two sessions on the same theorem don't collide in the router.
+    session_id: str = ""
 
     @property
     def is_closed(self) -> bool:
