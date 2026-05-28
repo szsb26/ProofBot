@@ -1,5 +1,12 @@
 """
-Integration tests for lean/repl.py
+Unit and integration tests for lean/repl.py.
+
+TestParseGoalString      — fast, no Lean needed; tests the goal string parser
+TestSubprocessExecutorRouting — fast, no Lean needed; tests worker routing logic
+                               with mocked LeanWorkers
+TestSubprocessExecutor   — slow, real Lean; tests a single worker end-to-end
+TestSubprocessExecutorCapacity2 — slow, real Lean; tests concurrent multi-worker
+                                   behavior including session isolation
 """
 
 import pytest
@@ -69,8 +76,9 @@ class TestParseGoalString:
 
 def _mock_worker(reset_state: ProofState, step_result: StepResult | None = None) -> MagicMock:
     '''
-    A mock worker class which will imitate the behavior of a real LeanWorker for testing the SubprocessExecutor's routing logic.
-    worker.start(), worker.stop(), and worker.reset() all need to be async functions.
+    A mock LeanWorker for testing SubprocessExecutor routing logic without a real Lean process.
+    start(), stop(), reset(), and step() must all be AsyncMock because SubprocessExecutor
+    awaits each of them — a regular MagicMock would raise a TypeError when awaited.
     '''
     worker = MagicMock()
     worker.start = AsyncMock()
@@ -221,6 +229,7 @@ class TestSubprocessExecutor:
 
     async def test_reset_simple_theorem(self, executor):
         # reset() against a real REPL should return an open ProofState with one goal
+        # and a non-empty session_id so subsequent step() calls route correctly
         state = await executor.reset(
             "theorem foo : ∀ n : Nat, n + 0 = n := by"
         )
@@ -228,6 +237,7 @@ class TestSubprocessExecutor:
         assert not state.is_closed
         assert not state.is_error
         assert state.num_goals == 1
+        assert state.session_id != ""
 
     async def test_step_intro(self, executor):
         # "intro n" on a ∀ goal strips the quantifier and exposes the body as a new goal
@@ -293,9 +303,9 @@ class TestSubprocessExecutorCapacity2:
         await exec_.close()
 
     async def test_step_succeeds_after_reset(self, executor):
-        # With capacity=2, reset() and step() may land on different workers
-        # if routing is broken. This confirms the router directs step() to
-        # the correct worker — the one whose REPL has the proof state cached.
+        # With capacity=2, reset() assigns a session_id and routes to worker 0.
+        # step() uses (session_id, stable_hash) to find the same worker, so
+        # the REPL proof state is always found in its cache.
         state = await executor.reset(
             "theorem foo : ∀ n : Nat, n + 0 = n := by"
         )
