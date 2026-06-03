@@ -93,6 +93,12 @@ class LeanWorker:
 
     Each LeanWorker is a completely separate "lake exe repl" OS subprocess, and
     there is no shared memory between lean workers.
+
+    Because LeanWorker methods are async, we see that SubprocessExecutor methods are also async.
+    Recall that async functions are functions that can be paused and resumed, allowing other code to run while waiting for long-running operations.
+    In our case, the long-running operations are the interactions with the REPL subprocess, which involve I/O and can take some time to complete.
+    By making these methods async, we can ensure that our Python event loop remains responsive and can handle multiple proof attempts in parallel
+    without blocking on any single REPL interaction.
     """
 
     def __init__(self, lean_project_dir: Path):
@@ -126,6 +132,7 @@ class LeanWorker:
         since each REPL process maintains its own proof state table and environment.
         
         """
+        # start the lean REPL subprocess.
         self._proc = await asyncio.create_subprocess_exec(
             "lake", "exe", "repl",
             stdin=asyncio.subprocess.PIPE,
@@ -153,15 +160,33 @@ class LeanWorker:
 
     async def _send(self, payload: dict) -> dict:
         """
-        Send a JSON payload to the REPL and read the response.
-        Every command is terminated with \\n\\n (blank line).
-        Every response is terminated with a blank line.
+        Send a JSON payload to the REPL and read the response. Every command is terminated with \\n\\n (blank line).
+        Every response is terminated with a blank line. _send() in LeanWorker.step(), where we send a tactic(part of the payload)
+        to the REPL on the worker and wait for the response. 
+
+        As an example of how async and await works, when Python gets to "await self._proc.stdin.drain()", it sends the command to the REPL
+        and then pauses the current coroutine, allowing other coroutines to run while waiting for the REPL to respond. Once the REPL responds
+        and the command is fully sent, the coroutine resumes and continues to read the response from the REPL.
+        This allows us to handle multiple proof attempts in parallel without blocking on any single REPL interaction.
+
+        The await points are exactly where Python steps aside and lets the OS and the Lean process do their work. Lean can take hundreds of milliseconds
+        to verify a tactic, and during that time, other sessions (like other workers or proof attempts) can continue to run and interact with their
+        own REPL proceses.
         """
+        # sanity check. We should have used LeanWorker.start() to launch the REPL before calling _send()
         if not self._proc or self._proc.returncode is not None:
             raise LeanREPLError("Lean worker process is not running")
 
+        # .encode() converts the string to bytes, which is what the subprocess stdin expects. json.dumps() converts the payload dictionary
+        # to a JSON-formatted string. We add the blank line terminator "\n\n" as required by the REPL protocol. 
         msg = (json.dumps(payload) + "\n\n").encode()
+        # note that we do not need to use any lean specific python libraries to interact with the REPL.
+        # Think of "lake exe repl" as a compiled Lean binary that runs as an interactive process.
+        # It: 1) starts up, loads Mathlib into memory, 2)and then sits there waiting for JSON commands on stdin,
+        #.    3) responds with JSON on stdout. We can interact with it using standard python subprocess communication patterns
         self._proc.stdin.write(msg)
+        # drain() waits until the write buffer is flushed, meaning that the message has actually been sent to the REPL process.
+        # This is important because we ensure that the command is fully sent before we start waiting for the response.
         await self._proc.stdin.drain()
 
         # Read lines until we hit a blank line
@@ -255,7 +280,7 @@ class LeanWorker:
         tactic: str,
     ) -> StepResult:
         """
-        Apply a tactic to a proof state.
+        Apply a tactic to a proof state. Used in SubprocessExecutor.step().
 
         Looks up the REPL proofState id for the given state, sends the
         tactic, and parses the response into a StepResult.
@@ -266,8 +291,10 @@ class LeanWorker:
         """
         start = time.perf_counter()
 
-        # Look up the REPL proof state id for this state
+        # Look up the REPL proof state id for this state, stable_hash identifies which branch of the proof tree we are on within the workers' REPL process.
         repl_ps_id = self._proof_state_cache.get(state.stable_hash())
+        # error out if we dont have this state in our cache. This should not happen if our caching and routing logic is correct, 
+        # but we check just in case.
         if repl_ps_id is None:
             # State not in cache — return error
             error_state = ProofState(
@@ -282,7 +309,7 @@ class LeanWorker:
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
 
-        # Send tactic to REPL
+        # Send tactic to REPL, send tactic (a string) to the given proofState id.
         try:
             response = await self._send({
                 "tactic": tactic,
@@ -303,7 +330,7 @@ class LeanWorker:
 
         elapsed = (time.perf_counter() - start) * 1000
 
-        # Parse response
+        # Parse response. Note that response is a JSON object which contains keys like proofState, goals, proofStatus, etc...
         if "message" in response:
             # Tactic failed
             error_state = ProofState(
@@ -409,6 +436,7 @@ class SubprocessExecutor:
             # note that we wait for each worker to finish starting before launching the next one.
             await worker.start()
             self._workers.append(worker)
+            # asyncio.Lock()
             self._locks.append(asyncio.Lock())
         self._started = True
         logger.info(f"Started {self._capacity} Lean workers")
@@ -437,7 +465,32 @@ class SubprocessExecutor:
         two sessions on the same theorem never interfere with each other.
         Stamps session_id onto the resulting state so it continues to route
         correctly for all subsequent steps.
+
+        The LEAN REPL is single-threaded and cannot handle concurrent commands, so asyncio.Lock() is used to serialize step() calls that
+        route to the same worker. The great thing about the LEAN REPL is that it can handle branching k attempts on the same proof state. For ex:
+
+        Worker sends:  {"tactic": "intro n", "proofState": 0}
+        REPL responds: {"proofState": 1, "goals": [...]}
+
+        Worker sends:  {"tactic": "simp",   "proofState": 0}  ← same proofState: 0
+        REPL responds: {"proofState": 2, "goals": [...]}       ← independent new ID
+
+        Worker sends:  {"tactic": "ring",   "proofState": 0}  ← same proofState: 0
+        REPL responds: {"message": "ring failed..."}
+
+        This is an example of us sending different tactics to the same proof state (proofState: 0) and the REPL handling them correctly by giving them independent 
+        new proofState IDs (1 and 2) for the successful ones, and an error message for the failed one. 
+        This allows us to explore multiple branches of the proof tree in parallel without needing to restart the REPL, 
+        since each branch gets its own independent proof state in the REPL's internal table.
         """
+        # session_id identifies which worker owns this proof state, and stable_hash identifies which proof state it is within that worker.
+        # ex. session_id -> worker 0's REPL process
+        #.         stable_hash "abc123" -> proofState: 0 (initial state)
+        #.         stable_hash "def456" -> proofState: 1 (after "intro n")
+        #.         stable_hash "ghi789" -> proofState: 2 (after "simp")
+        #.    session_id -> worker 1's REPL process
+        #.         stable_hash "abc123" -> proofState: 0 (same initial state, different session)
+        #.         stable_hash "jkl012" -> proofState: 1 (after "ring")
         key = (state.session_id, state.stable_hash())
         idx = self._router.get(key)
         if idx is None:
@@ -446,6 +499,11 @@ class SubprocessExecutor:
                 error="proof state not routable: no worker owns this state",
             )
             return StepResult(next_state=error_state, tactic=tactic)
+        # acquring the lock for the worker with the given session_id and stable_hash, which is gotten from the ProofState. Recall
+        # that each worker has its own REPL process and proof state (stable_hash) cache, so we need to route to the correct worker that owns the given proof state. 
+        # The lock ensures that if multiple step() calls are made on the same proof state (which would route to the same worker), they will be processed 
+        # sequentially, since the REPL is single-threaded and cannot handle concurrent commands. However, step() calls on different proof states that 
+        # route to different workers can run in parallel, allowing us to explore multiple branches of the proof tree simultaneously.
         async with self._locks[idx]:
             result = await self._workers[idx].step(state, tactic)
         if result.success:

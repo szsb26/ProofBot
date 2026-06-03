@@ -224,7 +224,13 @@ class TestSubprocessExecutor:
 
     @pytest_asyncio.fixture
     async def executor(self):
-        """Create and start an executor, shut it down after test."""
+        """
+        Create and start an executor, shut it down after test. Recall that fixtures
+        are called before every test method. Everything before yield is setup, we then pass exec_
+        to the test method using yield, and then after the test finishes, we run the teardown code
+        after yield. Fixtures are used so we dont have to write the same boilerplate startup and teardown
+        in every test method. 
+        """
         exec_ = SubprocessExecutor(capacity=1)
         await exec_.start()
         yield exec_
@@ -366,7 +372,8 @@ class TestSubprocessExecutorCapacity2:
             r1 = await executor.step(state, "intro n")
             r2 = await executor.step(r1.next_state, "simp")
             return r2.proof_closed
-
+        # asyncio.gather() runs the two full_proof() coroutines concurrently!!!, so 2 workers are actually doing work
+        # at the same time, though they are working on the same theorem.
         closed0, closed1 = await asyncio.gather(full_proof(s0), full_proof(s1))
         assert closed0
         assert closed1
