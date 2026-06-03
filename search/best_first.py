@@ -260,7 +260,19 @@ class BestFirstSearch:
         candidates: list[TacticCandidate],
         sem: asyncio.Semaphore,
     ) -> list[StepResult]:
-        """Verify all tactic candidates concurrently, bounded by semaphore."""
+        """
+        Verify all tactic candidates concurrently, bounded by semaphore. _verify_parallel() is effectively just a way to call executor.step()
+        k times and collect all the results. 
+
+        asyncio.gather() fires k coroutines:
+
+        coroutine 1 acquires worker lock of the SAME worker -> sends for ex., "intro n" -> gets result -> releases lock
+        coroutine 2 acquires worker lock -> sends for ex., "simp" -> gets result -> releases lock
+        ...
+
+        all k results collected -> returned as a list.
+
+        """
 
         async def verify_one(candidate: TacticCandidate) -> StepResult:
             async with sem:

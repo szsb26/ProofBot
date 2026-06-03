@@ -98,6 +98,9 @@ class TestSubprocessExecutorRouting:
         # to the worker that processed it (index 0 here).
         base_state = make_proof_state(["n + 0 = n"])
         w0 = _mock_worker(base_state)
+        # patch() replaces LeanWorker class with the mock worker class we defined above.
+        # each instance/call to the real LeanWorker() constructor will instead return the instances
+        # in side_effect in order. So first call to LeanWorker() returns w0, second call returns w1, and so on.
         with patch("lean.repl.LeanWorker", side_effect=[w0]):
             executor = SubprocessExecutor(capacity=1)
             await executor.start()

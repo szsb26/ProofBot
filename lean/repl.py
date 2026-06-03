@@ -401,9 +401,12 @@ class SubprocessExecutor:
         return self._capacity
 
     async def start(self) -> None:
-        """Start all worker processes. Must be called before use."""
+        """
+        Start all worker processes. Must be called before use.
+        """
         for _ in range(self._capacity):
             worker = LeanWorker(self._dir)
+            # note that we wait for each worker to finish starting before launching the next one.
             await worker.start()
             self._workers.append(worker)
             self._locks.append(asyncio.Lock())

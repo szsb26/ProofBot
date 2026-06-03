@@ -48,7 +48,8 @@ class StepResult:
         """True if this tactic closed all remaining goals."""
         return self.next_state.is_closed
 
-
+# @runtime_checkable allows us to use isinstance() to check if an object satisfies the LeanExecutor protocol, so for ex.,
+# we can verify that SubprocessExecutor and MockExecutor both are valid LeanExecutor types.
 @runtime_checkable
 class LeanExecutor(Protocol):
     """
@@ -63,6 +64,11 @@ class LeanExecutor(Protocol):
     Air with 8GB RAM, capacity=2. On a DGX Spark with 128GB, capacity=10.
     The search loop uses this to automatically bound its parallelism —
     no hardcoded constants anywhere in the search code.
+
+    This is a template for SubprocessExecutor and MockExecutor classes. Since LeanExecutor is a Protocol, then
+    any classes we define that has the below functions is recognized as a valid implementation of LeanExecutor, even without explicitly inheriting
+    from LeanExecutor. This allows us to have a MockExecutor that satisfies the same interface for testing purposes without needing to import from lean/
+    in the search code.
     """
 
     @property
