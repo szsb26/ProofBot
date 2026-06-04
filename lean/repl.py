@@ -161,7 +161,7 @@ class LeanWorker:
         This allows us to handle multiple proof attempts in parallel without blocking on any single REPL interaction.
 
         The await points are exactly where Python steps aside and lets the OS and the Lean process do their work. Lean can take hundreds of milliseconds
-        to verify a tactic, and during that time, other sessions (like other workers or proof attempts) can continue to run and interact with their
+        to verify a tactic, and during that time, other workers can continue to run and interact with their
         own REPL proceses.
         """
         # sanity check. We should have used LeanWorker.start() to launch the REPL before calling _send()
