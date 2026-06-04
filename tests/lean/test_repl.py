@@ -1,8 +1,11 @@
 """
 Unit and integration tests for lean/repl.py.
 
-TestParseGoalString   — fast, no Lean needed; tests the goal string parser
-TestSubprocessExecutor — slow, real Lean; tests the executor end-to-end
+TestParseGoalString          — fast, no Lean needed; tests the goal string parser
+TestSubprocessExecutor       — slow, real Lean; tests a single executor end-to-end
+TestProveParallelIntegration — slow, real Lean; tests k (BestFirstSearch,
+                               SubprocessExecutor) pairs running concurrently
+                               via prove_parallel on the same theorem
 """
 
 import pytest
@@ -10,6 +13,9 @@ import pytest_asyncio
 import asyncio
 from lean.repl import SubprocessExecutor, _parse_goal_string, LEAN_PROJECT_DIR
 from core.proof_state import ProofState
+from policy.mock import MockPolicy
+from value.heuristic import HeuristicValue
+from search.best_first import BestFirstSearch, prove_parallel
 
 
 # ---------------------------------------------------------------------------
@@ -152,3 +158,70 @@ class TestSubprocessExecutor:
         finally:
             await exec0.close()
             await exec1.close()
+
+
+# ---------------------------------------------------------------------------
+# prove_parallel integration tests (slow, real Lean)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not LEAN_PROJECT_DIR.exists(),
+    reason="lean_project not found"
+)
+@pytest.mark.asyncio
+class TestProveParallelIntegration:
+
+    async def test_k_searches_prove_same_theorem(self):
+        # k BestFirstSearch + k SubprocessExecutor pairs all attempt the same
+        # theorem concurrently via prove_parallel. MockPolicy supplies tactics
+        # so no LLM API calls are needed. Real Lean can close this theorem with
+        # just "simp" in one step, so we only assert overall success.
+        k = 3
+        policy = MockPolicy(tactics=["simp", "ring", "omega", "intro n"])
+        value = HeuristicValue()
+
+        executors = [SubprocessExecutor() for _ in range(k)]
+        for e in executors:
+            await e.start()
+
+        try:
+            searches = [
+                BestFirstSearch(policy=policy, executor=e, value=value)
+                for e in executors
+            ]
+            result = await prove_parallel(
+                "theorem foo : ∀ n : Nat, n + 0 = n := by",
+                searches=searches,
+                budget=50,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            for e in executors:
+                await e.close()
+
+    async def test_all_searches_fail_returns_failure(self):
+        # All k searches fail because every tactic is invalid Lean syntax.
+        # prove_parallel must return failure rather than crashing.
+        k = 2
+        policy = MockPolicy(tactics=["not_a_tactic", "also_invalid"])
+        value = HeuristicValue()
+
+        executors = [SubprocessExecutor() for _ in range(k)]
+        for e in executors:
+            await e.start()
+
+        try:
+            searches = [
+                BestFirstSearch(policy=policy, executor=e, value=value)
+                for e in executors
+            ]
+            result = await prove_parallel(
+                "theorem foo : ∀ n : Nat, n + 0 = n := by",
+                searches=searches,
+                budget=10,
+            )
+            assert not result.success
+        finally:
+            for e in executors:
+                await e.close()
