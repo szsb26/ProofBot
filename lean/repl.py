@@ -24,44 +24,35 @@ Protocol (discovered via testing):
         Each gets an independent new proofState number.
         This is how we explore multiple branches without restarting Lean.
 
-Here is the full compute hierarchy:
+Compute hierarchy (one SubprocessExecutor = one search worker):
 
-SubprocessExecutor (SubprocessExecutor and all its LeanWorker management runs in one Python process. The SubprocessExecutor is
-a lightweight Python coordinator for our LeanWorkers. Each LeanWorker spawns a "lake exe repl" OS subprocess with separate PID, separate memory), but the Python side is single-process event loop.
+SubprocessExecutor  (thin Python coordinator, one per BestFirstSearch instance)
 │
-│  owns:
-│  ├── _capacity (int)
-│  ├── _workers: list[LeanWorker]       # flat list, for shutdown
-│  └── _pool: asyncio.Queue[LeanWorker] # the queue workers are borrowed from
-│
-└── LeanWorker  (one per capacity slot, actual OS process, meaning we have a unique PID and memory for each LeanWorker)
+└── LeanWorker  (one lake exe repl OS subprocess, unique PID and memory)
     │
     │  owns:
     │  ├── _proc: asyncio.subprocess.Process   ← one lake exe repl OS process
-    │  └── _proof_state_cache: dict[str, int]  ← hash → REPL integer ID
+    │  └── _proof_state_cache: dict[str, int]  ← stable_hash → REPL integer ID
     │
-    └── lake exe repl  (one OS process per worker)
+    └── lake exe repl  (one OS process)
         │
         │  owns (internal to Lean, not visible to Python):
         │  ├── loaded Mathlib environment
         │  └── proof state table: { 0: <state>, 1: <state>, 2: <state>, ... }
 
-A single SubprocessExecutor with multiple workers is sufficient.
-Each worker maintains its own REPL process and proof state cache, but they all share the same underlying Lean environment on disk (the lean_project directory).
-This allows us to explore multiple branches of the proof tree in parallel without needing to restart the REPL for each branch. 
-Each worker can be working on the same theorem, or different theorems, and they are working all in parallel.
-
+For k parallel proof searches, create k SubprocessExecutor instances and run
+k BestFirstSearch.prove() coroutines concurrently with asyncio.gather().
+Each executor owns exactly one worker process, so there is no cross-worker
+routing or session tracking needed.
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import logging
 import os
 import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -388,138 +379,66 @@ class LeanWorker:
 
 class SubprocessExecutor:
     """
-    Pool of LeanWorker processes implementing the LeanExecutor protocol.
+    Wraps a single LeanWorker, implementing the LeanExecutor protocol.
 
-    Each worker owns a separate `lake exe repl` subprocess with its own
-    proof state table. REPL proof-state IDs are process-local integers,
-    so a state created by worker A cannot be used by worker B.
+    One SubprocessExecutor = one `lake exe repl` subprocess = one proof search.
+    For k parallel searches, create k SubprocessExecutor instances and run
+    them concurrently with asyncio.gather().
 
-    To handle this, SubprocessExecutor maintains a _router that maps
-    each ProofState's stable_hash to the worker index that owns it.
-    reset() assigns a worker via round-robin; step() always routes to
-    the worker that owns the given state.
-
-    Parallelism: concurrent step() calls on states owned by different
-    workers run simultaneously. Calls on the same state are serialized
-    through its worker's lock (correct, since the REPL is single-threaded).
-
-    On MacBook Air (8GB): capacity=2
-    On a larger machine like DGX Spark (128GB): capacity=10
+    The lock serializes reset() and step() so the REPL's stdin/stdout
+    is never written to concurrently within the same Python process.
     """
 
     def __init__(
         self,
         lean_project_dir: Path = LEAN_PROJECT_DIR,
-        capacity: int = 2,
     ):
         self._dir = lean_project_dir
-        self._capacity = capacity
-        self._workers: list[LeanWorker] = []
-        self._locks: list[asyncio.Lock] = []
-        # Maps (session_id, stable_hash) -> index into self._workers.
-        # Using session_id as part of the key lets multiple independent
-        # proof attempts on the same theorem coexist without collision.
-        self._router: dict[tuple[str, str], int] = {}
-        self._rr_counter = 0
+        self._worker: Optional[LeanWorker] = None
+        self._lock = asyncio.Lock()
         self._started = False
 
-    @property
-    def capacity(self) -> int:
-        return self._capacity
-
     async def start(self) -> None:
-        """
-        Start all worker processes. Must be called before use.
-        """
-        for _ in range(self._capacity):
-            worker = LeanWorker(self._dir)
-            # note that we wait for each worker to finish starting before launching the next one.
-            await worker.start()
-            self._workers.append(worker)
-            # asyncio.Lock()
-            self._locks.append(asyncio.Lock())
+        """Start the Lean worker process. Must be called before use."""
+        self._worker = LeanWorker(self._dir)
+        await self._worker.start()
         self._started = True
-        logger.info(f"Started {self._capacity} Lean workers")
+        logger.info("Started Lean worker")
 
     async def reset(self, theorem: str) -> ProofState:
-        """Initialize a proof attempt, assigning a worker via round-robin.
-
-        Generates a unique session_id and stamps it on the returned state.
-        All subsequent step() calls must use states carrying this session_id
-        so the router can distinguish parallel attempts on the same theorem.
-        """
-        idx = self._rr_counter % self._capacity
-        self._rr_counter += 1
-        async with self._locks[idx]:
-            state, _ = await self._workers[idx].reset(theorem)
-        if not state.is_error:
-            session_id = str(uuid.uuid4())
-            state = dataclasses.replace(state, session_id=session_id)
-            self._router[(session_id, state.stable_hash())] = idx
+        """Initialize a new proof attempt and return the initial ProofState."""
+        async with self._lock:
+            state, _ = await self._worker.reset(theorem)
         return state
 
     async def step(self, state: ProofState, tactic: str) -> StepResult:
-        """Apply a tactic, routing to the worker that owns this state.
+        """Apply a tactic to the given proof state and return the result.
 
-        Uses (session_id, stable_hash) to look up the owning worker, so
-        two sessions on the same theorem never interfere with each other.
-        Stamps session_id onto the resulting state so it continues to route
-        correctly for all subsequent steps.
+        The REPL is single-threaded, so the lock ensures that concurrent
+        Python callers do not interleave their writes to stdin/stdout.
 
-        The LEAN REPL is single-threaded and cannot handle concurrent commands, so asyncio.Lock() is used to serialize step() calls that
-        route to the same worker. The great thing about the LEAN REPL is that it can handle branching k attempts on the same proof state. For ex:
+        The REPL supports branching: sending two different tactics with the
+        same proofState ID produces two independent new proof states.
 
-        Worker sends:  {"tactic": "intro n", "proofState": 0}
-        REPL responds: {"proofState": 1, "goals": [...]}
+            send: {"tactic": "intro n", "proofState": 0}
+            recv: {"proofState": 1, "goals": [...]}
 
-        Worker sends:  {"tactic": "simp",   "proofState": 0}  ← same proofState: 0
-        REPL responds: {"proofState": 2, "goals": [...]}       ← independent new ID
+            send: {"tactic": "simp", "proofState": 0}   ← same ID
+            recv: {"proofState": 2, "goals": [...]}       ← independent new ID
 
-        Worker sends:  {"tactic": "ring",   "proofState": 0}  ← same proofState: 0
-        REPL responds: {"message": "ring failed..."}
-
-        This is an example of us sending different tactics to the same proof state (proofState: 0) and the REPL handling them correctly by giving them independent 
-        new proofState IDs (1 and 2) for the successful ones, and an error message for the failed one. 
-        This allows us to explore multiple branches of the proof tree in parallel without needing to restart the REPL, 
-        since each branch gets its own independent proof state in the REPL's internal table.
+        This lets the search explore multiple branches from one state without
+        restarting the REPL, since each branch gets its own ID in the REPL's
+        internal proof state table.
         """
-        # session_id identifies which worker owns this proof state, and stable_hash identifies which proof state it is within that worker.
-        # ex. session_id -> worker 0's REPL process
-        #.         stable_hash "abc123" -> proofState: 0 (initial state)
-        #.         stable_hash "def456" -> proofState: 1 (after "intro n")
-        #.         stable_hash "ghi789" -> proofState: 2 (after "simp")
-        #.    session_id -> worker 1's REPL process
-        #.         stable_hash "abc123" -> proofState: 0 (same initial state, different session)
-        #.         stable_hash "jkl012" -> proofState: 1 (after "ring")
-        key = (state.session_id, state.stable_hash())
-        idx = self._router.get(key)
-        if idx is None:
-            error_state = dataclasses.replace(
-                state,
-                error="proof state not routable: no worker owns this state",
-            )
-            return StepResult(next_state=error_state, tactic=tactic)
-        # acquring the lock for the worker with the given session_id and stable_hash, which is gotten from the ProofState. Recall
-        # that each worker has its own REPL process and proof state (stable_hash) cache, so we need to route to the correct worker that owns the given proof state. 
-        # The lock ensures that if multiple step() calls are made on the same proof state (which would route to the same worker), they will be processed 
-        # sequentially, since the REPL is single-threaded and cannot handle concurrent commands. However, step() calls on different proof states that 
-        # route to different workers can run in parallel, allowing us to explore multiple branches of the proof tree simultaneously.
-        async with self._locks[idx]:
-            result = await self._workers[idx].step(state, tactic)
-        if result.success:
-            next_state = dataclasses.replace(result.next_state, session_id=state.session_id)
-            self._router[(state.session_id, next_state.stable_hash())] = idx
-            result = dataclasses.replace(result, next_state=next_state)
-        return result
+        async with self._lock:
+            return await self._worker.step(state, tactic)
 
     async def close(self) -> None:
-        """Shut down all worker processes."""
-        for worker in self._workers:
-            await worker.stop()
-        self._workers.clear()
-        self._locks.clear()
-        self._router.clear()
-        logger.info("All Lean workers stopped")
+        """Shut down the worker process."""
+        if self._worker:
+            await self._worker.stop()
+            self._worker = None
+        logger.info("Lean worker stopped")
 
 
 # ---------------------------------------------------------------------------

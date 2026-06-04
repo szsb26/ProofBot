@@ -77,10 +77,6 @@ class ProofState:
     error: str | None = None
     depth: int = 0
     tactic_trace: tuple[str, ...] = field(default_factory=tuple)
-    # Identifies which proof search session produced this state.
-    # Set by SubprocessExecutor.reset(); excluded from stable_hash() so
-    # two sessions on the same theorem don't collide in the router.
-    session_id: str = ""
 
     @property
     def is_closed(self) -> bool:

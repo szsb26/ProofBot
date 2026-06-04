@@ -27,8 +27,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from core.executor import LeanExecutor, StepResult
-from core.policy import PolicyModel, TacticCandidate
+from core.executor import LeanExecutor
+from core.policy import PolicyModel
 from core.proof_state import ProofState
 from core.value import ValueModel
 
@@ -190,9 +190,6 @@ class BestFirstSearch:
         # State cache: avoid re-expanding states we've already seen
         visited: set[str] = set()
 
-        # Semaphore bounds concurrent Lean calls to executor capacity
-        sem = asyncio.Semaphore(self.executor.capacity)
-
         while heap and nodes_visited < budget:
             # Pop the highest-value unexplored node
             _, _, node = heapq.heappop(heap)
@@ -211,8 +208,11 @@ class BestFirstSearch:
                 k=self.k,
             )
 
-            # Verify all candidates in parallel, bounded by capacity
-            results = await self._verify_parallel(node.state, candidates, sem)
+            # Verify each candidate sequentially against this worker's REPL
+            results = [
+                await self.executor.step(node.state, c.tactic)
+                for c in candidates
+            ]
 
             # Process results
             for candidate, result in zip(candidates, results):
@@ -254,32 +254,6 @@ class BestFirstSearch:
             theorem=theorem,
         )
 
-    async def _verify_parallel(
-        self,
-        state: ProofState,
-        candidates: list[TacticCandidate],
-        sem: asyncio.Semaphore,
-    ) -> list[StepResult]:
-        """
-        Verify all tactic candidates concurrently, bounded by semaphore. _verify_parallel() is effectively just a way to call executor.step()
-        k times and collect all the results. 
-
-        asyncio.gather() fires k coroutines:
-
-        coroutine 1 acquires worker lock of the SAME worker -> sends for ex., "intro n" -> gets result -> releases lock
-        coroutine 2 acquires worker lock -> sends for ex., "simp" -> gets result -> releases lock
-        ...
-
-        all k results collected -> returned as a list.
-
-        """
-
-        async def verify_one(candidate: TacticCandidate) -> StepResult:
-            async with sem:
-                return await self.executor.step(state, candidate.tactic)
-
-        return await asyncio.gather(*[verify_one(c) for c in candidates])
-
     def _extract_trace(
         self,
         node: SearchNode,
@@ -297,3 +271,34 @@ class BestFirstSearch:
         trace.reverse()
         trace.append(closing_tactic)
         return trace
+
+
+async def prove_parallel(
+    theorem: str,
+    searches: list[BestFirstSearch],
+    budget: int = 100,
+) -> ProofResult:
+    """
+    Run k independent BestFirstSearch instances concurrently.
+
+    Each search must have its own executor (and thus its own Lean worker
+    process) and maintains its own priority queue. All k searches attempt
+    the same theorem independently — whichever finds a proof first wins.
+
+    Args:
+        theorem:  The Lean 4 theorem statement to prove.
+        searches: Pre-built BestFirstSearch instances, each backed by its
+                  own SubprocessExecutor. Create with:
+                      [BestFirstSearch(policy, SubprocessExecutor(), value)
+                       for _ in range(k)]
+        budget:   Node budget per search instance.
+
+    Returns:
+        The first successful ProofResult, or — if all searches fail —
+        the result with the most nodes visited.
+    """
+    results = await asyncio.gather(*[s.prove(theorem, budget) for s in searches])
+    for r in results:
+        if r.success:
+            return r
+    return max(results, key=lambda r: r.nodes_visited)

@@ -13,7 +13,7 @@ from core.policy import TacticCandidate
 from lean.mock_executor import MockExecutor
 from policy.mock import MockPolicy
 from value.heuristic import HeuristicValue
-from search.best_first import BestFirstSearch, SearchNode, ProofResult
+from search.best_first import BestFirstSearch, SearchNode, ProofResult, prove_parallel
 
 
 # ---------------------------------------------------------------------------
@@ -193,3 +193,60 @@ class TestBestFirstSearch:
         # Should not crash — returns failure gracefully
         assert isinstance(result, ProofResult)
         assert not result.success or result.success  # either is fine, just no crash
+
+
+# ---------------------------------------------------------------------------
+# prove_parallel
+# ---------------------------------------------------------------------------
+
+class TestProveParallel:
+
+    def test_returns_success_when_any_search_succeeds(self):
+        """If at least one search finds a proof, prove_parallel returns success."""
+        searches = [make_search(tactics=["simp"]) for _ in range(3)]
+        result = asyncio.run(prove_parallel(
+            "theorem foo : n + 0 = n := by",
+            searches=searches,
+            budget=10,
+        ))
+        assert result.success
+
+    def test_returns_failure_when_all_searches_fail(self):
+        """If every search exhausts its budget, prove_parallel returns failure."""
+        searches = [make_search(tactics=["blah", "nope"]) for _ in range(3)]
+        result = asyncio.run(prove_parallel(
+            "theorem foo : n + 0 = n := by",
+            searches=searches,
+            budget=5,
+        ))
+        assert not result.success
+
+    def test_proof_trace_present_on_success(self):
+        """A successful parallel result must include the closing tactic."""
+        searches = [make_search(tactics=["simp", "ring"]) for _ in range(2)]
+        result = asyncio.run(prove_parallel(
+            "theorem foo : n + 0 = n := by",
+            searches=searches,
+            budget=10,
+        ))
+        assert result.success
+        assert len(result.proof_trace) > 0
+
+    def test_single_search_behaves_like_prove(self):
+        """prove_parallel with k=1 should behave identically to prove()."""
+        theorem = "theorem foo : n + 0 = n := by"
+        search = make_search(tactics=["simp"])
+        parallel = asyncio.run(prove_parallel(theorem, searches=[search], budget=10))
+        single = asyncio.run(make_search(tactics=["simp"]).prove(theorem, budget=10))
+        assert parallel.success == single.success
+
+    def test_multi_step_proof_found_in_parallel(self):
+        """A two-step proof should be found across parallel searches."""
+        searches = [make_search(tactics=["intro n", "simp", "ring"]) for _ in range(2)]
+        result = asyncio.run(prove_parallel(
+            "theorem foo : ∀ n : ℕ, n + 0 = n := by",
+            searches=searches,
+            budget=20,
+        ))
+        assert result.success
+        assert "intro n" in result.proof_trace

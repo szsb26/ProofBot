@@ -71,15 +71,6 @@ class LeanExecutor(Protocol):
     in the search code.
     """
 
-    @property
-    def capacity(self) -> int:
-        """
-        How many concurrent step() calls this executor can handle.
-        The search loop uses asyncio.Semaphore(executor.capacity) to
-        bound parallelism automatically.
-        """
-        ...
-
     async def reset(self, theorem: str) -> ProofState:
         """
         Start a new proof attempt for the given theorem statement.
