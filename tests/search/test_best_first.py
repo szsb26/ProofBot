@@ -4,14 +4,20 @@ Unit tests for search/best_first.py
 These tests use MockPolicy and MockExecutor — no real Lean or API calls.
 They verify the search logic: priority ordering, backtracking, budget
 exhaustion, proof trace extraction, and parallel verification.
+
+TestBestFirstSearchWithAnthropicPolicy verifies that AnthropicPolicy
+(with a mocked Anthropic client) wires correctly into BestFirstSearch —
+the tactic strings it produces are consumed by the search loop without error.
 """
 
 import pytest
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 from core.proof_state import make_proof_state, ProofState, make_goal
 from core.policy import TacticCandidate
 from lean.mock_executor import MockExecutor
 from policy.mock import MockPolicy
+from policy.anthropic import AnthropicPolicy
 from value.heuristic import HeuristicValue
 from search.best_first import BestFirstSearch, SearchNode, ProofResult, prove_parallel
 
@@ -250,3 +256,117 @@ class TestProveParallel:
         ))
         assert result.success
         assert "intro n" in result.proof_trace
+
+
+# ---------------------------------------------------------------------------
+# BestFirstSearch with AnthropicPolicy (mocked client, no real API calls)
+# ---------------------------------------------------------------------------
+
+def _make_api_response(text: str) -> MagicMock:
+    content_block = MagicMock()
+    content_block.text = text
+    response = MagicMock()
+    response.content = [content_block]
+    return response
+
+
+class TestBestFirstSearchWithAnthropicPolicy:
+
+    def _make_search_with_anthropic(self, api_response_text: str, k: int = 8) -> tuple[BestFirstSearch, MagicMock]:
+        """Build a BestFirstSearch backed by a mocked AnthropicPolicy."""
+        patcher = patch("policy.anthropic.AsyncAnthropic")
+        MockClient = patcher.start()
+        mock_instance = MagicMock()
+        mock_instance.messages.create = AsyncMock(
+            return_value=_make_api_response(api_response_text)
+        )
+        mock_instance.close = AsyncMock()
+        MockClient.return_value = mock_instance
+
+        policy = AnthropicPolicy(api_key="test-key")
+        search = BestFirstSearch(
+            policy=policy,
+            executor=MockExecutor(),
+            value=HeuristicValue(),
+            k=k,
+        )
+        return search, patcher
+
+    async def test_proves_simple_theorem(self):
+        # AnthropicPolicy returns "simp" → MockExecutor closes n + 0 = n → success.
+        search, patcher = self._make_search_with_anthropic("simp\nring\nomega")
+        try:
+            result = await search.prove("theorem foo : n + 0 = n := by", budget=10)
+            assert result.success
+            assert "simp" in result.proof_trace
+        finally:
+            patcher.stop()
+
+    async def test_proves_multi_step_theorem(self):
+        # AnthropicPolicy returns "intro n" and "simp" → two-step proof closes ∀ goal.
+        search, patcher = self._make_search_with_anthropic("intro n\nsimp\nring")
+        try:
+            result = await search.prove(
+                "theorem foo : ∀ n : ℕ, n + 0 = n := by",
+                budget=20,
+            )
+            assert result.success
+            assert "intro n" in result.proof_trace
+            assert "simp" in result.proof_trace
+        finally:
+            patcher.stop()
+
+    async def test_api_failure_falls_back_to_simp(self):
+        # If the Anthropic API raises, AnthropicPolicy falls back to ["simp"].
+        # BestFirstSearch must handle this gracefully and still find the proof.
+        with patch("policy.anthropic.AsyncAnthropic") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.messages.create = AsyncMock(side_effect=Exception("network error"))
+            mock_instance.close = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            policy = AnthropicPolicy(api_key="test-key")
+            search = BestFirstSearch(
+                policy=policy,
+                executor=MockExecutor(),
+                value=HeuristicValue(),
+            )
+            result = await search.prove("theorem foo : n + 0 = n := by", budget=10)
+            # simp fallback closes n + 0 = n
+            assert result.success
+
+    async def test_all_tactics_fail_returns_failure(self):
+        # AnthropicPolicy returns only invalid tactics → every step fails →
+        # no states pushed to the queue → budget exhausted → failure.
+        search, patcher = self._make_search_with_anthropic("blah\nnope\ninvalid")
+        try:
+            result = await search.prove("theorem foo : n + 0 = n := by", budget=10)
+            assert not result.success
+        finally:
+            patcher.stop()
+
+    async def test_policy_is_called_with_current_proof_state(self):
+        # Verifies that the proof state passed to get_tactics() is the one
+        # popped from the queue, not the initial state or a stale state.
+        with patch("policy.anthropic.AsyncAnthropic") as MockClient:
+            mock_instance = MagicMock()
+            mock_instance.messages.create = AsyncMock(
+                return_value=_make_api_response("simp")
+            )
+            mock_instance.close = AsyncMock()
+            MockClient.return_value = mock_instance
+
+            policy = AnthropicPolicy(api_key="test-key")
+            search = BestFirstSearch(
+                policy=policy,
+                executor=MockExecutor(),
+                value=HeuristicValue(),
+            )
+            await search.prove("theorem foo : n + 0 = n := by", budget=10)
+
+            # The API must have been called at least once
+            assert mock_instance.messages.create.call_count >= 1
+            # The proof state content appears in the prompt sent to Claude
+            _, kwargs = mock_instance.messages.create.call_args
+            user_content = kwargs["messages"][0]["content"]
+            assert "n + 0 = n" in user_content

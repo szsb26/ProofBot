@@ -6,14 +6,19 @@ TestSubprocessExecutor       — slow, real Lean; tests a single executor end-to
 TestProveParallelIntegration — slow, real Lean; tests k (BestFirstSearch,
                                SubprocessExecutor) pairs running concurrently
                                via prove_parallel on the same theorem
+TestEndToEnd                 — slow, real Lean + real Anthropic API; tests the
+                               full stack: AnthropicPolicy → BestFirstSearch →
+                               SubprocessExecutor → lake exe repl
 """
 
+import os
 import pytest
 import pytest_asyncio
 import asyncio
 from lean.repl import SubprocessExecutor, _parse_goal_string, LEAN_PROJECT_DIR
 from core.proof_state import ProofState
 from policy.mock import MockPolicy
+from policy.anthropic import AnthropicPolicy
 from value.heuristic import HeuristicValue
 from search.best_first import BestFirstSearch, prove_parallel
 
@@ -181,8 +186,7 @@ class TestProveParallelIntegration:
         value = HeuristicValue()
 
         executors = [SubprocessExecutor() for _ in range(k)]
-        for e in executors:
-            await e.start()
+        await asyncio.gather(*[e.start() for e in executors])
 
         try:
             searches = [
@@ -208,8 +212,7 @@ class TestProveParallelIntegration:
         value = HeuristicValue()
 
         executors = [SubprocessExecutor() for _ in range(k)]
-        for e in executors:
-            await e.start()
+        await asyncio.gather(*[e.start() for e in executors])
 
         try:
             searches = [
@@ -225,3 +228,117 @@ class TestProveParallelIntegration:
         finally:
             for e in executors:
                 await e.close()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end tests (slow, real Lean + real Anthropic API)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not LEAN_PROJECT_DIR.exists(),
+    reason="lean_project not found",
+)
+@pytest.mark.skipif(
+    not os.environ.get("ANTHROPIC_API_KEY"),
+    reason="ANTHROPIC_API_KEY not set",
+)
+@pytest.mark.asyncio
+class TestEndToEnd:
+
+    async def test_anthropic_proves_simple_theorem(self):
+        # Full stack: AnthropicPolicy calls the real Claude API to generate
+        # tactics, BestFirstSearch drives the search, SubprocessExecutor
+        # verifies each tactic against a real lake exe repl process.
+        policy = AnthropicPolicy()
+        executor = SubprocessExecutor()
+        await executor.start()
+        try:
+            search = BestFirstSearch(
+                policy=policy,
+                executor=executor,
+                value=HeuristicValue(),
+                k=8,
+            )
+            result = await search.prove(
+                "theorem foo : ∀ n : Nat, n + 0 = n := by",
+                budget=10,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            await executor.close()
+            await policy.close()
+
+    async def test_anthropic_prove_parallel(self):
+        # k independent (AnthropicPolicy, BestFirstSearch, SubprocessExecutor)
+        # triples run concurrently. The first to find a proof wins.
+        k = 3
+        policy = AnthropicPolicy()
+        value = HeuristicValue()
+        executors = [SubprocessExecutor() for _ in range(k)]
+        await asyncio.gather(*[e.start() for e in executors])
+        try:
+            searches = [
+                BestFirstSearch(policy=policy, executor=e, value=value, k=8)
+                for e in executors
+            ]
+            result = await prove_parallel(
+                "theorem foo : ∀ n : Nat, n + 0 = n := by",
+                searches=searches,
+                budget=10,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            for e in executors:
+                await e.close()
+            await policy.close()
+
+    async def test_binomial_square(self):
+        # Level 1: arithmetic identity over Int.
+        # simp and omega won't close this — Claude must produce "ring".
+        # Expected proof: intro a b; ring
+        policy = AnthropicPolicy()
+        executor = SubprocessExecutor()
+        await executor.start()
+        try:
+            search = BestFirstSearch(
+                policy=policy,
+                executor=executor,
+                value=HeuristicValue(),
+                k=8,
+            )
+            result = await search.prove(
+                "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+                budget=20,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            await executor.close()
+            await policy.close()
+
+    async def test_contrapositive(self):
+        # Level 2: propositional logic — modus tollens / contrapositive.
+        # Requires genuine multi-step reasoning: intro, apply, exact.
+        # simp/omega/ring do not apply here.
+        # Expected proof: intro p q hpq hnq hp; exact hnq (hpq hp)
+        policy = AnthropicPolicy()
+        executor = SubprocessExecutor()
+        await executor.start()
+        try:
+            search = BestFirstSearch(
+                policy=policy,
+                executor=executor,
+                value=HeuristicValue(),
+                k=8,
+            )
+            result = await search.prove(
+                "theorem contrapositive : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by",
+                budget=20,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            await executor.close()
+            await policy.close()

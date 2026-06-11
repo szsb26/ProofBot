@@ -39,12 +39,30 @@ pip install -e .
 ## Running tests
 
 ```bash
-# Fast tests only (no Lean required)
+# Fast tests only (no Lean, no API key)
 pytest tests/ --ignore=tests/lean/test_repl.py
 
-# All tests including Lean integration
+# All tests including Lean integration (no API key needed)
 pytest tests/
+
+# End-to-end tests: real Claude API + real Lean (requires ANTHROPIC_API_KEY)
+ANTHROPIC_API_KEY=sk-... .venv/bin/python -m pytest tests/lean/test_repl.py::TestEndToEnd -v
 ```
+
+### End-to-end test suite (`TestEndToEnd`)
+
+These tests exercise the full stack: Claude Haiku generates tactic candidates via the Anthropic API, `BestFirstSearch` drives the proof search, and `SubprocessExecutor` verifies each tactic against a real `lake exe repl` process.
+
+| Test | Theorem | Expected proof |
+|---|---|---|
+| `test_anthropic_proves_simple_theorem` | `∀ n : Nat, n + 0 = n` | `simp` |
+| `test_anthropic_prove_parallel` | `∀ n : Nat, n + 0 = n` | `simp` (3 parallel searches) |
+| `test_binomial_square` | `∀ a b : Int, (a + b)² = a² + 2·a·b + b²` | `intro a b; ring` |
+| `test_contrapositive` | `∀ (p q : Prop), (p → q) → ¬q → ¬p` | `intro p q hpq hnq hp; exact hnq (hpq hp)` |
+
+The first two tests verify basic plumbing. The last two are more meaningful: `test_binomial_square` requires Claude to produce `ring` (a Mathlib tactic not reachable by `simp` or `omega`), and `test_contrapositive` requires a multi-step propositional logic proof where `simp`/`omega`/`ring` all fail.
+
+**Cost**: each test makes 1–3 Claude Haiku API calls (~$0.001 total). Runtime is ~30–40 seconds, dominated by Lean REPL startup.
 
 ## API Usage
 

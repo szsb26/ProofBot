@@ -100,7 +100,7 @@ class LeanWorker:
 
     async def start(self) -> None:
         """Launch the lake exe repl subprocess.
-        
+
         worker.start(): launches the Lean subprocess using asyncio.create_subprocess_exec() and sets up the REPL.
         In the mock, we just need it to be an async function that does nothing, since we won't actually start a real REPL. asyncio.create_subprocess_exec()
         itself is an async operation - it asks the OS to spawn a new process, which takes a small amount of time. While the OS is doing that, other coroutines can run.
@@ -118,10 +118,10 @@ class LeanWorker:
         {"proofState": 1, "goals": [...]}
 
         Also, a process is a running instance of a program. When the process is launched, it has its own memory space, file handles, and system resources.
-        In our case, each LeanWorker launches its own "lake exe repl" process, which means each worker has its own separate instance of the Lean REPL running 
+        In our case, each LeanWorker launches its own "lake exe repl" process, which means each worker has its own separate instance of the Lean REPL running
         in parallel. This allows us to explore multiple branches of the proof tree simultaneously without interference,
         since each REPL process maintains its own proof state table and environment.
-        
+
         """
         # start the lean REPL subprocess.
         self._proc = await asyncio.create_subprocess_exec(
@@ -149,7 +149,7 @@ class LeanWorker:
                 await self._proc.wait()
         logger.debug("Lean worker stopped")
 
-    async def _send(self, payload: dict) -> dict:
+    async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
         """
         Send a JSON payload to the REPL and read the response. Every command is terminated with \\n\\n (blank line).
         Every response is terminated with a blank line. _send() in LeanWorker.step(), where we send a tactic(part of the payload)
@@ -186,7 +186,7 @@ class LeanWorker:
             try:
                 line = await asyncio.wait_for(
                     self._proc.stdout.readline(),
-                    timeout=30.0,
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
                 raise LeanREPLError(

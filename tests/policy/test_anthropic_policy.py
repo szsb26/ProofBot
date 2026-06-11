@@ -242,6 +242,9 @@ class TestAnthropicPolicyIntegration:
 
     async def test_real_api_call_returns_tactics(self):
         """Makes a real API call and verifies the response is parseable."""
+
+        # claude haiku is one of the cheaper models - we dont need a powerful model for these
+        # integration tests.
         policy = AnthropicPolicy(model="claude-haiku-4-5-20251001")
         state = make_proof_state(["n + 0 = n"], [[("n", "ℕ")]])
 
