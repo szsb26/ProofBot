@@ -4,8 +4,10 @@ Tests for run.py — the mathematician-facing CLI.
 TestParseArgs        — fast, no I/O; validates argument defaults and overrides
 TestCLIWithMock      — fast, no Lean, no API; uses --policy mock end-to-end
 TestCLIIntegration   — slow, real Lean, no API; uses --policy mock with real REPL
+TestCLIEndToEnd      — slow, real Lean + real Anthropic API; full stack via CLI
 """
 
+import os
 import pytest
 import asyncio
 from unittest.mock import patch
@@ -146,3 +148,65 @@ class TestCLIIntegration:
         captured = capsys.readouterr()
         assert "Lean 4 proof:" in captured.out
         assert ":= by" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Full end-to-end via CLI (slow, real Lean + real Anthropic API)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not LEAN_PROJECT_DIR.exists(),
+    reason="lean_project not found",
+)
+@pytest.mark.skipif(
+    not os.environ.get("ANTHROPIC_API_KEY"),
+    reason="ANTHROPIC_API_KEY not set",
+)
+class TestCLIEndToEnd:
+
+    def test_simple_theorem(self, capsys):
+        # Full stack: Claude Haiku → BestFirstSearch → real Lean REPL.
+        # ∀ n : Nat, n + 0 = n is closed by simp in one step.
+        result = main([
+            "theorem foo : ∀ n : Nat, n + 0 = n := by",
+            "--budget", "20",
+        ])
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "✓" in out
+        assert "Lean 4 proof:" in out
+
+    def test_binomial_square(self, capsys):
+        # Level 1: arithmetic identity over Int — requires a Mathlib tactic
+        # (ring, exact Int.add_sq, etc.). Not provable by simp or omega alone.
+        result = main([
+            "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+            "--budget", "20",
+        ])
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "✓" in out
+        assert "Lean 4 proof:" in out
+
+    def test_contrapositive(self, capsys):
+        # Level 2: propositional logic requiring multi-step intro/exact reasoning.
+        # simp, omega, and ring all fail here — Claude must reason logically.
+        result = main([
+            "theorem contrapositive : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by",
+            "--budget", "20",
+        ])
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "✓" in out
+        assert "Lean 4 proof:" in out
+
+    def test_parallel_search(self, capsys):
+        # 3 independent searches via the CLI --workers flag.
+        result = main([
+            "theorem foo : ∀ n : Nat, n + 0 = n := by",
+            "--workers", "3",
+            "--budget", "20",
+        ])
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "✓" in out
