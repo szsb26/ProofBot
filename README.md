@@ -150,6 +150,28 @@ Each component is swappable:
 - Replace `HeuristicValue` with a trained value model in later phases
 - `BestFirstSearch` can be replaced with more complex search algorithms like MCTSSearch(TODO)
 
+## Value model
+
+The priority queue in `BestFirstSearch` ranks states by a value estimate from `HeuristicValue`:
+
+```
+value = exp(-(1.0 × num_goals + 0.05 × depth))
+```
+
+States with fewer open goals and shallower depth are explored first. Some examples:
+
+| State | num_goals | depth | value |
+|---|---|---|---|
+| Closed proof | 0 | — | 1.000 |
+| 1 goal, just started | 1 | 0 | 0.368 |
+| 1 goal, 3 tactics deep | 1 | 3 | 0.317 |
+| 2 goals, just started | 2 | 0 | 0.135 |
+| Error / dead branch | — | — | 0.000 |
+
+This requires no training data and no ML — it is a deliberate baseline for early development. The depth penalty is kept small (0.05) because depth is a weak signal: a deep state with 1 goal is still far better than a shallow state with 3 goals.
+
+**Replacing it**: implement the `ValueModel` protocol in `core/value.py` and pass your model to `BestFirstSearch`. A trained value network (e.g., a small transformer that reads the serialized proof state and outputs a scalar in `[0, 1]`) would learn to predict the probability that a state leads to a closed proof, which is a much stronger signal than goal count alone.
+
 ## Key modules
 
 | Module | Purpose |

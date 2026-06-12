@@ -297,6 +297,10 @@ class TestEndToEnd:
     async def test_binomial_square(self):
         # Level 1: arithmetic identity over Int.
         # simp and omega won't close this — Claude must produce "ring".
+        # ring checks that both sides of an algebraic equation are the same, by
+        # expanding and simplifying. It uses a) distributivity, commutativity, and associativity 
+        # of + and * to expand both sides to check the equality, hence ring.
+        #
         # Expected proof: intro a b; ring
         policy = AnthropicPolicy()
         executor = SubprocessExecutor()
@@ -322,6 +326,7 @@ class TestEndToEnd:
         # Level 2: propositional logic — modus tollens / contrapositive.
         # Requires genuine multi-step reasoning: intro, apply, exact.
         # simp/omega/ring do not apply here.
+        #
         # Expected proof: intro p q hpq hnq hp; exact hnq (hpq hp)
         policy = AnthropicPolicy()
         executor = SubprocessExecutor()
