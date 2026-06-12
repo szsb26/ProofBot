@@ -2,9 +2,11 @@
 
 A best-first proof search system for Lean 4, backed by an LLM policy.
 
-This repo implements a generalized mathematical theorem prover using Large Language Models. In naive LLM theorem provers,  users 1) give a theorem to the LLM to prove, and then 2) the LLM attempts to prove it in a one-shot manner. The drawbacks of this are obvious - because the LLM is not running Lean verification of each of its statements, hallucination or wrong derivations occur in the output response. 
+Naive LLM theorem provers ask the model to prove a theorem in one shot. Because the LLM never runs Lean to verify its output, hallucinations and invalid derivations slip through. This repo takes a different approach: the LLM generates candidate tactics, and every candidate is immediately verified by a real Lean 4 process. A search algorithm (currently Best First Search) explores the proof tree, guided by the LLM and a value heuristic, until a complete proof is found or the budget is exhausted.
 
-This repo instead implements a generalized framework for mathematical theorem provers. Specifically, a theorem prover is a combination of 2 components: A) the LLM, and B) the underlying search algorithm guiding the LLM. The search algorithm used is rather flexible. For ex., the simplest approach uses the Best First Search, which is a simple priority queue which ranks candidate Lean tactics. A more complex search algorithm is MCTS, which requires a value network and Monte Carlo rollouts to guide the LLM. Because each mathematical statement output by the LLM is rigorously verified by LEAN, and the search algorithm looks ahead in the proof, generalized mathematical theorem provers are much more accurate than using the LLM alone.
+The policy (LLM backend) and the search algorithm are both pluggable. Anthropic's Claude and DeepSeek are supported out of the box; adding a new provider requires implementing one method.
+
+---
 
 ## Using the prover (no Python required)
 
@@ -12,11 +14,17 @@ This section is for mathematicians who want to prove theorems from the command l
 
 ### 1. Get an API key
 
-The prover uses Claude (an LLM) to generate proof steps. You need a free API key from Anthropic:
+The prover uses an LLM to generate proof steps. Choose a provider:
+
+**Option A — Anthropic (Claude)**
 
 1. Go to [console.anthropic.com](https://console.anthropic.com) and create an account
-2. Navigate to **API Keys** and create a new key
-3. Copy the key — it starts with `sk-ant-...`
+2. Navigate to **API Keys** and create a new key (starts with `sk-ant-...`)
+
+**Option B — DeepSeek**
+
+1. Go to [platform.deepseek.com](https://platform.deepseek.com) and create an account
+2. Navigate to **API Keys** and create a new key (starts with `sk-...`)
 
 ### 2. One-time setup
 
@@ -36,14 +44,22 @@ cd lean_project && lake build && cd ..
 
 ### 3. Set your API key
 
+Create a `.env` file in the project root so you don't have to set it every session:
+
+```
+# For Anthropic:
+ANTHROPIC_API_KEY=sk-ant-...
+
+# For DeepSeek:
+DEEPSEEK_API_KEY=sk-...
+```
+
+Or export it in your shell each session:
+
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-You can also create a `.env` file in the project root so you don't have to set it every session:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
+# or
+export DEEPSEEK_API_KEY=sk-...
 ```
 
 ### 4. Prove a theorem
@@ -51,10 +67,14 @@ ANTHROPIC_API_KEY=sk-ant-...
 Pass your Lean 4 theorem statement as a string. The statement must end with `:= by`:
 
 ```bash
+# Using Claude (default)
 python run.py "theorem add_comm_example : ∀ n m : Nat, n + m = m + n := by"
+
+# Using DeepSeek
+python run.py "theorem add_comm_example : ∀ n m : Nat, n + m = m + n := by" --policy deepseek
 ```
 
-Output:
+Example output:
 ```
 Theorem : theorem add_comm_example : ∀ n m : Nat, n + m = m + n := by
 Search  : 1 worker, budget=100, policy=anthropic (claude-haiku-4-5-20251001)
@@ -104,11 +124,12 @@ python run.py "theorem foo : ..." --workers 4
 # Both together for harder theorems
 python run.py "theorem foo : ..." --workers 4 --budget 200
 
-# Use a more powerful model (higher cost, better reasoning)
-python run.py "theorem foo : ..." --model claude-sonnet-4-6
+# Switch to a more powerful model
+python run.py "theorem foo : ..." --model claude-sonnet-4-6                # Anthropic
+python run.py "theorem foo : ..." --policy deepseek --model deepseek-reasoner  # DeepSeek
 ```
 
-**Cost**: the default model (Claude Haiku) costs roughly $0.001 per proof attempt — a $20 API credit will cover thousands of attempts.
+**Cost**: the default models (Claude Haiku, DeepSeek Chat) cost roughly $0.001 per proof attempt.
 
 ---
 
@@ -120,7 +141,7 @@ prove_parallel(theorem, searches=[...], budget=100)
             │
             └── BestFirstSearch          (one priority queue per instance)
                     │
-                    ├── PolicyModel      (tactic generator — AnthropicPolicy or MockPolicy)
+                    ├── PolicyModel      (tactic generator — AnthropicPolicy / DeepSeekPolicy / MockPolicy)
                     ├── ValueModel       (state evaluator — HeuristicValue)
                     └── LeanExecutor     (tactic verifier — SubprocessExecutor or MockExecutor)
                             │
@@ -128,6 +149,16 @@ prove_parallel(theorem, searches=[...], budget=100)
 ```
 
 **Parallelism**: create k `SubprocessExecutor` + `BestFirstSearch` pairs and run them with `prove_parallel`. Each search has its own Lean REPL process and priority queue — they explore the proof tree independently and concurrently.
+
+**Policy**: the `PolicyModel` protocol (`core/policy.py`) defines a single method:
+
+```python
+async def get_tactics(state: ProofState, premises: list[str], k: int) -> list[TacticCandidate]
+```
+
+`AnthropicPolicy` and `DeepSeekPolicy` both extend `BaseLLMPolicy` (`policy/base.py`), which handles prompt construction, response parsing, and error fallback. Adding a new provider means subclassing `BaseLLMPolicy` and implementing `_call_api(user_prompt) -> str`.
+
+---
 
 ## Prerequisites
 
@@ -144,89 +175,81 @@ pip install -e .
 
 ## Quick start
 
-Set your API key, then pass a Lean 4 theorem statement:
-
 ```bash
-export ANTHROPIC_API_KEY=sk-...
-
+# Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
 python run.py "theorem foo : ∀ n : Nat, n + 0 = n := by"
-```
 
-Example output:
-```
-Theorem : theorem foo : ∀ n : Nat, n + 0 = n := by
-Search  : 1 worker, budget=100, policy=anthropic (claude-haiku-4-5-20251001)
-
-Starting Lean workers... ready.
-Searching...
-
-✓  Proof found in 2.3s (2 nodes)
-
-Lean 4 proof:
-  theorem foo : ∀ n : Nat, n + 0 = n := by
-    simp
+# DeepSeek
+export DEEPSEEK_API_KEY=sk-...
+python run.py "theorem foo : ∀ n : Nat, n + 0 = n := by" --policy deepseek
 ```
 
 **Options:**
 
 ```
-python run.py "theorem ..." --workers 4    # run 4 parallel searches
-python run.py "theorem ..." --budget 200   # expand up to 200 nodes per search
-python run.py "theorem ..." --model claude-sonnet-4-6  # use a stronger model
-python run.py "theorem ..." --api-key sk-...            # pass key directly
+python run.py "theorem ..." --policy anthropic    # use Claude (default)
+python run.py "theorem ..." --policy deepseek     # use DeepSeek
+python run.py "theorem ..." --workers 4           # run 4 parallel searches
+python run.py "theorem ..." --budget 200          # expand up to 200 nodes per search
+python run.py "theorem ..." --model deepseek-reasoner   # override the model
+python run.py "theorem ..." --api-key sk-...      # pass key directly
 ```
+
+---
 
 ## Running tests
 
 ```bash
-# Fast tests only (no Lean, no API key)
-pytest tests/ --ignore=tests/lean/test_repl.py
+# Fast unit tests (no Lean, no API key)
+source .venv/bin/activate
+pytest tests/ --ignore=tests/lean/test_repl.py -q
 
-# All tests including Lean integration (no API key needed)
-pytest tests/
+# Lean integration tests (no API key needed)
+pytest tests/ -q
 
-# End-to-end tests: real Claude API + real Lean (requires ANTHROPIC_API_KEY)
-ANTHROPIC_API_KEY=sk-... .venv/bin/python -m pytest tests/lean/test_repl.py::TestEndToEnd -v
+# Anthropic end-to-end tests (real Claude API + real Lean)
+ANTHROPIC_API_KEY=sk-ant-... pytest tests/lean/test_repl.py::TestEndToEnd -v
+
+# DeepSeek end-to-end tests (real DeepSeek API + real Lean)
+DEEPSEEK_API_KEY=sk-... pytest tests/lean/test_repl.py::TestDeepSeekEndToEnd -v
 ```
 
-### End-to-end test suite (`TestEndToEnd`)
+### Test suite overview
 
-These tests exercise the full stack: Claude Haiku generates tactic candidates via the Anthropic API, `BestFirstSearch` drives the proof search, and `SubprocessExecutor` verifies each tactic against a real `lake exe repl` process.
+| Class | Lean | API | What it tests |
+|---|---|---|---|
+| `TestParseGoalString` | No | No | Goal string parser |
+| `TestParseTactics` | No | No | LLM response parser |
+| `TestBuildUserPrompt` | No | No | Prompt builder |
+| `TestAnthropicPolicyGetTactics` | No | No (mocked) | AnthropicPolicy unit tests |
+| `TestDeepSeekPolicyGetTactics` | No | No (mocked) | DeepSeekPolicy unit tests |
+| `TestSubprocessExecutor` | Yes | No | Lean REPL executor |
+| `TestProveParallelIntegration` | Yes | No (mock policy) | k parallel searches |
+| `TestCLIWithMock` | No | No | CLI arg parsing + mock stack |
+| `TestCLIIntegration` | Yes | No (mock policy) | CLI with real Lean |
+| `TestEndToEnd` | Yes | Anthropic | Full stack: Claude + Lean (simple + add_comm + contrapositive) |
+| `TestDeepSeekEndToEnd` | Yes | DeepSeek | Full stack: DeepSeek + Lean (simple + parallel + add_comm) |
+| `TestCLIEndToEnd` | Yes | Anthropic | Full stack via CLI |
+| `TestCLIDeepSeekEndToEnd` | Yes | DeepSeek | Full stack via CLI + DeepSeek |
 
-| Test | Theorem | Expected proof |
-|---|---|---|
-| `test_anthropic_proves_simple_theorem` | `∀ n : Nat, n + 0 = n` | `simp` |
-| `test_anthropic_prove_parallel` | `∀ n : Nat, n + 0 = n` | `simp` (3 parallel searches) |
-| `test_binomial_square` | `∀ a b : Int, (a + b)² = a² + 2·a·b + b²` | `intro a b; ring` |
-| `test_contrapositive` | `∀ (p q : Prop), (p → q) → ¬q → ¬p` | `intro p q hpq hnq hp; exact hnq (hpq hp)` |
-
-The first two tests verify basic plumbing. The last two are more meaningful: `test_binomial_square` requires Claude to produce `ring` (a Mathlib tactic not reachable by `simp` or `omega`), and `test_contrapositive` requires a multi-step propositional logic proof where `simp`/`omega`/`ring` all fail.
-
-**Cost**: each test makes 1–3 Claude Haiku API calls (~$0.001 total). Runtime is ~30–40 seconds, dominated by Lean REPL startup.
+---
 
 ## API Usage
 
-Set your API key before running:
-
-```bash
-export ANTHROPIC_API_KEY=sk-...
-```
-
 ### Single search (1 worker)
-
-The simplest end-to-end run. One Lean REPL process, one priority queue, one proof attempt.
 
 ```python
 import asyncio
-from policy.anthropic import AnthropicPolicy
+from policy.anthropic import AnthropicPolicy   # or: from policy.deepseek import DeepSeekPolicy
 from lean.repl import SubprocessExecutor
 from value.heuristic import HeuristicValue
 from search.best_first import BestFirstSearch
 
 async def main():
-    policy = AnthropicPolicy()          # Claude generates tactic candidates
-    executor = SubprocessExecutor()     # one Lean REPL subprocess
-    value = HeuristicValue()            # heuristic: fewer goals = more promising
+    policy = AnthropicPolicy()       # reads ANTHROPIC_API_KEY from env
+    executor = SubprocessExecutor()
+    value = HeuristicValue()
 
     await executor.start()
     search = BestFirstSearch(policy=policy, executor=executor, value=value)
@@ -236,35 +259,31 @@ async def main():
         budget=100,
     )
 
-    print(result)           # ProofResult(success=True, steps=2, ...)
     if result.success:
-        print(result.proof_trace)   # ["intro n", "simp"]
+        print(result.proof_trace)    # e.g. ["intro n", "simp"]
 
     await executor.close()
+    await policy.close()
 
 asyncio.run(main())
 ```
 
 ### Parallel search (k workers)
 
-k independent searches run concurrently — each with its own Lean REPL and priority queue.
-
 ```python
 import asyncio
-from policy.anthropic import AnthropicPolicy
+from policy.deepseek import DeepSeekPolicy     # or AnthropicPolicy
 from lean.repl import SubprocessExecutor
 from value.heuristic import HeuristicValue
 from search.best_first import BestFirstSearch, prove_parallel
 
 async def main():
     k = 4
-    policy = AnthropicPolicy()
+    policy = DeepSeekPolicy()        # reads DEEPSEEK_API_KEY from env
     value = HeuristicValue()
 
-    # Each search gets its own executor (its own Lean REPL process)
     executors = [SubprocessExecutor() for _ in range(k)]
-    for e in executors:
-        await e.start()
+    await asyncio.gather(*[e.start() for e in executors])
 
     searches = [
         BestFirstSearch(policy=policy, executor=e, value=value)
@@ -277,18 +296,34 @@ async def main():
         budget=100,
     )
 
-    print(result)
+    print(result.success, result.proof_trace)
+
     for e in executors:
         await e.close()
+    await policy.close()
 
 asyncio.run(main())
 ```
 
 Each component is swappable:
-- Replace `AnthropicPolicy` with `MockPolicy` to test without API calls
+- Replace `AnthropicPolicy`/`DeepSeekPolicy` with `MockPolicy` to test without API calls
 - Replace `SubprocessExecutor` with `MockExecutor` to test without Lean
-- Replace `HeuristicValue` with a trained value model in later phases
-- `BestFirstSearch` can be replaced with more complex search algorithms like MCTSSearch(TODO)
+- Replace `HeuristicValue` with a trained value model
+- `BestFirstSearch` can be replaced with more complex search algorithms like MCTSSearch (TODO)
+
+---
+
+## Supported policies
+
+| Policy | Provider | Default model | Key env var |
+|---|---|---|---|
+| `AnthropicPolicy` | Anthropic | `claude-haiku-4-5-20251001` | `ANTHROPIC_API_KEY` |
+| `DeepSeekPolicy` | DeepSeek | `deepseek-chat` | `DEEPSEEK_API_KEY` |
+| `MockPolicy` | — | — | — |
+
+All LLM policies extend `BaseLLMPolicy` (`policy/base.py`). To add a new provider, subclass `BaseLLMPolicy` and implement `_call_api(user_prompt: str) -> str`.
+
+---
 
 ## Value model
 
@@ -298,19 +333,11 @@ The priority queue in `BestFirstSearch` ranks states by a value estimate from `H
 value = exp(-(1.0 × num_goals + 0.05 × depth))
 ```
 
-States with fewer open goals and shallower depth are explored first. Some examples:
+States with fewer open goals and shallower depth are explored first. This requires no training data — it is a deliberate baseline for early development.
 
-| State | num_goals | depth | value |
-|---|---|---|---|
-| Closed proof | 0 | — | 1.000 |
-| 1 goal, just started | 1 | 0 | 0.368 |
-| 1 goal, 3 tactics deep | 1 | 3 | 0.317 |
-| 2 goals, just started | 2 | 0 | 0.135 |
-| Error / dead branch | — | — | 0.000 |
+**Replacing it**: implement the `ValueModel` protocol in `core/value.py` and pass your model to `BestFirstSearch`. A trained value network would learn to predict the probability that a state leads to a closed proof — a much stronger signal than goal count alone.
 
-This requires no training data and no ML — it is a deliberate baseline for early development. The depth penalty is kept small (0.05) because depth is a weak signal: a deep state with 1 goal is still far better than a shallow state with 3 goals.
-
-**Replacing it**: implement the `ValueModel` protocol in `core/value.py` and pass your model to `BestFirstSearch`. A trained value network (e.g., a small transformer that reads the serialized proof state and outputs a scalar in `[0, 1]`) would learn to predict the probability that a state leads to a closed proof, which is a much stronger signal than goal count alone.
+---
 
 ## Key modules
 
@@ -322,7 +349,10 @@ This requires no training data and no ML — it is a deliberate baseline for ear
 | `core/value.py` | `ValueModel` protocol |
 | `lean/repl.py` | `LeanWorker` (REPL subprocess) + `SubprocessExecutor` |
 | `lean/mock_executor.py` | `MockExecutor` for testing without Lean |
-| `policy/mock.py` | `MockPolicy` — fixed tactics, no API calls |
+| `policy/base.py` | `BaseLLMPolicy` — shared prompt/parse logic for LLM policies |
 | `policy/anthropic.py` | `AnthropicPolicy` — calls Claude API |
+| `policy/deepseek.py` | `DeepSeekPolicy` — calls DeepSeek API (OpenAI-compatible) |
+| `policy/mock.py` | `MockPolicy` — fixed tactics, no API calls |
 | `value/heuristic.py` | `HeuristicValue` — goal count + depth heuristic |
 | `search/best_first.py` | `BestFirstSearch` + `prove_parallel` |
+| `run.py` | CLI entrypoint for mathematicians |

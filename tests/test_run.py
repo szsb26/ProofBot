@@ -28,7 +28,7 @@ class TestParseArgs:
         assert args.workers == 1
         assert args.budget == 100
         assert args.policy == "anthropic"
-        assert args.model == "claude-haiku-4-5-20251001"
+        assert args.model is None  # resolved at policy-creation time
         assert args.api_key is None
 
     def test_workers_and_budget(self):
@@ -48,6 +48,10 @@ class TestParseArgs:
     def test_mock_tactics_override(self):
         args = parse_args(["thm", "--policy", "mock", "--tactics", "simp,ring"])
         assert args.tactics == "simp,ring"
+
+    def test_deepseek_policy(self):
+        args = parse_args(["thm", "--policy", "deepseek"])
+        assert args.policy == "deepseek"
 
     def test_model_override(self):
         args = parse_args(["thm", "--model", "claude-sonnet-4-6"])
@@ -85,15 +89,21 @@ class TestCLIWithMock:
         result = main([_SIMPLE, *_MOCK_FLAGS, "--tactics", "simp,ring,omega", "--workers", "3", "--budget", "10"])
         assert result == 0
 
-    def test_missing_api_key_exits_with_error(self, capsys):
-        # anthropic policy with no key should print an error and exit 1
+    def test_missing_anthropic_key_exits_with_error(self, capsys):
         with patch.dict("os.environ", {}, clear=True):
-            with patch("run.load_dotenv"):  # prevent .env from loading a key
+            with patch("run.load_dotenv"):
                 with pytest.raises(SystemExit) as exc:
                     main([_SIMPLE, "--policy", "anthropic", "--executor", "mock"])
         assert exc.value.code == 1
-        captured = capsys.readouterr()
-        assert "ANTHROPIC_API_KEY" in captured.err
+        assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+    def test_missing_deepseek_key_exits_with_error(self, capsys):
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("run.load_dotenv"):
+                with pytest.raises(SystemExit) as exc:
+                    main([_SIMPLE, "--policy", "deepseek", "--executor", "mock"])
+        assert exc.value.code == 1
+        assert "DEEPSEEK_API_KEY" in capsys.readouterr().err
 
     def test_output_contains_proof_trace(self, capsys):
         main([_SIMPLE, *_MOCK_FLAGS, "--tactics", "simp", "--budget", "10"])
@@ -176,11 +186,11 @@ class TestCLIEndToEnd:
         assert "✓" in out
         assert "Lean 4 proof:" in out
 
-    def test_binomial_square(self, capsys):
-        # Level 1: arithmetic identity over Int — requires a Mathlib tactic
-        # (ring, exact Int.add_sq, etc.). Not provable by simp or omega alone.
+    def test_add_comm(self, capsys):
+        # Level 1: commutativity of natural number addition.
+        # Requires intro n m then omega — tests multi-step proof generation.
         result = main([
-            "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+            "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
             "--budget", "20",
         ])
         assert result == 0
@@ -204,6 +214,43 @@ class TestCLIEndToEnd:
         # 3 independent searches via the CLI --workers flag.
         result = main([
             "theorem foo : ∀ n : Nat, n + 0 = n := by",
+            "--workers", "3",
+            "--budget", "20",
+        ])
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "✓" in out
+
+
+# ---------------------------------------------------------------------------
+# Full end-to-end via CLI (slow, real Lean + real DeepSeek API)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not LEAN_PROJECT_DIR.exists(),
+    reason="lean_project not found",
+)
+@pytest.mark.skipif(
+    not os.environ.get("DEEPSEEK_API_KEY"),
+    reason="DEEPSEEK_API_KEY not set",
+)
+class TestCLIDeepSeekEndToEnd:
+
+    def test_simple_theorem(self, capsys):
+        result = main([
+            "theorem foo : ∀ n : Nat, n + 0 = n := by",
+            "--policy", "deepseek",
+            "--budget", "20",
+        ])
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "✓" in out
+        assert "Lean 4 proof:" in out
+
+    def test_parallel_search(self, capsys):
+        result = main([
+            "theorem foo : ∀ n : Nat, n + 0 = n := by",
+            "--policy", "deepseek",
             "--workers", "3",
             "--budget", "20",
         ])

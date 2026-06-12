@@ -323,10 +323,31 @@ class LeanWorker:
 
         # Parse response. Note that response is a JSON object which contains keys like proofState, goals, proofStatus, etc...
         if "message" in response:
-            # Tactic failed
+            # Tactic failed (REPL top-level error string)
             error_state = ProofState(
                 goals=state.goals,
                 error=response["message"],
+                depth=state.depth,
+                tactic_trace=state.tactic_trace,
+            )
+            return StepResult(
+                next_state=error_state,
+                tactic=tactic,
+                elapsed_ms=elapsed,
+            )
+
+        # The REPL can also report errors via a "messages" list even when it
+        # returns goals:[] — e.g. `exact bad_term` closes the goal syntactically
+        # but reports "Unknown identifier" in messages. Treat those as failures.
+        msg_errors = [
+            m for m in response.get("messages", [])
+            if m.get("severity") == "error"
+        ]
+        if msg_errors:
+            error_msg = "Lean error:\n" + msg_errors[0].get("data", "unknown error")
+            error_state = ProofState(
+                goals=state.goals,
+                error=error_msg,
                 depth=state.depth,
                 tactic_trace=state.tactic_trace,
             )

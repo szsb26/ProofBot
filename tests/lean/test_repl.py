@@ -9,6 +9,8 @@ TestProveParallelIntegration — slow, real Lean; tests k (BestFirstSearch,
 TestEndToEnd                 — slow, real Lean + real Anthropic API; tests the
                                full stack: AnthropicPolicy → BestFirstSearch →
                                SubprocessExecutor → lake exe repl
+TestDeepSeekEndToEnd         — slow, real Lean + real DeepSeek API; same stack
+                               with DeepSeekPolicy instead of AnthropicPolicy
 """
 
 import os
@@ -19,6 +21,7 @@ from lean.repl import SubprocessExecutor, _parse_goal_string, LEAN_PROJECT_DIR
 from core.proof_state import ProofState
 from policy.mock import MockPolicy
 from policy.anthropic import AnthropicPolicy
+from policy.deepseek import DeepSeekPolicy
 from value.heuristic import HeuristicValue
 from search.best_first import BestFirstSearch, prove_parallel
 
@@ -294,14 +297,13 @@ class TestEndToEnd:
                 await e.close()
             await policy.close()
 
-    async def test_binomial_square(self):
-        # Level 1: arithmetic identity over Int.
-        # simp and omega won't close this — Claude must produce "ring".
-        # ring checks that both sides of an algebraic equation are the same, by
-        # expanding and simplifying. It uses a) distributivity, commutativity, and associativity 
-        # of + and * to expand both sides to check the equality, hence ring.
+    async def test_add_comm(self):
+        # Level 1: commutativity of natural number addition.
+        # Requires intro to eliminate the ∀, then omega closes the arithmetic.
+        # More interesting than n+0=n because it requires two intros and proves
+        # a non-trivial symmetry.
         #
-        # Expected proof: intro a b; ring
+        # Expected proof: intro n m; omega
         policy = AnthropicPolicy()
         executor = SubprocessExecutor()
         await executor.start()
@@ -313,7 +315,7 @@ class TestEndToEnd:
                 k=8,
             )
             result = await search.prove(
-                "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+                "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
                 budget=20,
             )
             assert result.success
@@ -340,6 +342,96 @@ class TestEndToEnd:
             )
             result = await search.prove(
                 "theorem contrapositive : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by",
+                budget=20,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            await executor.close()
+            await policy.close()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end tests (slow, real Lean + real DeepSeek API)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not LEAN_PROJECT_DIR.exists(),
+    reason="lean_project not found",
+)
+@pytest.mark.skipif(
+    not os.environ.get("DEEPSEEK_API_KEY"),
+    reason="DEEPSEEK_API_KEY not set",
+)
+@pytest.mark.asyncio
+class TestDeepSeekEndToEnd:
+
+    async def test_deepseek_proves_simple_theorem(self):
+        # Full stack: DeepSeekPolicy calls the real DeepSeek API to generate
+        # tactics, BestFirstSearch drives the search, SubprocessExecutor
+        # verifies each tactic against a real lake exe repl process.
+        policy = DeepSeekPolicy()
+        executor = SubprocessExecutor()
+        await executor.start()
+        try:
+            search = BestFirstSearch(
+                policy=policy,
+                executor=executor,
+                value=HeuristicValue(),
+                k=8,
+            )
+            result = await search.prove(
+                "theorem foo : ∀ n : Nat, n + 0 = n := by",
+                budget=10,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            await executor.close()
+            await policy.close()
+
+    async def test_deepseek_prove_parallel(self):
+        # k independent searches via DeepSeekPolicy run concurrently.
+        k = 3
+        policy = DeepSeekPolicy()
+        value = HeuristicValue()
+        executors = [SubprocessExecutor() for _ in range(k)]
+        await asyncio.gather(*[e.start() for e in executors])
+        try:
+            searches = [
+                BestFirstSearch(policy=policy, executor=e, value=value, k=8)
+                for e in executors
+            ]
+            result = await prove_parallel(
+                "theorem foo : ∀ n : Nat, n + 0 = n := by",
+                searches=searches,
+                budget=10,
+            )
+            assert result.success
+            assert len(result.proof_trace) > 0
+        finally:
+            for e in executors:
+                await e.close()
+            await policy.close()
+
+    async def test_deepseek_add_comm(self):
+        # Level 1: commutativity of natural number addition.
+        # Requires intro n m then omega — tests that DeepSeek generates a
+        # meaningful two-step proof for a non-trivial arithmetic theorem.
+        #
+        # Expected proof: intro n m; omega
+        policy = DeepSeekPolicy()
+        executor = SubprocessExecutor()
+        await executor.start()
+        try:
+            search = BestFirstSearch(
+                policy=policy,
+                executor=executor,
+                value=HeuristicValue(),
+                k=8,
+            )
+            result = await search.prove(
+                "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
                 budget=20,
             )
             assert result.success

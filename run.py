@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from lean.repl import SubprocessExecutor, LEAN_PROJECT_DIR
 from lean.mock_executor import MockExecutor
 from policy.anthropic import AnthropicPolicy
+from policy.deepseek import DeepSeekPolicy
 from policy.mock import MockPolicy
 from search.best_first import BestFirstSearch, prove_parallel
 from value.heuristic import HeuristicValue
@@ -65,9 +66,9 @@ examples:
     )
     parser.add_argument(
         "--policy",
-        choices=["anthropic", "mock"],
+        choices=["anthropic", "deepseek", "mock"],
         default="anthropic",
-        help="tactic generation policy: anthropic (default) or mock (no API calls, for testing)",
+        help="tactic generation policy: anthropic (default), deepseek, or mock (no API calls, for testing)",
     )
     parser.add_argument(
         "--tactics",
@@ -76,15 +77,15 @@ examples:
     )
     parser.add_argument(
         "--model",
-        default="claude-haiku-4-5-20251001",
+        default=None,
         metavar="MODEL",
-        help="Claude model ID (default: claude-haiku-4-5-20251001)",
+        help="model ID to use (default: claude-haiku-4-5-20251001 for anthropic, deepseek-chat for deepseek)",
     )
     parser.add_argument(
         "--api-key",
         default=None,
         metavar="KEY",
-        help="Anthropic API key (overrides ANTHROPIC_API_KEY env var)",
+        help="API key (overrides ANTHROPIC_API_KEY or DEEPSEEK_API_KEY env var)",
     )
     # Hidden flag for testing: forces MockExecutor so no Lean install is needed.
     parser.add_argument(
@@ -96,20 +97,37 @@ examples:
     return parser.parse_args(argv)
 
 
+_POLICY_DEFAULTS = {
+    "anthropic": "claude-haiku-4-5-20251001",
+    "deepseek": "deepseek-chat",
+}
+
+_POLICY_ENV_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+}
+
+
 def _make_policy(args: argparse.Namespace):
     if args.policy == "mock":
         tactics = [t.strip() for t in args.tactics.split(",") if t.strip()]
         return MockPolicy(tactics=tactics)
-    api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    env_var = _POLICY_ENV_VARS[args.policy]
+    api_key = args.api_key or os.environ.get(env_var, "")
     if not api_key:
         print(
-            "error: ANTHROPIC_API_KEY is not set.\n"
-            "  Set it in your shell:  export ANTHROPIC_API_KEY=sk-...\n"
-            "  Or pass it directly:   python run.py ... --api-key sk-...",
+            f"error: {env_var} is not set.\n"
+            f"  Set it in your shell:  export {env_var}=...\n"
+            f"  Or pass it directly:   python run.py ... --api-key ...",
             file=sys.stderr,
         )
         sys.exit(1)
-    return AnthropicPolicy(model=args.model, api_key=api_key)
+
+    model = args.model or _POLICY_DEFAULTS[args.policy]
+    if args.policy == "anthropic":
+        return AnthropicPolicy(model=model, api_key=api_key)
+    return DeepSeekPolicy(model=model, api_key=api_key)
 
 
 def _make_executors(args: argparse.Namespace, k: int):
@@ -157,7 +175,11 @@ async def _run(args: argparse.Namespace) -> int:
 
 def _print_header(args: argparse.Namespace) -> None:
     workers_str = f"{args.workers} worker" + ("s" if args.workers > 1 else "")
-    policy_str = f"anthropic ({args.model})" if args.policy == "anthropic" else "mock"
+    if args.policy == "mock":
+        policy_str = "mock"
+    else:
+        model = args.model or _POLICY_DEFAULTS.get(args.policy, "")
+        policy_str = f"{args.policy} ({model})"
     print(f"\nTheorem : {args.theorem.strip()}")
     print(f"Search  : {workers_str}, budget={args.budget}, policy={policy_str}\n")
 

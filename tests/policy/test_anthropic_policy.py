@@ -21,7 +21,8 @@ import pytest
 
 from core.policy import TacticCandidate
 from core.proof_state import make_proof_state, ProofState
-from policy.anthropic import AnthropicPolicy, _parse_tactics, _build_user_prompt
+from policy.anthropic import AnthropicPolicy
+from policy.base import parse_tactics as _parse_tactics, build_user_prompt as _build_user_prompt
 
 
 # ---------------------------------------------------------------------------
