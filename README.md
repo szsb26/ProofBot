@@ -6,6 +6,112 @@ This repo implements a generalized mathematical theorem prover using Large Langu
 
 This repo instead implements a generalized framework for mathematical theorem provers. Specifically, a theorem prover is a combination of 2 components: A) the LLM, and B) the underlying search algorithm guiding the LLM. The search algorithm used is rather flexible. For ex., the simplest approach uses the Best First Search, which is a simple priority queue which ranks candidate Lean tactics. A more complex search algorithm is MCTS, which requires a value network and Monte Carlo rollouts to guide the LLM. Because each mathematical statement output by the LLM is rigorously verified by LEAN, and the search algorithm looks ahead in the proof, generalized mathematical theorem provers are much more accurate than using the LLM alone.
 
+## Using the prover (no Python required)
+
+This section is for mathematicians who want to prove theorems from the command line without writing any code.
+
+### 1. Get an API key
+
+The prover uses Claude (an LLM) to generate proof steps. You need a free API key from Anthropic:
+
+1. Go to [console.anthropic.com](https://console.anthropic.com) and create an account
+2. Navigate to **API Keys** and create a new key
+3. Copy the key — it starts with `sk-ant-...`
+
+### 2. One-time setup
+
+```bash
+# Clone the repo
+git clone <repo-url>
+cd theorem_prover
+
+# Create a Python environment and install dependencies
+python -m venv .venv
+source .venv/bin/activate      # on Windows: .venv\Scripts\activate
+pip install -e .
+
+# Build the Lean project (downloads and compiles Mathlib — takes ~5 minutes)
+cd lean_project && lake build && cd ..
+```
+
+### 3. Set your API key
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+You can also create a `.env` file in the project root so you don't have to set it every session:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### 4. Prove a theorem
+
+Pass your Lean 4 theorem statement as a string. The statement must end with `:= by`:
+
+```bash
+python run.py "theorem add_comm_example : ∀ n m : Nat, n + m = m + n := by"
+```
+
+Output:
+```
+Theorem : theorem add_comm_example : ∀ n m : Nat, n + m = m + n := by
+Search  : 1 worker, budget=100, policy=anthropic (claude-haiku-4-5-20251001)
+
+Starting Lean workers... ready.
+Searching...
+
+✓  Proof found in 3.1s (2 nodes)
+
+Lean 4 proof:
+  theorem add_comm_example : ∀ n m : Nat, n + m = m + n := by
+    intro n m
+    omega
+```
+
+The **Lean 4 proof** block at the bottom is a complete, verified proof you can paste directly into your Lean file.
+
+### 5. Writing theorem statements
+
+Your theorem statement should be valid Lean 4 syntax ending in `:= by`. Some examples:
+
+```bash
+# Natural number arithmetic
+python run.py "theorem foo : ∀ n : Nat, n + 0 = n := by"
+
+# Integer algebra (uses Mathlib's ring tactic)
+python run.py "theorem foo : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by"
+
+# Propositional logic
+python run.py "theorem foo : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by"
+
+# Give your theorem a meaningful name
+python run.py "theorem my_lemma : ∀ n : Nat, n * 2 = n + n := by"
+```
+
+### 6. When the search fails
+
+If the prover returns `✗ No proof found`, try:
+
+```bash
+# Give it more search budget (default is 100 nodes)
+python run.py "theorem foo : ..." --budget 300
+
+# Run multiple independent searches in parallel
+python run.py "theorem foo : ..." --workers 4
+
+# Both together for harder theorems
+python run.py "theorem foo : ..." --workers 4 --budget 200
+
+# Use a more powerful model (higher cost, better reasoning)
+python run.py "theorem foo : ..." --model claude-sonnet-4-6
+```
+
+**Cost**: the default model (Claude Haiku) costs roughly $0.001 per proof attempt — a $20 API credit will cover thousands of attempts.
+
+---
+
 ## Architecture
 
 ```
