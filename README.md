@@ -36,6 +36,40 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+## Quick start
+
+Set your API key, then pass a Lean 4 theorem statement:
+
+```bash
+export ANTHROPIC_API_KEY=sk-...
+
+python run.py "theorem foo : ∀ n : Nat, n + 0 = n := by"
+```
+
+Example output:
+```
+Theorem : theorem foo : ∀ n : Nat, n + 0 = n := by
+Search  : 1 worker, budget=100, policy=anthropic (claude-haiku-4-5-20251001)
+
+Starting Lean workers... ready.
+Searching...
+
+✓  Proof found in 2.3s (2 nodes)
+
+Lean 4 proof:
+  theorem foo : ∀ n : Nat, n + 0 = n := by
+    simp
+```
+
+**Options:**
+
+```
+python run.py "theorem ..." --workers 4    # run 4 parallel searches
+python run.py "theorem ..." --budget 200   # expand up to 200 nodes per search
+python run.py "theorem ..." --model claude-sonnet-4-6  # use a stronger model
+python run.py "theorem ..." --api-key sk-...            # pass key directly
+```
+
 ## Running tests
 
 ```bash
