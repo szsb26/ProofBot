@@ -127,34 +127,38 @@ class TestCLIWithMock:
     reason="lean_project not found",
 )
 class TestCLIIntegration:
+    # Uses LEAN_SKIP_MATHLIB=1 so executors start in ~1s (no 300s Mathlib load).
+    # MockPolicy only needs simp/omega which are core Lean 4 tactics.
 
     def test_proves_simple_theorem_with_real_lean(self):
-        # MockPolicy supplies tactics; SubprocessExecutor verifies them against real Lean.
-        result = main([
-            _FORALL,
-            "--policy", "mock",
-            "--tactics", "simp,ring,omega,intro n",
-            "--budget", "20",
-        ])
+        with patch.dict("os.environ", {"LEAN_SKIP_MATHLIB": "1"}):
+            result = main([
+                _FORALL,
+                "--policy", "mock",
+                "--tactics", "simp,ring,omega,intro n",
+                "--budget", "20",
+            ])
         assert result == 0
 
     def test_parallel_workers_with_real_lean(self):
-        result = main([
-            _FORALL,
-            "--policy", "mock",
-            "--tactics", "simp,ring,omega,intro n",
-            "--workers", "3",
-            "--budget", "20",
-        ])
+        with patch.dict("os.environ", {"LEAN_SKIP_MATHLIB": "1"}):
+            result = main([
+                _FORALL,
+                "--policy", "mock",
+                "--tactics", "simp,ring,omega,intro n",
+                "--workers", "3",
+                "--budget", "20",
+            ])
         assert result == 0
 
     def test_proof_trace_printed(self, capsys):
-        main([
-            _FORALL,
-            "--policy", "mock",
-            "--tactics", "simp,ring,omega,intro n",
-            "--budget", "20",
-        ])
+        with patch.dict("os.environ", {"LEAN_SKIP_MATHLIB": "1"}):
+            main([
+                _FORALL,
+                "--policy", "mock",
+                "--tactics", "simp,ring,omega,intro n",
+                "--budget", "20",
+            ])
         captured = capsys.readouterr()
         assert "Lean 4 proof:" in captured.out
         assert ":= by" in captured.out
@@ -186,12 +190,12 @@ class TestCLIEndToEnd:
         assert "✓" in out
         assert "Lean 4 proof:" in out
 
-    def test_add_comm(self, capsys):
-        # Level 1: commutativity of natural number addition.
-        # Requires intro n m then omega — tests multi-step proof generation.
+    def test_binomial_square(self, capsys):
+        # Level 1: algebraic identity over Int — requires ring (Mathlib tactic).
+        # Executors load Mathlib by default so ring is available.
         result = main([
-            "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
-            "--budget", "20",
+            "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+            "--budget", "50",
         ])
         assert result == 0
         out = capsys.readouterr().out

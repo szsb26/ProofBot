@@ -201,19 +201,18 @@ python run.py "theorem ..." --api-key sk-...      # pass key directly
 ## Running tests
 
 ```bash
-# Fast unit tests (no Lean, no API key)
+# Fast unit tests (no Lean, no API key) — seconds
 source .venv/bin/activate
 pytest tests/ --ignore=tests/lean/test_repl.py -q
 
-# Lean integration tests (no API key needed)
-pytest tests/ -q
+# Lean infrastructure tests (no API key, no Mathlib load) — ~30s
+LEAN_SKIP_MATHLIB=1 pytest tests/lean/test_repl.py -k "not EndToEnd" -q
 
-# Anthropic end-to-end tests (real Claude API + real Lean)
-ANTHROPIC_API_KEY=sk-ant-... pytest tests/lean/test_repl.py::TestEndToEnd -v
-
-# DeepSeek end-to-end tests (real DeepSeek API + real Lean)
-DEEPSEEK_API_KEY=sk-... pytest tests/lean/test_repl.py::TestDeepSeekEndToEnd -v
+# Full suite including end-to-end (loads Mathlib, ~5 min startup per worker)
+ANTHROPIC_API_KEY=sk-ant-... DEEPSEEK_API_KEY=sk-... pytest tests/ -q
 ```
+
+`LEAN_SKIP_MATHLIB=1` skips the `import LeanProject` step so REPL workers start in ~1s instead of ~300s. Use it when running infrastructure tests that don't exercise Mathlib tactics (`ring`, `linarith`, etc.).
 
 ### Test suite overview
 

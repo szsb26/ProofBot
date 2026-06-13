@@ -92,11 +92,13 @@ class LeanWorker:
     without blocking on any single REPL interaction.
     """
 
-    def __init__(self, lean_project_dir: Path):
+    def __init__(self, lean_project_dir: Path, load_mathlib: bool = True):
         self._dir = lean_project_dir
         self._proc: Optional[asyncio.subprocess.Process] = None
-        # Maps stable_hash -> proofState number in the REPL
         self._proof_state_cache: dict[str, int] = {}
+        self._load_mathlib = load_mathlib
+        # env number returned by "import LeanProject"; 0 if not loaded
+        self._base_env: int = 0
 
     async def start(self) -> None:
         """Launch the lake exe repl subprocess.
@@ -132,6 +134,20 @@ class LeanWorker:
             cwd=str(self._dir),
         )
         logger.debug(f"Started Lean worker pid={self._proc.pid}")
+
+        if self._load_mathlib:
+            # Load the compiled project (imports Mathlib) so that tactics like
+            # ring, linarith, norm_num etc. are available. Uses pre-built .olean
+            # files from `lake build` — slow (~300s) but paid once per process.
+            logger.debug("Importing LeanProject (loading Mathlib from .olean files)...")
+            response = await self._send({"cmd": "import LeanProject"}, timeout=720.0)
+            errors = [m for m in response.get("messages", []) if m.get("severity") == "error"]
+            if errors:
+                raise LeanREPLError(
+                    f"Failed to import LeanProject: {errors[0].get('data', 'unknown error')}"
+                )
+            self._base_env = response.get("env", 0)
+            logger.debug(f"LeanProject loaded in env {self._base_env}")
 
     async def stop(self) -> None:
         """Terminate the subprocess cleanly.
@@ -230,7 +246,16 @@ class LeanWorker:
             theorem = theorem.rstrip() + " := by"
         cmd = theorem + "\n  sorry"
 
-        response = await self._send({"cmd": cmd})
+        # Pass "env" only when Mathlib was loaded. After "import LeanProject",
+        # the REPL assigns env 0 to the Mathlib environment. We must pass
+        # "env": 0 explicitly so the theorem is elaborated there; without it
+        # the REPL uses a fresh blank context where ring/linarith are unavailable.
+        # For load_mathlib=False we omit "env" entirely — a fresh REPL has no
+        # saved envs yet and passing "env": 0 causes "Unknown environment.".
+        payload: dict = {"cmd": cmd}
+        if self._load_mathlib:
+            payload["env"] = self._base_env
+        response = await self._send(payload)
 
         # Check for parse errors
         if "message" in response and "sorries" not in response:
@@ -413,15 +438,17 @@ class SubprocessExecutor:
     def __init__(
         self,
         lean_project_dir: Path = LEAN_PROJECT_DIR,
+        load_mathlib: bool = True,
     ):
         self._dir = lean_project_dir
+        self._load_mathlib = load_mathlib
         self._worker: Optional[LeanWorker] = None
         self._lock = asyncio.Lock()
         self._started = False
 
     async def start(self) -> None:
         """Start the Lean worker process. Must be called before use."""
-        self._worker = LeanWorker(self._dir)
+        self._worker = LeanWorker(self._dir, load_mathlib=self._load_mathlib)
         await self._worker.start()
         self._started = True
         logger.info("Started Lean worker")

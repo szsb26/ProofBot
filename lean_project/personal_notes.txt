@@ -18,3 +18,23 @@ Apply tactic:
 Branching:
 - send two different tactics with same proofState N
 - → get independent proofState N+1 and N+2
+
+# How compiled libraries work in Lean
+
+lake build
+  └── compiles Mathlib source → .olean files on disk  (run once, takes hours)
+
+lake exe repl
+  └── boots a blank Lean process, waits for JSON commands  (takes ~1s)
+
+{"cmd": "import LeanProject"}
+  └── reads .olean files from disk into memory  (takes ~300s)
+  └── returns {"env": 1}  ← now ring, linarith, etc. are all available
+
+{"cmd": "theorem foo ...", "env": 1}
+  └── elaborates in the Mathlib-loaded environment  (takes milliseconds)
+
+# LEAN is not like python, and only contains a couple of major libraries
+  - Init: ships with Lean itself, absolute core (basic types, logic primitives)
+  - Batteries: extended standard library, data structures, more utilities etc...
+  - Mathlib: the giant, covers most of mathematics; depends on Batteries

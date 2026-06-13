@@ -140,7 +140,8 @@ def _make_executors(args: argparse.Namespace, k: int):
             file=sys.stderr,
         )
         sys.exit(1)
-    return [SubprocessExecutor() for _ in range(k)]
+    load_mathlib = not os.environ.get("LEAN_SKIP_MATHLIB")
+    return [SubprocessExecutor(load_mathlib=load_mathlib) for _ in range(k)]
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -152,7 +153,11 @@ async def _run(args: argparse.Namespace) -> int:
 
     use_real_lean = args.executor != "mock"
     if use_real_lean:
-        print("Starting Lean workers...", end=" ", flush=True)
+        load_mathlib = not os.environ.get("LEAN_SKIP_MATHLIB")
+        if load_mathlib:
+            print("Starting Lean workers (loading Mathlib, ~5 min first run)...", end=" ", flush=True)
+        else:
+            print("Starting Lean workers...", end=" ", flush=True)
         await asyncio.gather(*[e.start() for e in executors])
         print("ready.\n")
 

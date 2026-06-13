@@ -77,7 +77,7 @@ class TestSubprocessExecutor:
     @pytest_asyncio.fixture
     async def executor(self):
         """Start one executor before each test, shut it down after."""
-        exec_ = SubprocessExecutor()
+        exec_ = SubprocessExecutor(load_mathlib=False)
         await exec_.start()
         yield exec_
         await exec_.close()
@@ -114,7 +114,9 @@ class TestSubprocessExecutor:
         assert r2.proof_closed
 
     async def test_step_failing_tactic(self, executor):
-        # "ring" cannot close a ∀ goal directly — REPL reports an error.
+        # "ring" on a ∀ goal fails — Mathlib not loaded in this fixture
+        # (load_mathlib=False for speed); even with Mathlib, ring requires
+        # intro first. Either way the REPL reports an error.
         state = await executor.reset(
             "theorem foo : ∀ n : Nat, n + 0 = n := by"
         )
@@ -142,8 +144,8 @@ class TestSubprocessExecutor:
     async def test_two_executors_independent(self):
         # Two SubprocessExecutor instances each own their own REPL process.
         # They must be able to run concurrent proofs without interfering.
-        exec0 = SubprocessExecutor()
-        exec1 = SubprocessExecutor()
+        exec0 = SubprocessExecutor(load_mathlib=False)
+        exec1 = SubprocessExecutor(load_mathlib=False)
         await exec0.start()
         await exec1.start()
         try:
@@ -188,7 +190,7 @@ class TestProveParallelIntegration:
         policy = MockPolicy(tactics=["simp", "ring", "omega", "intro n"])
         value = HeuristicValue()
 
-        executors = [SubprocessExecutor() for _ in range(k)]
+        executors = [SubprocessExecutor(load_mathlib=False) for _ in range(k)]
         await asyncio.gather(*[e.start() for e in executors])
 
         try:
@@ -214,7 +216,7 @@ class TestProveParallelIntegration:
         policy = MockPolicy(tactics=["not_a_tactic", "also_invalid"])
         value = HeuristicValue()
 
-        executors = [SubprocessExecutor() for _ in range(k)]
+        executors = [SubprocessExecutor(load_mathlib=False) for _ in range(k)]
         await asyncio.gather(*[e.start() for e in executors])
 
         try:
@@ -297,26 +299,25 @@ class TestEndToEnd:
                 await e.close()
             await policy.close()
 
-    async def test_add_comm(self):
-        # Level 1: commutativity of natural number addition.
-        # Requires intro to eliminate the ∀, then omega closes the arithmetic.
-        # More interesting than n+0=n because it requires two intros and proves
-        # a non-trivial symmetry.
+    async def test_binomial_square(self):
+        # Level 1: algebraic identity over Int requiring a Mathlib tactic.
+        # ring normalises both sides of a polynomial equation — it's only
+        # available after LeanProject is imported (load_mathlib=True default).
         #
-        # Expected proof: intro n m; omega
+        # Expected proof: intro a b; ring
         policy = AnthropicPolicy()
-        executor = SubprocessExecutor()
+        executor = SubprocessExecutor()  # load_mathlib=True by default
         await executor.start()
         try:
             search = BestFirstSearch(
                 policy=policy,
                 executor=executor,
                 value=HeuristicValue(),
-                k=8,
+                k=12,
             )
             result = await search.prove(
-                "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
-                budget=20,
+                "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+                budget=50,
             )
             assert result.success
             assert len(result.proof_trace) > 0
