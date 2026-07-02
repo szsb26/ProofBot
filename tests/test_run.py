@@ -9,7 +9,6 @@ TestCLIEndToEnd      — slow, real Lean + real Anthropic API; full stack via CL
 
 import os
 import pytest
-import asyncio
 from unittest.mock import patch
 
 from lean.repl import LEAN_PROJECT_DIR
@@ -60,6 +59,24 @@ class TestParseArgs:
     def test_api_key_flag(self):
         args = parse_args(["thm", "--api-key", "sk-test"])
         assert args.api_key == "sk-test"
+
+    def test_interactive_flag(self):
+        args = parse_args(["--interactive"])
+        assert args.interactive is True
+        assert args.theorem is None
+
+    def test_interactive_short_flag(self):
+        args = parse_args(["-i"])
+        assert args.interactive is True
+
+    def test_interactive_default_is_false(self):
+        args = parse_args(["thm"])
+        assert args.interactive is False
+
+    def test_theorem_optional_without_interactive(self):
+        # theorem=None is allowed at parse time; main() catches the missing value
+        args = parse_args([])
+        assert args.theorem is None
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +133,72 @@ class TestCLIWithMock:
         captured = capsys.readouterr()
         assert "✗" in captured.out
         assert "--budget" in captured.out or "--workers" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Interactive mode (no Lean, no API key — uses mock executor + mock policy)
+# ---------------------------------------------------------------------------
+
+class TestCLIInteractive:
+
+    def test_quit_exits_cleanly(self):
+        with patch("builtins.input", side_effect=["quit"]):
+            result = main(["--interactive", *_MOCK_FLAGS])
+        assert result == 0
+
+    def test_eof_exits_cleanly(self):
+        with patch("builtins.input", side_effect=EOFError()):
+            result = main(["--interactive", *_MOCK_FLAGS])
+        assert result == 0
+
+    def test_keyboard_interrupt_exits_cleanly(self):
+        with patch("builtins.input", side_effect=KeyboardInterrupt()):
+            result = main(["--interactive", *_MOCK_FLAGS])
+        assert result == 0
+
+    def test_proves_theorem_and_quits(self, capsys):
+        with patch("builtins.input", side_effect=[_SIMPLE, "quit"]):
+            result = main(["--interactive", *_MOCK_FLAGS, "--tactics", "simp", "--budget", "10"])
+        assert result == 0
+        assert "✓" in capsys.readouterr().out
+
+    def test_skips_empty_input(self, capsys):
+        with patch("builtins.input", side_effect=["", "  ", _SIMPLE, "quit"]):
+            result = main(["--interactive", *_MOCK_FLAGS, "--tactics", "simp", "--budget", "10"])
+        assert result == 0
+        assert "✓" in capsys.readouterr().out
+
+    def test_adds_by_suffix_if_missing(self, capsys):
+        theorem_no_by = "theorem foo : n + 0 = n"
+        with patch("builtins.input", side_effect=[theorem_no_by, "quit"]):
+            result = main(["--interactive", *_MOCK_FLAGS, "--tactics", "simp", "--budget", "10"])
+        assert result == 0
+        assert "✓" in capsys.readouterr().out
+
+    def test_failure_prints_cross_and_continues(self, capsys):
+        # A theorem that can't be closed still returns 0 (session exit, not proof exit)
+        with patch("builtins.input", side_effect=[_SIMPLE, "quit"]):
+            result = main(["--interactive", *_MOCK_FLAGS, "--tactics", "not_a_tactic", "--budget", "3"])
+        assert result == 0
+        assert "✗" in capsys.readouterr().out
+
+    def test_multiple_theorems_in_one_session(self, capsys):
+        with patch("builtins.input", side_effect=[_SIMPLE, _SIMPLE, "quit"]):
+            result = main(["--interactive", *_MOCK_FLAGS, "--tactics", "simp", "--budget", "10"])
+        assert result == 0
+        assert capsys.readouterr().out.count("✓") == 2
+
+    def test_output_includes_proof_trace(self, capsys):
+        with patch("builtins.input", side_effect=[_SIMPLE, "quit"]):
+            main(["--interactive", *_MOCK_FLAGS, "--tactics", "simp", "--budget", "10"])
+        out = capsys.readouterr().out
+        assert "Lean 4 proof:" in out
+        assert "simp" in out
+
+    def test_no_theorem_without_interactive_exits(self):
+        with pytest.raises(SystemExit) as exc:
+            main([])
+        assert exc.value.code == 1
 
 
 # ---------------------------------------------------------------------------

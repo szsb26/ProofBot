@@ -6,6 +6,7 @@ Mathematicians can use this directly without writing Python:
 
     python run.py "theorem foo : ∀ n : Nat, n + 0 = n := by"
     python run.py "theorem foo : ..." --workers 4 --budget 50
+    python run.py --interactive          # warm session; prove many theorems
 
 Set ANTHROPIC_API_KEY in your environment (or .env file) before running.
 """
@@ -48,7 +49,9 @@ examples:
     )
     parser.add_argument(
         "theorem",
-        help='Lean 4 theorem statement (must end with ":= by")',
+        nargs="?",
+        default=None,
+        help='Lean 4 theorem statement (must end with ":= by"); omit when using --interactive',
     )
     parser.add_argument(
         "--workers", "-k",
@@ -86,6 +89,12 @@ examples:
         default=None,
         metavar="KEY",
         help="API key (overrides ANTHROPIC_API_KEY or DEEPSEEK_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--interactive", "-i",
+        action="store_true",
+        default=False,
+        help="interactive mode: prove multiple theorems in one session without reloading Mathlib",
     )
     # Hidden flag for testing: forces MockExecutor so no Lean install is needed.
     parser.add_argument(
@@ -193,7 +202,7 @@ def _print_result(args: argparse.Namespace, result) -> None:
     if result.success:
         print(f"✓  Proof found in {result.elapsed_ms / 1000:.1f}s ({result.nodes_visited} nodes)\n")
         print("Lean 4 proof:")
-        theorem = args.theorem.strip()
+        theorem = result.theorem.strip()
         if not theorem.endswith(":= by"):
             theorem = theorem + " := by"
         print(f"  {theorem}")
@@ -208,9 +217,74 @@ def _print_result(args: argparse.Namespace, result) -> None:
         )
 
 
+async def _interactive(args: argparse.Namespace) -> int:
+    """Keep Lean workers warm across multiple theorem submissions."""
+    policy = _make_policy(args)
+    executors = _make_executors(args, args.workers)
+    value = HeuristicValue()
+
+    use_real_lean = args.executor != "mock"
+    if use_real_lean:
+        load_mathlib = not os.environ.get("LEAN_SKIP_MATHLIB")
+        if load_mathlib:
+            print("Starting Lean workers (loading Mathlib, ~10 min first run)...", end=" ", flush=True)
+        else:
+            print("Starting Lean workers...", end=" ", flush=True)
+        await asyncio.gather(*[e.start() for e in executors])
+        print("ready.")
+
+    workers_str = f"{args.workers} worker" + ("s" if args.workers > 1 else "")
+    if args.policy == "mock":
+        policy_str = "mock"
+    else:
+        model = args.model or _POLICY_DEFAULTS.get(args.policy, "")
+        policy_str = f"{args.policy} ({model})"
+    print(f"\nInteractive mode — {workers_str}, budget={args.budget}, policy={policy_str}")
+    print("Enter a theorem statement, or 'quit' to exit.\n")
+
+    try:
+        while True:
+            try:
+                theorem = input("theorem> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nGoodbye.")
+                break
+
+            if theorem.lower() in ("quit", "exit", "q"):
+                print("Goodbye.")
+                break
+
+            if not theorem:
+                continue
+
+            if not theorem.endswith(":= by"):
+                theorem = theorem + " := by"
+
+            searches = [
+                BestFirstSearch(policy=policy, executor=e, value=value)
+                for e in executors
+            ]
+
+            print("Searching...", flush=True)
+            result = await prove_parallel(theorem, searches=searches, budget=args.budget)
+            _print_result(args, result)
+    finally:
+        if use_real_lean:
+            await asyncio.gather(*[e.close() for e in executors])
+        if hasattr(policy, "close"):
+            await policy.close()
+
+    return 0
+
+
 def main(argv=None) -> int:
     load_dotenv()
     args = parse_args(argv)
+    if args.interactive:
+        return asyncio.run(_interactive(args))
+    if not args.theorem:
+        print("error: provide a theorem statement or use --interactive", file=sys.stderr)
+        sys.exit(1)
     return asyncio.run(_run(args))
 
 
