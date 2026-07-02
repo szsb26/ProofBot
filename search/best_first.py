@@ -139,7 +139,7 @@ class BestFirstSearch:
 
         Args:
             theorem: The Lean 4 theorem statement to prove.
-            budget:  Maximum number of nodes to expand before giving up. Each unit of budget is equal to
+            budget:  Maximum number of unique nodes/states to explore before giving up. Each unit of budget is equal to
                      one node expansion, which involves popping a node from the priority queue, one LLM call +
                      k Lean REPL calls.
 
@@ -203,7 +203,8 @@ class BestFirstSearch:
             visited.add(state_hash)
             nodes_visited += 1
 
-            # Get tactic candidates from the policy. For ex., policy can be Anthropic policy
+            # Get tactic candidates from the policy. For ex., policy can be Anthropic policy.
+            # For the Anthropic policy, a single call returns k tactic candidates.
             candidates = await self.policy.get_tactics(
                 node.state,
                 self.premises,

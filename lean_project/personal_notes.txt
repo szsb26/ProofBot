@@ -9,7 +9,7 @@ Initialize proof:
 - send: {"cmd": "theorem ... := by\n  sorry"}
 - recv: {"sorries": [{"proofState": 0, "goal": "⊢ ..."}], "env": 0}
 
-Apply tactic:
+How LLM applies tactic:
 - send: {"tactic": "simp", "proofState": 0}
 - recv (success):  {"proofState": 1, "goals": ["n : Nat\n⊢ n + 0 = n"]}
 - recv (complete): {"proofState": 2, "goals": [], "proofStatus": "Completed"}
@@ -22,7 +22,8 @@ Branching:
 # How compiled libraries work in Lean
 
 lake build
-  └── compiles Mathlib source → .olean files on disk  (run once, takes hours)
+  └── compiles Mathlib source → .olean files on disk  (run once, takes hours). 
+      .olean files are precompiled and downloaded via lake since they take hours to compile.
 
 lake exe repl
   └── boots a blank Lean process, waits for JSON commands  (takes ~1s)
@@ -34,7 +35,33 @@ lake exe repl
 {"cmd": "theorem foo ...", "env": 1}
   └── elaborates in the Mathlib-loaded environment  (takes milliseconds)
 
-# LEAN is not like python, and only contains a couple of major libraries
+# LEAN contains a couple of major packages
   - Init: ships with Lean itself, absolute core (basic types, logic primitives)
   - Batteries: extended standard library, data structures, more utilities etc...
   - Mathlib: the giant, covers most of mathematics; depends on Batteries
+
+# Mathlib stores lemmas that were proven before. For ex., 
+  - 'Differentiable.continuous', usage: 'apply Differentiable.continuous'. This theorem says
+    that differentiable functions are continuous
+
+# Lean Tactics:
+  - 'intro': strips the goal down into hypotheses/local context. 
+      - "Let's assume the left side is true..." (for A -> B)
+      - "Let me pick an arbitrary object x..." (for all x)
+  - 'simp': stands for simplifier, and is the "auto-pilot" for algebraic simplification.
+    Use simp when goal or assumption looks messy, redundant, or contains math operations
+    that obviously should reduce to something simpler.
+      - Think of it like the "simplify" button on a graphing calculator.
+      - "x + 0 (which should just be x)"
+      - "true ^ P (should just be P)"
+  - 'omega': powerhouse tactic for solving integer and nautral number arithmetic. Use omega
+    when goal consist of math statements about 'Nat' (natural numbers) or 'Int' (integers), and the
+    conclusion logically must follow from those facts, even if it requires a bit of algebraic balancing.
+      - context/hypotheses: ' h1: a < b', 'h2 : b <= c', Goal = 'a<c', use 'omega' to close goal instantly
+      - context/hypotheses: 'h1 : x + 5 < 10', 'h2 : x > 6', Goal: False use 'omega' to close the goal instantly
+  - 'ring': dedicated tool for solving algebraic equalities using the standard rules of a commutative ring.
+    Use ring when goal is an equality where both sides are clearly the same algebraic expression, just written
+    in a different order or format. Unlike omega which handles inequalities like < and <= for integers, ring
+    works on any type that behaves like a mathematical ring, meaning it works on Real, Complex, Rational, Int
+      - Goal = (x+y)^2 = x^2 + 2xy + y^2 use 'ring' to immediately close the goal.
+     

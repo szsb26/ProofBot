@@ -247,44 +247,39 @@ class TestProveParallelIntegration:
     not os.environ.get("ANTHROPIC_API_KEY"),
     reason="ANTHROPIC_API_KEY not set",
 )
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 class TestEndToEnd:
+    # Mathlib loads once per class (shared_lean fixture).  The parallel test
+    # still starts k=2 fresh executors — reusing the shared one there would risk
+    # corrupting the REPL's stdout buffer if that search gets cancelled first.
 
-    async def test_anthropic_proves_simple_theorem(self):
-        # Full stack: AnthropicPolicy calls the real Claude API to generate
-        # tactics, BestFirstSearch drives the search, SubprocessExecutor
-        # verifies each tactic against a real lake exe repl process.
+    @pytest_asyncio.fixture(scope="class", loop_scope="class")
+    async def shared_lean(self):
+        """Start one Mathlib-loaded executor shared across all non-parallel tests."""
         policy = AnthropicPolicy()
         executor = SubprocessExecutor()
         await executor.start()
-        try:
-            search = BestFirstSearch(
-                policy=policy,
-                executor=executor,
-                value=HeuristicValue(),
-                k=8,
-            )
-            result = await search.prove(
-                "theorem foo : ∀ n : Nat, n + 0 = n := by",
-                budget=10,
-            )
-            assert result.success
-            assert len(result.proof_trace) > 0
-        finally:
-            await executor.close()
-            await policy.close()
+        yield policy, executor
+        await executor.close()
+        await policy.close()
 
-    async def test_anthropic_prove_parallel(self):
-        # k independent (AnthropicPolicy, BestFirstSearch, SubprocessExecutor)
-        # triples run concurrently. The first to find a proof wins.
-        k = 3
-        policy = AnthropicPolicy()
-        value = HeuristicValue()
+    async def test_anthropic_proves_simple_theorem(self, shared_lean):
+        policy, executor = shared_lean
+        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        result = await search.prove("theorem foo : ∀ n : Nat, n + 0 = n := by", budget=10)
+        assert result.success
+        assert len(result.proof_trace) > 0
+
+    async def test_anthropic_prove_parallel(self, shared_lean):
+        # k independent searches run concurrently. Fresh executors so cancellation
+        # can't corrupt the shared REPL's stdout buffer.
+        policy, _ = shared_lean
+        k = 2
         executors = [SubprocessExecutor() for _ in range(k)]
         await asyncio.gather(*[e.start() for e in executors])
         try:
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=value, k=8)
+                BestFirstSearch(policy=policy, executor=e, value=HeuristicValue(), k=8)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -297,59 +292,36 @@ class TestEndToEnd:
         finally:
             for e in executors:
                 await e.close()
-            await policy.close()
 
-    async def test_binomial_square(self):
+    async def test_binomial_square(self, shared_lean):
         # Level 1: algebraic identity over Int requiring a Mathlib tactic.
         # ring normalises both sides of a polynomial equation — it's only
         # available after LeanProject is imported (load_mathlib=True default).
         #
         # Expected proof: intro a b; ring
-        policy = AnthropicPolicy()
-        executor = SubprocessExecutor()  # load_mathlib=True by default
-        await executor.start()
-        try:
-            search = BestFirstSearch(
-                policy=policy,
-                executor=executor,
-                value=HeuristicValue(),
-                k=12,
-            )
-            result = await search.prove(
-                "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
-                budget=50,
-            )
-            assert result.success
-            assert len(result.proof_trace) > 0
-        finally:
-            await executor.close()
-            await policy.close()
+        policy, executor = shared_lean
+        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=12)
+        result = await search.prove(
+            "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+            budget=50,
+        )
+        assert result.success
+        assert len(result.proof_trace) > 0
 
-    async def test_contrapositive(self):
+    async def test_contrapositive(self, shared_lean):
         # Level 2: propositional logic — modus tollens / contrapositive.
         # Requires genuine multi-step reasoning: intro, apply, exact.
         # simp/omega/ring do not apply here.
         #
         # Expected proof: intro p q hpq hnq hp; exact hnq (hpq hp)
-        policy = AnthropicPolicy()
-        executor = SubprocessExecutor()
-        await executor.start()
-        try:
-            search = BestFirstSearch(
-                policy=policy,
-                executor=executor,
-                value=HeuristicValue(),
-                k=8,
-            )
-            result = await search.prove(
-                "theorem contrapositive : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by",
-                budget=20,
-            )
-            assert result.success
-            assert len(result.proof_trace) > 0
-        finally:
-            await executor.close()
-            await policy.close()
+        policy, executor = shared_lean
+        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        result = await search.prove(
+            "theorem contrapositive : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by",
+            budget=20,
+        )
+        assert result.success
+        assert len(result.proof_trace) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -364,43 +336,36 @@ class TestEndToEnd:
     not os.environ.get("DEEPSEEK_API_KEY"),
     reason="DEEPSEEK_API_KEY not set",
 )
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 class TestDeepSeekEndToEnd:
+    # Mathlib loads once per class (shared_lean fixture). Same rationale as
+    # TestEndToEnd — parallel test uses fresh executors to avoid cancellation issues.
 
-    async def test_deepseek_proves_simple_theorem(self):
-        # Full stack: DeepSeekPolicy calls the real DeepSeek API to generate
-        # tactics, BestFirstSearch drives the search, SubprocessExecutor
-        # verifies each tactic against a real lake exe repl process.
+    @pytest_asyncio.fixture(scope="class", loop_scope="class")
+    async def shared_lean(self):
+        """Start one Mathlib-loaded executor shared across all non-parallel tests."""
         policy = DeepSeekPolicy()
         executor = SubprocessExecutor()
         await executor.start()
-        try:
-            search = BestFirstSearch(
-                policy=policy,
-                executor=executor,
-                value=HeuristicValue(),
-                k=8,
-            )
-            result = await search.prove(
-                "theorem foo : ∀ n : Nat, n + 0 = n := by",
-                budget=10,
-            )
-            assert result.success
-            assert len(result.proof_trace) > 0
-        finally:
-            await executor.close()
-            await policy.close()
+        yield policy, executor
+        await executor.close()
+        await policy.close()
 
-    async def test_deepseek_prove_parallel(self):
-        # k independent searches via DeepSeekPolicy run concurrently.
-        k = 3
-        policy = DeepSeekPolicy()
-        value = HeuristicValue()
+    async def test_deepseek_proves_simple_theorem(self, shared_lean):
+        policy, executor = shared_lean
+        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        result = await search.prove("theorem foo : ∀ n : Nat, n + 0 = n := by", budget=10)
+        assert result.success
+        assert len(result.proof_trace) > 0
+
+    async def test_deepseek_prove_parallel(self, shared_lean):
+        policy, _ = shared_lean
+        k = 2
         executors = [SubprocessExecutor() for _ in range(k)]
         await asyncio.gather(*[e.start() for e in executors])
         try:
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=value, k=8)
+                BestFirstSearch(policy=policy, executor=e, value=HeuristicValue(), k=8)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -413,30 +378,18 @@ class TestDeepSeekEndToEnd:
         finally:
             for e in executors:
                 await e.close()
-            await policy.close()
 
-    async def test_deepseek_add_comm(self):
+    async def test_deepseek_add_comm(self, shared_lean):
         # Level 1: commutativity of natural number addition.
         # Requires intro n m then omega — tests that DeepSeek generates a
         # meaningful two-step proof for a non-trivial arithmetic theorem.
         #
         # Expected proof: intro n m; omega
-        policy = DeepSeekPolicy()
-        executor = SubprocessExecutor()
-        await executor.start()
-        try:
-            search = BestFirstSearch(
-                policy=policy,
-                executor=executor,
-                value=HeuristicValue(),
-                k=8,
-            )
-            result = await search.prove(
-                "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
-                budget=20,
-            )
-            assert result.success
-            assert len(result.proof_trace) > 0
-        finally:
-            await executor.close()
-            await policy.close()
+        policy, executor = shared_lean
+        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        result = await search.prove(
+            "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
+            budget=20,
+        )
+        assert result.success
+        assert len(result.proof_trace) > 0
