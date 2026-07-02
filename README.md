@@ -92,6 +92,39 @@ Lean 4 proof:
 
 The **Lean 4 proof** block at the bottom is a complete, verified proof you can paste directly into your Lean file.
 
+### 4b. Interactive mode (recommended for sessions)
+
+Lean workers take ~10 minutes to load Mathlib on first start. If you want to prove several theorems in a row, use `--interactive` (`-i`) to load Mathlib once and then submit theorems one at a time:
+
+```bash
+python run.py --interactive
+# or with DeepSeek:
+python run.py --interactive --policy deepseek
+```
+
+```
+Starting Lean workers (loading Mathlib, ~10 min first run)... ready.
+
+Interactive mode — 1 worker, budget=100, policy=anthropic (claude-haiku-4-5-20251001)
+Enter a theorem statement, or 'quit' to exit.
+
+theorem> theorem foo : ∀ n : Nat, n + 0 = n := by
+Searching...
+✓  Proof found in 2.3s (3 nodes)
+
+Lean 4 proof:
+  theorem foo : ∀ n : Nat, n + 0 = n := by
+    intro n
+    simp
+
+theorem> quit
+Goodbye.
+```
+
+- The `:= by` suffix is added automatically if you omit it
+- Type `quit`, `exit`, or press `Ctrl+C` to exit
+- All other flags (`--workers`, `--budget`, `--model`, etc.) work the same way
+
 ### 5. Writing theorem statements
 
 Your theorem statement should be valid Lean 4 syntax ending in `:= by`. Some examples:
@@ -194,6 +227,8 @@ python run.py "theorem ..." --workers 4           # run 4 parallel searches
 python run.py "theorem ..." --budget 200          # expand up to 200 nodes per search
 python run.py "theorem ..." --model deepseek-reasoner   # override the model
 python run.py "theorem ..." --api-key sk-...      # pass key directly
+python run.py --interactive                        # interactive session (load Mathlib once)
+python run.py -i --policy deepseek --workers 2    # interactive with options
 ```
 
 ---
@@ -208,7 +243,7 @@ pytest tests/ --ignore=tests/lean/test_repl.py -q
 # Lean infrastructure tests (no API key, no Mathlib load) — ~30s
 LEAN_SKIP_MATHLIB=1 pytest tests/lean/test_repl.py -k "not EndToEnd" -q
 
-# Full suite including end-to-end (loads Mathlib, ~5 min startup per worker)
+# Full suite including end-to-end (loads Mathlib, ~10 min startup per worker)
 ANTHROPIC_API_KEY=sk-ant-... DEEPSEEK_API_KEY=sk-... pytest tests/ -q
 ```
 
@@ -226,6 +261,7 @@ ANTHROPIC_API_KEY=sk-ant-... DEEPSEEK_API_KEY=sk-... pytest tests/ -q
 | `TestSubprocessExecutor` | Yes | No | Lean REPL executor |
 | `TestProveParallelIntegration` | Yes | No (mock policy) | k parallel searches |
 | `TestCLIWithMock` | No | No | CLI arg parsing + mock stack |
+| `TestCLIInteractive` | No | No | Interactive mode (mock stack) |
 | `TestCLIIntegration` | Yes | No (mock policy) | CLI with real Lean |
 | `TestEndToEnd` | Yes | Anthropic | Full stack: Claude + Lean (simple + add_comm + contrapositive) |
 | `TestDeepSeekEndToEnd` | Yes | DeepSeek | Full stack: DeepSeek + Lean (simple + parallel + add_comm) |
