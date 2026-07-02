@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+Evaluation harness for the Lean 4 theorem prover.
+
+Runs a curated 20-problem set (easy → stretch) and saves pass rate,
+node counts, and timing to results/eval_TIMESTAMP.json for longitudinal
+comparison across model or algorithm changes.
+
+Lean workers load Mathlib once at startup, then reuse the same warm
+executor for every problem — no repeated 10-minute cold starts.
+
+    python run_eval.py                           # all 20 problems, Anthropic default
+    python run_eval.py --problems easy           # easy tier only
+    python run_eval.py --problems easy,medium    # easy + medium
+    python run_eval.py --problems add_zero       # single problem by name
+    python run_eval.py --policy deepseek         # switch LLM backend
+    python run_eval.py --workers 2 --budget 150  # tune search params
+"""
+
+import argparse
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from eval.problems import DIFFICULTIES, select_problems
+from eval.harness import run_eval
+from lean.repl import SubprocessExecutor, LEAN_PROJECT_DIR
+from lean.mock_executor import MockExecutor
+from policy.anthropic import AnthropicPolicy
+from policy.deepseek import DeepSeekPolicy
+from policy.mock import MockPolicy
+
+RESULTS_DIR = Path(__file__).parent / "results"
+
+_POLICY_DEFAULTS = {
+    "anthropic": "claude-haiku-4-5-20251001",
+    "deepseek": "deepseek-chat",
+}
+_POLICY_ENV_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+}
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="eval.py",
+        description="Evaluate the theorem prover on a curated problem set.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+--problems filter syntax:
+  difficulty tier   : {', '.join(DIFFICULTIES)}
+  problem name      : add_zero, contrapositive, dvd_trans_nat, ... (see eval/problems.py)
+  comma-separated   : easy,medium  /  add_zero,binomial_square
+
+examples:
+  python run_eval.py
+  python run_eval.py --problems easy
+  python run_eval.py --problems easy,medium --budget 150
+  python run_eval.py --problems add_zero,contrapositive --policy deepseek
+  python run_eval.py --workers 2 --budget 200
+        """,
+    )
+    parser.add_argument(
+        "--problems",
+        default=None,
+        metavar="FILTER",
+        help=(
+            "comma-separated difficulty tiers or problem names "
+            f"(tiers: {', '.join(DIFFICULTIES)}; default: all)"
+        ),
+    )
+    parser.add_argument(
+        "--policy",
+        choices=["anthropic", "deepseek", "mock"],
+        default="anthropic",
+        help="tactic policy (default: anthropic)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help="model override (default: claude-haiku-4-5-20251001 or deepseek-chat)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        metavar="KEY",
+        help="API key (overrides ANTHROPIC_API_KEY / DEEPSEEK_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--workers", "-k",
+        type=int,
+        default=1,
+        metavar="K",
+        help="parallel searches per problem (default: 1)",
+    )
+    parser.add_argument(
+        "--budget", "-b",
+        type=int,
+        default=100,
+        metavar="N",
+        help="max nodes expanded per search (default: 100)",
+    )
+    parser.add_argument(
+        "--tactics",
+        default="simp,ring,omega,intro n,aesop,linarith,norm_num,tauto",
+        help="comma-separated tactic list for --policy mock",
+    )
+    # Hidden: lets tests bypass real Lean
+    parser.add_argument(
+        "--executor",
+        choices=["lean", "mock"],
+        default="lean",
+        help=argparse.SUPPRESS,
+    )
+    return parser.parse_args(argv)
+
+
+def _make_policy(args: argparse.Namespace):
+    """Return (policy, policy_name, model_name)."""
+    if args.policy == "mock":
+        tactics = [t.strip() for t in args.tactics.split(",") if t.strip()]
+        return MockPolicy(tactics=tactics), "mock", "mock"
+
+    env_var = _POLICY_ENV_VARS[args.policy]
+    api_key = args.api_key or os.environ.get(env_var, "")
+    if not api_key:
+        print(
+            f"error: {env_var} is not set.\n"
+            f"  Set it in your shell:  export {env_var}=...\n"
+            f"  Or pass it directly:   python run_eval.py --api-key ...",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    model = args.model or _POLICY_DEFAULTS[args.policy]
+    if args.policy == "anthropic":
+        return AnthropicPolicy(model=model, api_key=api_key), "anthropic", model
+    return DeepSeekPolicy(model=model, api_key=api_key), "deepseek", model
+
+
+def _make_executors(args: argparse.Namespace, k: int):
+    if args.executor == "mock":
+        return [MockExecutor() for _ in range(k)]
+    if not LEAN_PROJECT_DIR.exists():
+        print(
+            f"error: lean_project not found at {LEAN_PROJECT_DIR}\n"
+            "  Build it first:  cd lean_project && lake build",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    load_mathlib = not os.environ.get("LEAN_SKIP_MATHLIB")
+    return [SubprocessExecutor(load_mathlib=load_mathlib) for _ in range(k)]
+
+
+def _print_summary(summary) -> None:
+    print(f"\n{'─' * 52}")
+    print(f"  Pass rate : {summary.passed}/{summary.total}  ({summary.pass_rate:.0%})")
+    print(f"  By tier   :")
+    for tier in DIFFICULTIES:
+        if tier in summary.by_difficulty:
+            d = summary.by_difficulty[tier]
+            bar = "█" * d["passed"] + "░" * (d["total"] - d["passed"])
+            print(
+                f"    {tier:8s}  {d['passed']}/{d['total']}  "
+                f"({d['pass_rate']:.0%})  {bar}"
+            )
+    print(f"{'─' * 52}\n")
+
+
+async def _run(args: argparse.Namespace) -> int:
+    try:
+        problems = select_problems(args.problems)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    policy, policy_name, model_name = _make_policy(args)
+    executors = _make_executors(args, args.workers)
+
+    use_real_lean = args.executor != "mock"
+    if use_real_lean:
+        load_mathlib = not os.environ.get("LEAN_SKIP_MATHLIB")
+        if load_mathlib:
+            print(
+                "Starting Lean workers (loading Mathlib, ~10 min first run)...",
+                end=" ",
+                flush=True,
+            )
+        else:
+            print("Starting Lean workers...", end=" ", flush=True)
+        await asyncio.gather(*[e.start() for e in executors])
+        print("ready.\n")
+
+    workers_str = f"{args.workers} worker" + ("s" if args.workers > 1 else "")
+    print(
+        f"Evaluating {len(problems)} problem(s) — "
+        f"{workers_str}, budget={args.budget}, "
+        f"policy={policy_name} ({model_name})\n"
+    )
+
+    try:
+        summary = await run_eval(
+            problems=problems,
+            policy=policy,
+            executors=executors,
+            budget=args.budget,
+            policy_name=policy_name,
+            model_name=model_name,
+        )
+    finally:
+        if use_real_lean:
+            await asyncio.gather(*[e.close() for e in executors])
+        if hasattr(policy, "close"):
+            await policy.close()
+
+    _print_summary(summary)
+
+    path = summary.save(RESULTS_DIR)
+    print(f"Results saved → {path}\n")
+    return 0
+
+
+def main(argv=None) -> int:
+    load_dotenv()
+    args = parse_args(argv)
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,99 @@
+{
+  "timestamp": "20260702_144205",
+  "policy": "mock",
+  "model": "mock",
+  "workers": 1,
+  "budget": 5,
+  "total": 5,
+  "passed": 5,
+  "pass_rate": 1.0,
+  "by_difficulty": {
+    "easy": {
+      "total": 5,
+      "passed": 5,
+      "pass_rate": 1.0
+    }
+  },
+  "results": [
+    {
+      "name": "add_zero",
+      "difficulty": "easy",
+      "tags": [
+        "arithmetic",
+        "nat"
+      ],
+      "statement": "theorem eval_add_zero : \u2200 n : Nat, n + 0 = n := by",
+      "success": true,
+      "nodes_visited": 2,
+      "elapsed_ms": 0.10562501847743988,
+      "proof_trace": [
+        "intro n",
+        "simp"
+      ]
+    },
+    {
+      "name": "mul_one",
+      "difficulty": "easy",
+      "tags": [
+        "arithmetic",
+        "nat"
+      ],
+      "statement": "theorem eval_mul_one : \u2200 n : Nat, n * 1 = n := by",
+      "success": true,
+      "nodes_visited": 2,
+      "elapsed_ms": 0.08233310654759407,
+      "proof_trace": [
+        "intro n",
+        "ring"
+      ]
+    },
+    {
+      "name": "add_comm_nat",
+      "difficulty": "easy",
+      "tags": [
+        "arithmetic",
+        "nat"
+      ],
+      "statement": "theorem eval_add_comm_nat : \u2200 n m : Nat, n + m = m + n := by",
+      "success": true,
+      "nodes_visited": 2,
+      "elapsed_ms": 0.0777500681579113,
+      "proof_trace": [
+        "intro n",
+        "ring"
+      ]
+    },
+    {
+      "name": "binomial_square",
+      "difficulty": "easy",
+      "tags": [
+        "algebra",
+        "int"
+      ],
+      "statement": "theorem eval_binomial_sq : \u2200 a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
+      "success": true,
+      "nodes_visited": 2,
+      "elapsed_ms": 0.08008396252989769,
+      "proof_trace": [
+        "intro n",
+        "ring"
+      ]
+    },
+    {
+      "name": "double_eq_add_self",
+      "difficulty": "easy",
+      "tags": [
+        "arithmetic",
+        "nat"
+      ],
+      "statement": "theorem eval_double_eq_add_self : \u2200 n : Nat, n * 2 = n + n := by",
+      "success": true,
+      "nodes_visited": 2,
+      "elapsed_ms": 0.0757498200982809,
+      "proof_trace": [
+        "intro n",
+        "ring"
+      ]
+    }
+  ]
+}
