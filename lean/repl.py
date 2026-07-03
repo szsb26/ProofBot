@@ -165,11 +165,30 @@ class LeanWorker:
                 await self._proc.wait()
         logger.debug("Lean worker stopped")
 
+    async def _drain_stale_response(self, drain_timeout: float = 120.0) -> None:
+        """Read and discard REPL stdout until a blank-line separator.
+
+        Called after a _send timeout to consume the response that Lean will
+        eventually write, so the next _send reads its own response instead.
+        Raises asyncio.TimeoutError if Lean doesn't respond within drain_timeout.
+        """
+        deadline = time.perf_counter() + drain_timeout
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            line = await asyncio.wait_for(
+                self._proc.stdout.readline(),
+                timeout=remaining,
+            )
+            if line.decode().strip() == "":
+                return  # blank line = end of response
+
     async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
         """
         Send a JSON payload to the REPL and read the response. Every command is terminated with \\n\\n (blank line).
         Every response is terminated with a blank line. _send() in LeanWorker.step(), where we send a tactic(part of the payload)
-        to the REPL on the worker and wait for the response. 
+        to the REPL on the worker and wait for the response.
 
         As an example of how async and await works, when Python gets to "await self._proc.stdin.drain()", it sends the command to the REPL
         and then pauses the current coroutine, allowing other coroutines to run while waiting for the REPL to respond. Once the REPL responds
@@ -185,7 +204,7 @@ class LeanWorker:
             raise LeanREPLError("Lean worker process is not running")
 
         # .encode() converts the string to bytes, which is what the subprocess stdin expects. json.dumps() converts the payload dictionary
-        # to a JSON-formatted string. We add the blank line terminator "\n\n" as required by the REPL protocol. 
+        # to a JSON-formatted string. We add the blank line terminator "\n\n" as required by the REPL protocol.
         msg = (json.dumps(payload) + "\n\n").encode()
         # note that we do not need to use any lean specific python libraries to interact with the REPL.
         # Think of "lake exe repl" as a compiled Lean binary that runs as an interactive process.
@@ -205,6 +224,21 @@ class LeanWorker:
                     timeout=timeout,
                 )
             except asyncio.TimeoutError:
+                # Lean is still computing. Drain its eventual response so the
+                # next _send reads its own response rather than this stale one.
+                logger.warning("Lean REPL timed out; draining stale response to prevent desync")
+                try:
+                    await self._drain_stale_response(drain_timeout=120.0)
+                except asyncio.TimeoutError:
+                    # Lean appears stuck; kill the subprocess so future calls fail fast
+                    # and SubprocessExecutor.reset() can restart it cleanly.
+                    logger.error("Lean REPL drain timed out; killing subprocess")
+                    try:
+                        self._proc.kill()
+                        await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+                    except Exception:
+                        pass
+                    self._proof_state_cache.clear()
                 raise LeanREPLError(
                     f"Lean REPL timed out waiting for response to: {payload}"
                 )
@@ -216,7 +250,8 @@ class LeanWorker:
         if not lines:
             raise LeanREPLError("Lean REPL returned empty response")
 
-        return json.loads("".join(lines))
+        result = json.loads("".join(lines))
+        return result
 
     async def reset(self, theorem: str) -> tuple[ProofState, int]:
         """
@@ -383,6 +418,15 @@ class LeanWorker:
             )
 
         # Tactic succeeded
+        if "proofState" not in response:
+            error_state = ProofState(
+                goals=state.goals,
+                error=f"unexpected REPL response (no proofState): {response}",
+                depth=state.depth,
+                tactic_trace=state.tactic_trace,
+            )
+            return StepResult(next_state=error_state, tactic=tactic, elapsed_ms=elapsed)
+
         new_repl_ps_id = response["proofState"]
         goals_raw = response.get("goals", [])
         proof_status = response.get("proofStatus", "")
@@ -456,6 +500,11 @@ class SubprocessExecutor:
     async def reset(self, theorem: str) -> ProofState:
         """Initialize a new proof attempt and return the initial ProofState."""
         async with self._lock:
+            # If the subprocess was killed (e.g., due to a stuck drain timeout),
+            # restart it before attempting a new proof.
+            if not self._worker._proc or self._worker._proc.returncode is not None:
+                logger.warning("Lean worker process is dead; restarting...")
+                await self._worker.start()
             state, _ = await self._worker.reset(theorem)
         return state
 

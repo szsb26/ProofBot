@@ -83,9 +83,10 @@ async def run_eval(
             problem.statement, searches=searches, budget=budget
         )
         status = "✓" if result.success else "✗"
+        suffix = f"  [parse error: {result.error}]" if result.error else ""
         print(
             f"{status}  {result.nodes_visited:4d} nodes  "
-            f"{result.elapsed_ms / 1000:6.1f}s"
+            f"{result.elapsed_ms / 1000:6.1f}s{suffix}"
         )
         results.append(
             ProblemResult(

@@ -78,6 +78,7 @@ class ProofResult:
     nodes_visited: int
     elapsed_ms: float
     theorem: str
+    error: str = ""   # parse/init error message; non-empty when nodes_visited == 0 due to bad input
 
     def __repr__(self) -> str:
         if self.success:
@@ -161,6 +162,7 @@ class BestFirstSearch:
                 nodes_visited=0,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
                 theorem=theorem,
+                error=initial_state.error or "Lean parse error",
             )
 
         # Handle trivially closed theorem (shouldn't happen but be safe)

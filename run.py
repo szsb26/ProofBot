@@ -209,6 +209,11 @@ def _print_result(args: argparse.Namespace, result) -> None:
         for tactic in result.proof_trace:
             print(f"    {tactic}")
         print()
+    elif result.error:
+        print(
+            f"✗  Parse error ({result.elapsed_ms / 1000:.1f}s)\n"
+            f"   {result.error}"
+        )
     else:
         print(
             f"✗  No proof found "
