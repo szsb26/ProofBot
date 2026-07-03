@@ -28,9 +28,6 @@ from run_eval import parse_args, main
 
 class TestEvalProblems:
 
-    def test_exactly_twenty_problems(self):
-        assert len(PROBLEMS) == 20
-
     def test_all_names_unique(self):
         names = [p.name for p in PROBLEMS]
         assert len(names) == len(set(names))
@@ -45,20 +42,12 @@ class TestEvalProblems:
                 f"{p.name} statement does not end with ':= by'"
             )
 
-    def test_five_easy_problems(self):
-        assert sum(1 for p in PROBLEMS if p.difficulty == "easy") == 5
-
-    def test_seven_medium_problems(self):
-        assert sum(1 for p in PROBLEMS if p.difficulty == "medium") == 7
-
-    def test_five_hard_problems(self):
-        assert sum(1 for p in PROBLEMS if p.difficulty == "hard") == 5
-
-    def test_three_stretch_problems(self):
-        assert sum(1 for p in PROBLEMS if p.difficulty == "stretch") == 3
-
     def test_problem_by_name_index_complete(self):
         assert set(PROBLEM_BY_NAME.keys()) == {p.name for p in PROBLEMS}
+
+    def test_every_tier_has_at_least_one_problem(self):
+        tiers_present = {p.difficulty for p in PROBLEMS}
+        assert tiers_present == set(DIFFICULTIES)
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +65,14 @@ class TestSelectProblems:
     def test_single_tier(self):
         result = select_problems("easy")
         assert all(p.difficulty == "easy" for p in result)
-        assert len(result) == 5
+        expected = sum(1 for p in PROBLEMS if p.difficulty == "easy")
+        assert len(result) == expected
 
     def test_multiple_tiers(self):
         result = select_problems("easy,medium")
         assert {p.difficulty for p in result} == {"easy", "medium"}
-        assert len(result) == 12   # 5 + 7
+        expected = sum(1 for p in PROBLEMS if p.difficulty in ("easy", "medium"))
+        assert len(result) == expected
 
     def test_single_name(self):
         result = select_problems("add_zero")
@@ -317,4 +308,5 @@ class TestEvalCLI:
         assert len(json_files) == 1
         with open(json_files[0]) as f:
             data = json.load(f)
-        assert data["total"] == 5   # 5 easy problems
+        easy_count = sum(1 for p in PROBLEMS if p.difficulty == "easy")
+        assert data["total"] == easy_count

@@ -211,6 +211,9 @@ class BestFirstSearch:
                 k=self.k,
             )
 
+            # Strip sorry — it closes any goal but is not a real proof
+            candidates = [c for c in candidates if c.tactic.strip() != "sorry"]
+
             # Verify each candidate sequentially against this worker's REPL
             results = [
                 await self.executor.step(node.state, c.tactic)

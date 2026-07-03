@@ -196,12 +196,24 @@ PROBLEMS: list[EvalProblem] = [
         tags=["arithmetic", "nat", "induction"],
     ),
     # The sum of the first n natural numbers equals n(n+1)/2, or equivalently 2·∑i = n(n+1).
+    # Uses Finset.sum instead of ∑ notation to avoid needing `open BigOperators` in the REPL.
     EvalProblem(
         name="sum_range_formula",
-        statement="theorem eval_sum_range_formula : ∀ n : Nat, 2 * ∑ i in Finset.range (n + 1), i = n * (n + 1) := by",
+        statement="theorem eval_sum_range_formula : ∀ n : Nat, 2 * Finset.sum (Finset.range (n + 1)) id = n * (n + 1) := by",
         difficulty="stretch",
         description="Gauss's sum formula: 2 times the sum of 0..n equals n(n+1).",
         tags=["arithmetic", "nat", "induction", "combinatorics"],
+    ),
+    # AIME-style distance problem: a car travels distance d at speed p (ℚ).
+    # Driving faster by 2 saves 1 hour; driving faster by 9 (vs original+2) saves another hour.
+    # Requires clearing rational denominators (field_simp) then nonlinear arithmetic (nlinarith).
+    # Correct answer is d = 252/25 (not 45/2 — verify: p = 18/5 satisfies both hypotheses).
+    EvalProblem(
+        name="aime_distance",
+        statement="theorem eval_aime_distance (d p : ℚ) (hp : 0 < p) (hd : 0 < d) (h₁ : d / p = d / (p + 2) + 1) (h₂ : d / (p + 2) = d / (p + 9) + 1) : d = 252 / 25 := by",
+        difficulty="stretch",
+        description="AIME-style: given two rational speed/time equations, prove the unique distance d = 252/25. Needs field_simp to clear denominators then nlinarith.",
+        tags=["algebra", "rat", "field_simp", "nlinarith"],
     ),
 
     # -------------------------------------------------------------------------
