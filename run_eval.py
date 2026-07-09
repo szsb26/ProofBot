@@ -106,6 +106,20 @@ examples:
         help="max nodes expanded per search (default: 100)",
     )
     parser.add_argument(
+        "--trials", "-t",
+        type=int,
+        default=1,
+        metavar="K",
+        help="independent attempts per problem for pass@k estimation (default: 1)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        metavar="T",
+        help="sampling temperature for the LLM policy (default: 0.7)",
+    )
+    parser.add_argument(
         "--tactics",
         default="simp,ring,omega,intro n,aesop,linarith,norm_num,tauto",
         help="comma-separated tactic list for --policy mock",
@@ -138,9 +152,10 @@ def _make_policy(args: argparse.Namespace):
         sys.exit(1)
 
     model = args.model or _POLICY_DEFAULTS[args.policy]
+    temp = args.temperature
     if args.policy == "anthropic":
-        return AnthropicPolicy(model=model, api_key=api_key), "anthropic", model
-    return DeepSeekPolicy(model=model, api_key=api_key), "deepseek", model
+        return AnthropicPolicy(model=model, temperature=temp, api_key=api_key), "anthropic", model
+    return DeepSeekPolicy(model=model, temperature=temp, api_key=api_key), "deepseek", model
 
 
 def _make_executors(args: argparse.Namespace, k: int):
@@ -158,17 +173,29 @@ def _make_executors(args: argparse.Namespace, k: int):
 
 
 def _print_summary(summary) -> None:
+    multi = summary.trials > 1
     print(f"\n{'─' * 52}")
-    print(f"  Pass rate : {summary.passed}/{summary.total}  ({summary.pass_rate:.0%})")
+    if multi:
+        print(f"  {summary.trials} trials per problem")
+        print(f"  pass@{summary.trials} (any pass)  : {summary.passed}/{summary.total}  ({summary.pass_rate:.0%})")
+        print(f"  pass@1  (mean rate) : {summary.mean_pass_rate:.0%}")
+    else:
+        print(f"  Pass rate : {summary.passed}/{summary.total}  ({summary.pass_rate:.0%})")
     print(f"  By tier   :")
     for tier in DIFFICULTIES:
         if tier in summary.by_difficulty:
             d = summary.by_difficulty[tier]
             bar = "█" * d["passed"] + "░" * (d["total"] - d["passed"])
-            print(
-                f"    {tier:8s}  {d['passed']}/{d['total']}  "
-                f"({d['pass_rate']:.0%})  {bar}"
-            )
+            if multi:
+                print(
+                    f"    {tier:8s}  pass@{summary.trials}: {d['passed']}/{d['total']}  "
+                    f"({d['pass_rate']:.0%})  mean: {d['mean_pass_rate']:.0%}  {bar}"
+                )
+            else:
+                print(
+                    f"    {tier:8s}  {d['passed']}/{d['total']}  "
+                    f"({d['pass_rate']:.0%})  {bar}"
+                )
     print(f"{'─' * 52}\n")
 
 
@@ -197,9 +224,11 @@ async def _run(args: argparse.Namespace) -> int:
         print("ready.\n")
 
     workers_str = f"{args.workers} worker" + ("s" if args.workers > 1 else "")
+    trials_str = f", trials={args.trials}" if args.trials > 1 else ""
+    temp_str = f", temp={args.temperature}" if args.executor != "mock" else ""
     print(
         f"Evaluating {len(problems)} problem(s) — "
-        f"{workers_str}, budget={args.budget}, "
+        f"{workers_str}, budget={args.budget}{trials_str}{temp_str}, "
         f"policy={policy_name} ({model_name})\n"
     )
 
@@ -211,6 +240,7 @@ async def _run(args: argparse.Namespace) -> int:
             budget=args.budget,
             policy_name=policy_name,
             model_name=model_name,
+            trials=args.trials,
         )
     finally:
         if use_real_lean:

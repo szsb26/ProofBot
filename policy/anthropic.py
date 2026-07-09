@@ -32,9 +32,10 @@ class AnthropicPolicy(BaseLLMPolicy):
         self,
         model: str = "claude-haiku-4-5-20251001",
         max_tokens: int = 256,
+        temperature: float = 1.0,
         api_key: str | None = None,
     ):
-        super().__init__(model=model, max_tokens=max_tokens)
+        super().__init__(model=model, max_tokens=max_tokens, temperature=temperature)
         self._client = AsyncAnthropic(
             api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         )
@@ -43,6 +44,7 @@ class AnthropicPolicy(BaseLLMPolicy):
         message = await self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
+            temperature=self._temperature,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )

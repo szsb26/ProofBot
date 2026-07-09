@@ -256,6 +256,54 @@ class TestRunEval:
         for r in successful:
             assert len(r.proof_trace) > 0
 
+    @pytest.mark.asyncio
+    async def test_trials_fields_populated(self, mock_stack):
+        policy, executors = mock_stack
+        summary = await run_eval(
+            problems=_TWO_PROBLEMS,
+            policy=policy,
+            executors=executors,
+            budget=10,
+            policy_name="mock",
+            model_name="mock",
+            trials=3,
+        )
+        assert summary.trials == 3
+        for r in summary.results:
+            assert r.trials == 3
+            assert 0 <= r.passes <= 3
+
+    @pytest.mark.asyncio
+    async def test_mean_pass_rate_in_range(self, mock_stack):
+        policy, executors = mock_stack
+        summary = await run_eval(
+            problems=_TWO_PROBLEMS,
+            policy=policy,
+            executors=executors,
+            budget=10,
+            policy_name="mock",
+            model_name="mock",
+            trials=3,
+        )
+        assert 0.0 <= summary.mean_pass_rate <= 1.0
+
+    @pytest.mark.asyncio
+    async def test_single_trial_passes_fields_consistent(self, mock_stack):
+        policy, executors = mock_stack
+        summary = await run_eval(
+            problems=_TWO_PROBLEMS,
+            policy=policy,
+            executors=executors,
+            budget=10,
+            policy_name="mock",
+            model_name="mock",
+        )
+        assert summary.trials == 1
+        for r in summary.results:
+            assert r.trials == 1
+            assert r.passes in (0, 1)
+            assert r.success == (r.passes == 1)
+
 
 # ---------------------------------------------------------------------------
 # CLI (mock executor + mock policy)
@@ -281,6 +329,14 @@ class TestEvalCLI:
         args = parse_args(["-k", "2", "-b", "50"])
         assert args.workers == 2
         assert args.budget == 50
+
+    def test_parse_trials_flag(self):
+        args = parse_args(["-t", "3"])
+        assert args.trials == 3
+
+    def test_trials_default_is_one(self):
+        args = parse_args([])
+        assert args.trials == 1
 
     def test_runs_subset_with_mock(self):
         result = main(["--problems", "easy", *_MOCK_FLAGS, "--budget", "5"])

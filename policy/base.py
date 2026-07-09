@@ -83,9 +83,10 @@ class BaseLLMPolicy:
     get_tactics() handles prompt building, parsing, and error fallback.
     """
 
-    def __init__(self, model: str, max_tokens: int = 256):
+    def __init__(self, model: str, max_tokens: int = 256, temperature: float = 1.0):
         self._model = model
         self._max_tokens = max_tokens
+        self._temperature = temperature
 
     async def get_tactics(
         self,
