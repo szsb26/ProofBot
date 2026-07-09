@@ -28,6 +28,8 @@ class ProblemResult:
     nodes_visited: int   # avg nodes per trial (rounded)
     elapsed_ms: float    # total elapsed across all trials
     proof_trace: list[str]  # from first successful trial (empty if none)
+    failure_modes: dict = field(default_factory=dict)   # search-level: {reason: count}
+    tactic_errors: dict = field(default_factory=dict)   # tactic-level: {category: count}
 
 
 @dataclass
@@ -89,6 +91,8 @@ async def run_eval(
         total_nodes = 0
         total_ms = 0.0
         proof_trace: list[str] = []
+        failure_modes: dict[str, int] = {}
+        tactic_errors: dict[str, int] = {}
 
         for t in range(trials):
             searches = [
@@ -102,6 +106,11 @@ async def run_eval(
                 passes += 1
                 if not proof_trace:
                     proof_trace = result.proof_trace
+            else:
+                reason = result.failure_reason or "unknown"
+                failure_modes[reason] = failure_modes.get(reason, 0) + 1
+                for cat, cnt in result.tactic_errors.items():
+                    tactic_errors[cat] = tactic_errors.get(cat, 0) + cnt
             total_nodes += result.nodes_visited
             total_ms += result.elapsed_ms
 
@@ -112,6 +121,7 @@ async def run_eval(
         avg_nodes = round(total_nodes / trials)
         success = passes > 0
 
+        failures = trials - passes
         if trials == 1:
             result_single = result  # type: ignore[possibly-undefined]
             status = "✓" if success else "✗"
@@ -125,6 +135,16 @@ async def run_eval(
                 f"  {passes}/{trials}  ({pct:4.0%})  "
                 f"{avg_nodes:4d} nodes avg  {total_ms / 1000:6.1f}s total"
             )
+        if failures > 0 and (failure_modes or tactic_errors):
+            fm_str = ", ".join(
+                f"{k}×{v}" for k, v in sorted(failure_modes.items(), key=lambda x: -x[1])
+            )
+            te_str = ", ".join(
+                f"{k}×{v}" for k, v in sorted(tactic_errors.items(), key=lambda x: -x[1])
+            )
+            print(f"              ↳ search: {fm_str}")
+            if te_str:
+                print(f"              ↳ errors: {te_str}")
 
         results.append(
             ProblemResult(
@@ -138,6 +158,8 @@ async def run_eval(
                 nodes_visited=avg_nodes,
                 elapsed_ms=total_ms,
                 proof_trace=proof_trace,
+                failure_modes=failure_modes,
+                tactic_errors=tactic_errors,
             )
         )
 

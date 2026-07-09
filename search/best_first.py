@@ -60,25 +60,54 @@ class SearchNode:
         return self.value > other.value
 
 
+def _classify_tactic_error(error: str) -> str:
+    e = error.lower()
+    if e.startswith("lean error:\n"):
+        e = e[len("lean error:\n"):]
+    if "unknown identifier" in e or "unknown constant" in e:
+        return "hallucinated_lemma"
+    if "application type mismatch" in e or "function expected" in e:
+        return "wrong_arguments"
+    if "type mismatch" in e:
+        return "type_mismatch"
+    if "failed to synthesize" in e:
+        return "typeclass_failure"
+    if "unsolved goals" in e:
+        return "unsolved_goals"
+    if "no goals" in e:
+        return "no_goals"
+    if "expected token" in e or "unexpected token" in e or "unexpected end of input" in e:
+        return "syntax_error"
+    if "maximum heart beats" in e or "deterministic timeout" in e:
+        return "max_heartbeats"
+    return "tactic_failed"
+
+
 @dataclass
 class ProofResult:
     """
     The result of a proof search attempt.
 
     Attributes:
-        success:      Whether a proof was found.
-        proof_trace:  The sequence of tactics that close the proof.
-                      Empty if success is False.
-        nodes_visited: Total nodes expanded during search.
-        elapsed_ms:   Total wall-clock time for the search.
-        theorem:      The theorem that was attempted.
+        success:        Whether a proof was found.
+        proof_trace:    The sequence of tactics that close the proof.
+        nodes_visited:  Total nodes expanded during search.
+        elapsed_ms:     Total wall-clock time for the search.
+        theorem:        The theorem that was attempted.
+        error:          Parse/init error; non-empty when nodes_visited == 0.
+        failure_reason: Why the search failed (budget_exhausted, queue_drained,
+                        parse_error, repl_crash). Empty on success.
+        tactic_errors:  Counts of tactic-level error categories across all
+                        rejected tactics during this search.
     """
     success: bool
     proof_trace: list[str]
     nodes_visited: int
     elapsed_ms: float
     theorem: str
-    error: str = ""   # parse/init error message; non-empty when nodes_visited == 0 due to bad input
+    error: str = ""
+    failure_reason: str = ""
+    tactic_errors: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
         if self.success:
@@ -163,6 +192,7 @@ class BestFirstSearch:
                 elapsed_ms=(time.perf_counter() - start) * 1000,
                 theorem=theorem,
                 error=initial_state.error or "Lean parse error",
+                failure_reason="parse_error",
             )
 
         # Handle trivially closed theorem (shouldn't happen but be safe)
@@ -193,6 +223,8 @@ class BestFirstSearch:
 
         # State cache: avoid re-expanding states we've already seen
         visited: set[str] = set()
+
+        tactic_errors: dict[str, int] = {}
 
         while heap and nodes_visited < budget:
             # Pop the highest-value unexplored node
@@ -251,15 +283,21 @@ class BestFirstSearch:
                         )
                         heapq.heappush(heap, (-next_value, counter, next_node))
 
-                # Failed tactics are simply discarded — natural backtracking
+                else:
+                    # Tactic rejected by Lean — classify the error
+                    err = result.next_state.error or ""
+                    category = _classify_tactic_error(err)
+                    tactic_errors[category] = tactic_errors.get(category, 0) + 1
 
-        # Budget exhausted or queue empty — search failed
+        failure_reason = "queue_drained" if not heap else "budget_exhausted"
         return ProofResult(
             success=False,
             proof_trace=[],
             nodes_visited=nodes_visited,
             elapsed_ms=(time.perf_counter() - start) * 1000,
             theorem=theorem,
+            failure_reason=failure_reason,
+            tactic_errors=tactic_errors,
         )
 
     def _extract_trace(
@@ -309,4 +347,17 @@ async def prove_parallel(
     for r in results:
         if r.success:
             return r
-    return max(results, key=lambda r: r.nodes_visited)
+    best = max(results, key=lambda r: r.nodes_visited)
+    combined_errors: dict[str, int] = {}
+    for r in results:
+        for cat, count in r.tactic_errors.items():
+            combined_errors[cat] = combined_errors.get(cat, 0) + count
+    return ProofResult(
+        success=False,
+        proof_trace=[],
+        nodes_visited=best.nodes_visited,
+        elapsed_ms=best.elapsed_ms,
+        theorem=theorem,
+        failure_reason=best.failure_reason,
+        tactic_errors=combined_errors,
+    )
