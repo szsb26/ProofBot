@@ -216,6 +216,29 @@ PROBLEMS: list[EvalProblem] = [
         tags=["algebra", "rat", "field_simp", "nlinarith"],
     ),
 
+    # Every score leader in a tournament is a champion (king): for every player p
+    # that beats c, there exists a player q that c beat and q beat p.
+    # The proof uses a pigeonhole argument on win-set cardinalities.
+    EvalProblem(
+        name="tournament_champion",
+        statement=(
+            "theorem eval_tournament_champion "
+            "{α : Type*} [Fintype α] [DecidableEq α] "
+            "(beats : α → α → Prop) [DecidableRel beats] "
+            "(htour : ∀ a b : α, a ≠ b → (beats a b ↔ ¬ beats b a)) "
+            "(c : α) "
+            "(hmax : ∀ x : α, (Finset.univ.filter (fun y => beats x y)).card ≤ "
+            "                  (Finset.univ.filter (fun y => beats c y)).card) : "
+            "∀ p : α, beats p c → ∃ q : α, beats c q ∧ beats q p := by"
+        ),
+        difficulty="stretch",
+        description=(
+            "Every score leader in a tournament is a champion: "
+            "for every player p that beat c, there exists q such that c beat q and q beat p."
+        ),
+        tags=["combinatorics", "graph-theory", "finset", "tournament"],
+    ),
+
     # -------------------------------------------------------------------------
     # Custom — put custom problems here
     # -------------------------------------------------------------------------

@@ -245,8 +245,9 @@ class BestFirstSearch:
                 k=self.k,
             )
 
-            # Strip sorry — it closes any goal but is not a real proof
-            candidates = [c for c in candidates if c.tactic.strip() != "sorry"]
+            # Strip sorry/admit — they close any goal but are not real proofs
+            _SORRY_TACTICS = {"sorry", "admit"}
+            candidates = [c for c in candidates if c.tactic.strip() not in _SORRY_TACTICS]
 
             # Verify each candidate sequentially against this worker's REPL
             results = [
