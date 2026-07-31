@@ -37,7 +37,7 @@ RESULTS_DIR = Path(__file__).parent / "results"
 
 _POLICY_DEFAULTS = {
     "anthropic": "claude-haiku-4-5-20251001",
-    "deepseek": "deepseek-chat",
+    "deepseek": "deepseek-v4-flash",
 }
 _POLICY_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -83,7 +83,7 @@ examples:
         "--model",
         default=None,
         metavar="MODEL",
-        help="model override (default: claude-haiku-4-5-20251001 or deepseek-chat)",
+        help="model override (default: claude-haiku-4-5-20251001 or deepseek-v4-flash)",
     )
     parser.add_argument(
         "--api-key",

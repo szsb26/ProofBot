@@ -82,7 +82,7 @@ examples:
         "--model",
         default=None,
         metavar="MODEL",
-        help="model ID to use (default: claude-haiku-4-5-20251001 for anthropic, deepseek-chat for deepseek)",
+        help="model ID to use (default: claude-haiku-4-5-20251001 for anthropic, deepseek-v4-flash for deepseek)",
     )
     parser.add_argument(
         "--api-key",
@@ -108,7 +108,7 @@ examples:
 
 _POLICY_DEFAULTS = {
     "anthropic": "claude-haiku-4-5-20251001",
-    "deepseek": "deepseek-chat",
+    "deepseek": "deepseek-v4-flash",
 }
 
 _POLICY_ENV_VARS = {

@@ -152,7 +152,7 @@ class TestDeepSeekPolicyGetTactics:
         policy, _ = mock_policy
         assert isinstance(policy, PolicyModel)
 
-    async def test_default_model_is_deepseek_chat(self, mock_policy):
+    async def test_default_model_is_deepseek_v4_flash(self, mock_policy):
         policy, client = mock_policy
         client.chat.completions.create.return_value = _make_api_response("simp")
 
@@ -160,7 +160,7 @@ class TestDeepSeekPolicyGetTactics:
         await policy.get_tactics(state, [], k=1)
 
         _, kwargs = client.chat.completions.create.call_args
-        assert kwargs["model"] == "deepseek-chat"
+        assert kwargs["model"] == "deepseek-v4-flash"
 
     async def test_custom_model_passed_through(self):
         with patch("policy.deepseek.AsyncOpenAI") as MockClient:
@@ -171,12 +171,12 @@ class TestDeepSeekPolicyGetTactics:
             mock_instance.close = AsyncMock()
             MockClient.return_value = mock_instance
 
-            policy = DeepSeekPolicy(model="deepseek-reasoner", api_key="test-key")
+            policy = DeepSeekPolicy(model="deepseek-v4-pro", api_key="test-key")
             state = make_proof_state(["P"])
             await policy.get_tactics(state, [], k=1)
 
             _, kwargs = mock_instance.chat.completions.create.call_args
-            assert kwargs["model"] == "deepseek-reasoner"
+            assert kwargs["model"] == "deepseek-v4-pro"
 
     def test_base_url_points_to_deepseek(self):
         with patch("policy.deepseek.AsyncOpenAI") as MockClient:
@@ -198,7 +198,7 @@ class TestDeepSeekPolicyIntegration:
 
     async def test_real_api_call_returns_tactics(self):
         """Makes a real DeepSeek API call and verifies the response is parseable."""
-        policy = DeepSeekPolicy(model="deepseek-chat")
+        policy = DeepSeekPolicy(model="deepseek-v4-flash")
         state = make_proof_state(["n + 0 = n"], [[("n", "ℕ")]])
 
         results = await policy.get_tactics(state, premises=["Nat.add_zero"], k=4)

@@ -159,7 +159,7 @@ python run.py "theorem foo : ..." --workers 4 --budget 200
 
 # Switch to a more powerful model
 python run.py "theorem foo : ..." --model claude-sonnet-4-6                # Anthropic
-python run.py "theorem foo : ..." --policy deepseek --model deepseek-reasoner  # DeepSeek
+python run.py "theorem foo : ..." --policy deepseek --model deepseek-v4-pro  # DeepSeek
 ```
 
 **Cost**: the default models (Claude Haiku, DeepSeek Chat) cost roughly $0.001 per proof attempt.
@@ -225,7 +225,7 @@ python run.py "theorem ..." --policy anthropic    # use Claude (default)
 python run.py "theorem ..." --policy deepseek     # use DeepSeek
 python run.py "theorem ..." --workers 4           # run 4 parallel searches
 python run.py "theorem ..." --budget 200          # expand up to 200 nodes per search
-python run.py "theorem ..." --model deepseek-reasoner   # override the model
+python run.py "theorem ..." --model deepseek-v4-pro   # override the model
 python run.py "theorem ..." --api-key sk-...      # pass key directly
 python run.py --interactive                        # interactive session (load Mathlib once)
 python run.py -i --policy deepseek --workers 2    # interactive with options
@@ -353,7 +353,7 @@ Each component is swappable:
 | Policy | Provider | Default model | Key env var |
 |---|---|---|---|
 | `AnthropicPolicy` | Anthropic | `claude-haiku-4-5-20251001` | `ANTHROPIC_API_KEY` |
-| `DeepSeekPolicy` | DeepSeek | `deepseek-chat` | `DEEPSEEK_API_KEY` |
+| `DeepSeekPolicy` | DeepSeek | `deepseek-v4-flash` | `DEEPSEEK_API_KEY` |
 | `MockPolicy` | — | — | — |
 
 All LLM policies extend `BaseLLMPolicy` (`policy/base.py`). To add a new provider, subclass `BaseLLMPolicy` and implement `_call_api(user_prompt: str) -> str`.
