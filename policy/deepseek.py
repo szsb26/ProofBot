@@ -42,24 +42,39 @@ class DeepSeekPolicy(BaseLLMPolicy):
         max_tokens: int = 256,
         temperature: float = 1.0,
         api_key: str | None = None,
+        director_max_tokens: int = 512,
+        director_thinking: bool = False,
     ):
-        super().__init__(model=model, max_tokens=max_tokens, temperature=temperature)
+        super().__init__(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            director_max_tokens=director_max_tokens,
+            director_thinking=director_thinking,
+        )
         self._client = AsyncOpenAI(
             api_key=api_key or os.environ.get("DEEPSEEK_API_KEY", ""),
             base_url="https://api.deepseek.com",
         )
 
-    async def _call_api(self, user_prompt: str) -> str:
+    async def _call_api(
+        self,
+        user_prompt: str,
+        system_prompt: str = SYSTEM_PROMPT,
+        max_tokens: int | None = None,
+        enable_thinking: bool = False,
+    ) -> str:
         # DeepSeek's v4 models reason by default, sometimes burning thousands
-        # of tokens before answering — disable it so tactic generation stays
-        # fast and stays within max_tokens.
+        # of tokens before answering — disabled unless the caller (currently
+        # only the director call, via director_thinking) explicitly wants it.
+        thinking_body = {"type": "enabled"} if enable_thinking else {"type": "disabled"}
         response = await self._client.chat.completions.create(
             model=self._model,
-            max_tokens=self._max_tokens,
+            max_tokens=max_tokens or self._max_tokens,
             temperature=self._temperature,
-            extra_body={"thinking": {"type": "disabled"}},
+            extra_body={"thinking": thinking_body},
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         )

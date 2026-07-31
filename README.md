@@ -1,10 +1,12 @@
 # Theorem Prover
 
-A best-first proof search system for Lean 4, backed by an LLM policy.
+An LLM-guided proof search system for Lean 4.
 
-Naive LLM theorem provers ask the model to prove a theorem in one shot. Because the LLM never runs Lean to verify its output, hallucinations and invalid derivations slip through. This repo takes a different approach: the LLM generates candidate tactics, and every candidate is immediately verified by a real Lean 4 process. A search algorithm (currently Best First Search) explores the proof tree, guided by the LLM and a value heuristic, until a complete proof is found or the budget is exhausted.
+Naive LLM theorem provers ask the model to prove a theorem in one shot. Because the LLM never runs Lean to verify its output, hallucinations and invalid derivations slip through. This repo takes a different approach: the LLM generates candidate tactics, and every candidate is immediately verified by a real Lean 4 process. A `Ledger` records every open proof state and every tactic attempted against it — no scores, no priority queue. Each turn, one LLM call reads the full ledger and decides both which state to continue from (or abandon) and what tactics to try there, until a complete proof is found or the budget is exhausted.
 
-The policy (LLM backend) and the search algorithm are both pluggable. Anthropic's Claude and DeepSeek are supported out of the box; adding a new provider requires implementing one method.
+An earlier design ranked states with a hand-coded heuristic (goal count + depth) driving a priority queue. An eval across the hard/stretch problem tiers showed the ledger-driven design matches or exceeds it (pass@1 76%→86%, pass@5 80%→100%) while removing an entire component, so it was retired.
+
+The policy (LLM backend) is pluggable. Anthropic's Claude and DeepSeek are supported out of the box; adding a new provider requires implementing one method.
 
 ---
 
@@ -172,24 +174,23 @@ python run.py "theorem foo : ..." --policy deepseek --model deepseek-v4-pro  # D
 prove_parallel(theorem, searches=[...], budget=100)
     └── asyncio.gather(search_0.prove(), search_1.prove(), ..., search_k.prove())
             │
-            └── BestFirstSearch          (one priority queue per instance)
+            └── LedgerSearch            (one Ledger per instance — no priority queue)
                     │
-                    ├── PolicyModel      (tactic generator — AnthropicPolicy / DeepSeekPolicy / MockPolicy)
-                    ├── ValueModel       (state evaluator — HeuristicValue)
+                    ├── PolicyModel      (tactic + director generator — AnthropicPolicy / DeepSeekPolicy / MockPolicy)
                     └── LeanExecutor     (tactic verifier — SubprocessExecutor or MockExecutor)
                             │
                             └── LeanWorker → lake exe repl  (one OS process)
 ```
 
-**Parallelism**: create k `SubprocessExecutor` + `BestFirstSearch` pairs and run them with `prove_parallel`. Each search has its own Lean REPL process and priority queue — they explore the proof tree independently and concurrently.
+**Parallelism**: create k `SubprocessExecutor` + `LedgerSearch` pairs and run them with `prove_parallel`. Each search has its own Lean REPL process and its own ledger — they explore the proof tree independently and concurrently.
 
-**Policy**: the `PolicyModel` protocol (`core/policy.py`) defines a single method:
+**Policy**: the `PolicyModel` protocol (`core/policy.py`) defines the tactic-generation method used by the director call:
 
 ```python
-async def get_tactics(state: ProofState, premises: list[str], k: int) -> list[TacticCandidate]
+async def get_next_action(theorem: str, ledger: Ledger, premises: list[str], k: int) -> DirectorResponse
 ```
 
-`AnthropicPolicy` and `DeepSeekPolicy` both extend `BaseLLMPolicy` (`policy/base.py`), which handles prompt construction, response parsing, and error fallback. Adding a new provider means subclassing `BaseLLMPolicy` and implementing `_call_api(user_prompt) -> str`.
+`DirectorResponse` carries which open state to continue from, any states to abandon, and k tactic candidates for the chosen state. `AnthropicPolicy` and `DeepSeekPolicy` both extend `BaseLLMPolicy` (`policy/base.py`), which handles ledger serialization, response parsing, and error fallback. Adding a new provider means subclassing `BaseLLMPolicy` and implementing `_call_api(user_prompt, system_prompt, max_tokens, enable_thinking) -> str`.
 
 ---
 
@@ -278,16 +279,14 @@ ANTHROPIC_API_KEY=sk-ant-... DEEPSEEK_API_KEY=sk-... pytest tests/ -q
 import asyncio
 from policy.anthropic import AnthropicPolicy   # or: from policy.deepseek import DeepSeekPolicy
 from lean.repl import SubprocessExecutor
-from value.heuristic import HeuristicValue
-from search.best_first import BestFirstSearch
+from search.ledger_search import LedgerSearch
 
 async def main():
     policy = AnthropicPolicy()       # reads ANTHROPIC_API_KEY from env
     executor = SubprocessExecutor()
-    value = HeuristicValue()
 
     await executor.start()
-    search = BestFirstSearch(policy=policy, executor=executor, value=value)
+    search = LedgerSearch(policy=policy, executor=executor)
 
     result = await search.prove(
         "theorem foo : ∀ n : ℕ, n + 0 = n := by",
@@ -309,19 +308,17 @@ asyncio.run(main())
 import asyncio
 from policy.deepseek import DeepSeekPolicy     # or AnthropicPolicy
 from lean.repl import SubprocessExecutor
-from value.heuristic import HeuristicValue
-from search.best_first import BestFirstSearch, prove_parallel
+from search.ledger_search import LedgerSearch, prove_parallel
 
 async def main():
     k = 4
     policy = DeepSeekPolicy()        # reads DEEPSEEK_API_KEY from env
-    value = HeuristicValue()
 
     executors = [SubprocessExecutor() for _ in range(k)]
     await asyncio.gather(*[e.start() for e in executors])
 
     searches = [
-        BestFirstSearch(policy=policy, executor=e, value=value)
+        LedgerSearch(policy=policy, executor=e)
         for e in executors
     ]
 
@@ -343,8 +340,6 @@ asyncio.run(main())
 Each component is swappable:
 - Replace `AnthropicPolicy`/`DeepSeekPolicy` with `MockPolicy` to test without API calls
 - Replace `SubprocessExecutor` with `MockExecutor` to test without Lean
-- Replace `HeuristicValue` with a trained value model
-- `BestFirstSearch` can be replaced with more complex search algorithms like MCTSSearch (TODO)
 
 ---
 
@@ -360,17 +355,19 @@ All LLM policies extend `BaseLLMPolicy` (`policy/base.py`). To add a new provide
 
 ---
 
-## Value model
+## Ledger-guided search
 
-The priority queue in `BestFirstSearch` ranks states by a value estimate from `HeuristicValue`:
+There is no value function and no priority queue. `LedgerSearch` maintains a `Ledger` (`core/ledger.py`) — every open proof state (the "frontier") plus a record of every tactic attempted and its outcome. Each turn, one LLM call (`PolicyModel.get_next_action`) reads the full ledger and returns a `DirectorResponse`: which open state to continue from, any states to abandon as dead ends, and k tactic candidates for its chosen state. Deciding what's "promising" is entirely the LLM's judgment, informed by the actual proof history — not a formula over goal count and depth.
 
-```
-value = exp(-(1.0 × num_goals + 0.05 × depth))
-```
+This replaced an earlier design (`BestFirstSearch` + `HeuristicValue`) that ranked states by `exp(-(1.0 × num_goals + 0.05 × depth))` and picked the highest-scoring state off a priority queue at each step. An eval across the hard/stretch problem tiers (same model, budget, and trial count) showed the ledger design matches or exceeds it:
 
-States with fewer open goals and shallower depth are explored first. This requires no training data — it is a deliberate baseline for early development.
+| Metric | Priority queue + heuristic | Ledger-guided |
+|---|---|---|
+| pass@5 (any pass) | 80% | **100%** |
+| pass@1 (mean rate) | 76% | **86%** |
+| stretch tier mean | 52% | **72%** |
 
-**Replacing it**: implement the `ValueModel` protocol in `core/value.py` and pass your model to `BestFirstSearch`. A trained value network would learn to predict the probability that a state leads to a closed proof — a much stronger signal than goal count alone.
+The heuristic couldn't read Lean semantics — it only counted open goals, so it had no way to tell "closer to a real proof" from "closer to a dead end that merely looks tidier," and it discarded failed-tactic error messages instead of feeding them back. The ledger design fixes both: navigation uses full proof context, and failures are recorded and summarized back to the LLM on the next turn.
 
 ---
 
@@ -381,13 +378,12 @@ States with fewer open goals and shallower depth are explored first. This requir
 | `core/proof_state.py` | `ProofState`, `Goal`, `Hypothesis` data types |
 | `core/executor.py` | `LeanExecutor` protocol + `StepResult` |
 | `core/policy.py` | `PolicyModel` protocol + `TacticCandidate` |
-| `core/value.py` | `ValueModel` protocol |
+| `core/ledger.py` | `Ledger`, `LedgerEntry` — the search state `LedgerSearch` operates over |
 | `lean/repl.py` | `LeanWorker` (REPL subprocess) + `SubprocessExecutor` |
 | `lean/mock_executor.py` | `MockExecutor` for testing without Lean |
-| `policy/base.py` | `BaseLLMPolicy` — shared prompt/parse logic for LLM policies |
+| `policy/base.py` | `BaseLLMPolicy` — shared ledger serialization, prompt/parse logic, `DirectorResponse` |
 | `policy/anthropic.py` | `AnthropicPolicy` — calls Claude API |
 | `policy/deepseek.py` | `DeepSeekPolicy` — calls DeepSeek API (OpenAI-compatible) |
 | `policy/mock.py` | `MockPolicy` — fixed tactics, no API calls |
-| `value/heuristic.py` | `HeuristicValue` — goal count + depth heuristic |
-| `search/best_first.py` | `BestFirstSearch` + `prove_parallel` |
+| `search/ledger_search.py` | `LedgerSearch` + `prove_parallel` |
 | `run.py` | CLI entrypoint for mathematicians |

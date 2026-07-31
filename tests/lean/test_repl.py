@@ -3,11 +3,11 @@ Unit and integration tests for lean/repl.py.
 
 TestParseGoalString          — fast, no Lean needed; tests the goal string parser
 TestSubprocessExecutor       — slow, real Lean; tests a single executor end-to-end
-TestProveParallelIntegration — slow, real Lean; tests k (BestFirstSearch,
+TestProveParallelIntegration — slow, real Lean; tests k (LedgerSearch,
                                SubprocessExecutor) pairs running concurrently
                                via prove_parallel on the same theorem
 TestEndToEnd                 — slow, real Lean + real Anthropic API; tests the
-                               full stack: AnthropicPolicy → BestFirstSearch →
+                               full stack: AnthropicPolicy → LedgerSearch →
                                SubprocessExecutor → lake exe repl
 TestDeepSeekEndToEnd         — slow, real Lean + real DeepSeek API; same stack
                                with DeepSeekPolicy instead of AnthropicPolicy
@@ -22,8 +22,7 @@ from core.proof_state import ProofState
 from policy.mock import MockPolicy
 from policy.anthropic import AnthropicPolicy
 from policy.deepseek import DeepSeekPolicy
-from value.heuristic import HeuristicValue
-from search.best_first import BestFirstSearch, prove_parallel
+from search.ledger_search import LedgerSearch, prove_parallel
 
 
 # ---------------------------------------------------------------------------
@@ -182,20 +181,19 @@ class TestSubprocessExecutor:
 class TestProveParallelIntegration:
 
     async def test_k_searches_prove_same_theorem(self):
-        # k BestFirstSearch + k SubprocessExecutor pairs all attempt the same
+        # k LedgerSearch + k SubprocessExecutor pairs all attempt the same
         # theorem concurrently via prove_parallel. MockPolicy supplies tactics
         # so no LLM API calls are needed. Real Lean can close this theorem with
         # just "simp" in one step, so we only assert overall success.
         k = 3
         policy = MockPolicy(tactics=["simp", "ring", "omega", "intro n"])
-        value = HeuristicValue()
 
         executors = [SubprocessExecutor(load_mathlib=False) for _ in range(k)]
         await asyncio.gather(*[e.start() for e in executors])
 
         try:
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=value)
+                LedgerSearch(policy=policy, executor=e)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -214,14 +212,13 @@ class TestProveParallelIntegration:
         # prove_parallel must return failure rather than crashing.
         k = 2
         policy = MockPolicy(tactics=["not_a_tactic", "also_invalid"])
-        value = HeuristicValue()
 
         executors = [SubprocessExecutor(load_mathlib=False) for _ in range(k)]
         await asyncio.gather(*[e.start() for e in executors])
 
         try:
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=value)
+                LedgerSearch(policy=policy, executor=e)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -265,7 +262,7 @@ class TestEndToEnd:
 
     async def test_anthropic_proves_simple_theorem(self, shared_lean):
         policy, executor = shared_lean
-        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        search = LedgerSearch(policy=policy, executor=executor, k=8)
         result = await search.prove("theorem foo : ∀ n : Nat, n + 0 = n := by", budget=10)
         assert result.success
         assert len(result.proof_trace) > 0
@@ -279,7 +276,7 @@ class TestEndToEnd:
         await asyncio.gather(*[e.start() for e in executors])
         try:
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=HeuristicValue(), k=8)
+                LedgerSearch(policy=policy, executor=e, k=8)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -300,7 +297,7 @@ class TestEndToEnd:
         #
         # Expected proof: intro a b; ring
         policy, executor = shared_lean
-        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=12)
+        search = LedgerSearch(policy=policy, executor=executor, k=12)
         result = await search.prove(
             "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
             budget=50,
@@ -315,7 +312,7 @@ class TestEndToEnd:
         #
         # Expected proof: intro p q hpq hnq hp; exact hnq (hpq hp)
         policy, executor = shared_lean
-        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        search = LedgerSearch(policy=policy, executor=executor, k=8)
         result = await search.prove(
             "theorem contrapositive : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by",
             budget=20,
@@ -353,7 +350,7 @@ class TestDeepSeekEndToEnd:
 
     async def test_deepseek_proves_simple_theorem(self, shared_lean):
         policy, executor = shared_lean
-        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        search = LedgerSearch(policy=policy, executor=executor, k=8)
         result = await search.prove("theorem foo : ∀ n : Nat, n + 0 = n := by", budget=10)
         assert result.success
         assert len(result.proof_trace) > 0
@@ -365,7 +362,7 @@ class TestDeepSeekEndToEnd:
         await asyncio.gather(*[e.start() for e in executors])
         try:
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=HeuristicValue(), k=8)
+                LedgerSearch(policy=policy, executor=e, k=8)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -386,7 +383,7 @@ class TestDeepSeekEndToEnd:
         #
         # Expected proof: intro n m; omega
         policy, executor = shared_lean
-        search = BestFirstSearch(policy=policy, executor=executor, value=HeuristicValue(), k=8)
+        search = LedgerSearch(policy=policy, executor=executor, k=8)
         result = await search.prove(
             "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
             budget=20,

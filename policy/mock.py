@@ -9,8 +9,10 @@ before plugging in a real LLM.
 """
 
 from __future__ import annotations
+from core.ledger import Ledger
 from core.proof_state import ProofState
 from core.policy import TacticCandidate
+from policy.base import DirectorResponse
 
 
 class MockPolicy:
@@ -54,6 +56,33 @@ class MockPolicy:
             TacticCandidate(tactic=t, log_prob=float(-i))
             for i, t in enumerate(candidates)
         ]
+
+    async def get_next_action(
+        self,
+        theorem: str,
+        ledger: Ledger,
+        premises: list[str],
+        k: int = 8,
+    ) -> DirectorResponse:
+        """
+        Ignores theorem/premises. Always continues the most recently added
+        open state (insertion order) with the same fixed tactic list, and
+        never abandons anything. Picking the newest state — rather than the
+        first — lets a fixed-tactic search actually advance depth-first
+        instead of re-trying an already-succeeded tactic at the root forever,
+        since states are never auto-evicted from the frontier on success.
+        """
+        chosen_id = next(reversed(ledger.frontier))
+        candidates = self._tactics[:k]
+        tactics = [
+            TacticCandidate(tactic=t, log_prob=float(-i))
+            for i, t in enumerate(candidates)
+        ]
+        return DirectorResponse(
+            chosen_state_id=chosen_id,
+            abandoned_state_ids=[],
+            tactics=tactics,
+        )
 
     async def close(self) -> None:
         pass

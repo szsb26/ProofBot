@@ -23,14 +23,13 @@ from lean.mock_executor import MockExecutor
 from policy.anthropic import AnthropicPolicy
 from policy.deepseek import DeepSeekPolicy
 from policy.mock import MockPolicy
-from search.best_first import BestFirstSearch, prove_parallel
-from value.heuristic import HeuristicValue
+from search.ledger_search import LedgerSearch, prove_parallel
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="run.py",
-        description="Prove a Lean 4 theorem using LLM-guided best-first search.",
+        description="Prove a Lean 4 theorem using LLM-guided ledger search.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
@@ -156,7 +155,6 @@ def _make_executors(args: argparse.Namespace, k: int):
 async def _run(args: argparse.Namespace) -> int:
     policy = _make_policy(args)
     executors = _make_executors(args, args.workers)
-    value = HeuristicValue()
 
     _print_header(args)
 
@@ -171,7 +169,7 @@ async def _run(args: argparse.Namespace) -> int:
         print("ready.\n")
 
     searches = [
-        BestFirstSearch(policy=policy, executor=e, value=value)
+        LedgerSearch(policy=policy, executor=e)
         for e in executors
     ]
 
@@ -226,7 +224,6 @@ async def _interactive(args: argparse.Namespace) -> int:
     """Keep Lean workers warm across multiple theorem submissions."""
     policy = _make_policy(args)
     executors = _make_executors(args, args.workers)
-    value = HeuristicValue()
 
     use_real_lean = args.executor != "mock"
     if use_real_lean:
@@ -266,7 +263,7 @@ async def _interactive(args: argparse.Namespace) -> int:
                 theorem = theorem + " := by"
 
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=value)
+                LedgerSearch(policy=policy, executor=e)
                 for e in executors
             ]
 

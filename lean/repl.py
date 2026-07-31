@@ -26,7 +26,7 @@ Protocol (discovered via testing):
 
 Compute hierarchy (one SubprocessExecutor = one search worker):
 
-SubprocessExecutor  (thin Python coordinator, one per BestFirstSearch instance)
+SubprocessExecutor  (thin Python coordinator, one per LedgerSearch instance)
 │
 └── LeanWorker  (one lake exe repl OS subprocess, unique PID and memory)
     │
@@ -41,7 +41,7 @@ SubprocessExecutor  (thin Python coordinator, one per BestFirstSearch instance)
         │  └── proof state table: { 0: <state>, 1: <state>, 2: <state>, ... }
 
 For k parallel proof searches, create k SubprocessExecutor instances and run
-k BestFirstSearch.prove() coroutines concurrently with asyncio.gather().
+k LedgerSearch.prove() coroutines concurrently with asyncio.gather().
 Each executor owns exactly one worker process, so there is no cross-worker
 routing or session tracking needed.
 """

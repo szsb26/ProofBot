@@ -12,8 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from eval.problems import DIFFICULTIES, EvalProblem
-from search.best_first import BestFirstSearch, prove_parallel
-from value.heuristic import HeuristicValue
+from search.ledger_search import LedgerSearch, prove_parallel
 
 
 @dataclass
@@ -68,16 +67,15 @@ async def run_eval(
     """
     Run every problem in *problems* through the prover and collect results.
 
-    Executors must already be started (Mathlib loaded). A fresh
-    BestFirstSearch is created for each problem so search state never
-    leaks between problems; the underlying executors are reused.
+    Executors must already be started (Mathlib loaded). A fresh LedgerSearch
+    instance is created for each trial so search state never leaks between
+    problems; the underlying executors are reused.
 
     With trials > 1, each problem is attempted `trials` times independently.
     Results report both pass@k (any trial succeeded) and mean pass rate
     (fraction of trials that succeeded, a pass@1 estimate).
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    value = HeuristicValue()
     results: list[ProblemResult] = []
 
     for problem in problems:
@@ -96,7 +94,7 @@ async def run_eval(
 
         for t in range(trials):
             searches = [
-                BestFirstSearch(policy=policy, executor=e, value=value)
+                LedgerSearch(policy=policy, executor=e)
                 for e in executors
             ]
             result = await prove_parallel(

@@ -1,0 +1,301 @@
+"""
+Unit tests for the director-call machinery in policy/base.py:
+serialize_ledger, parse_director_response, and BaseLLMPolicy.get_next_action.
+
+These are the pieces search/ledger_search.py relies on instead of a priority
+queue — serialize_ledger turns a Ledger into prompt text, parse_director_response
+turns the LLM's JSON reply back into a DirectorResponse, and get_next_action
+wires the two together with the same never-raises fallback contract as
+get_tactics().
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from core.ledger import Ledger
+from core.proof_state import ProofState, make_goal, make_proof_state
+from policy.base import (
+    DIRECTOR_SYSTEM_PROMPT,
+    DirectorResponse,
+    parse_director_response,
+    serialize_ledger,
+)
+from policy.deepseek import DeepSeekPolicy
+
+
+# ---------------------------------------------------------------------------
+# serialize_ledger
+# ---------------------------------------------------------------------------
+
+class TestSerializeLedger:
+
+    def test_includes_theorem(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n + 0 = n"]))
+        text = serialize_ledger("theorem foo : n + 0 = n := by", ledger, [], 8)
+        assert "theorem foo : n + 0 = n := by" in text
+
+    def test_lists_open_state_with_goal(self):
+        ledger = Ledger()
+        state = make_proof_state(["n + 0 = n"], [[("n", "ℕ")]])
+        state_id = ledger.add_state(state)
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert state_id in text
+        assert "n + 0 = n" in text
+        assert "n : ℕ" in text
+
+    def test_root_state_shows_path_as_root(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n + 0 = n"]))
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "(root)" in text
+
+    def test_non_root_state_shows_tactic_path(self):
+        ledger = Ledger()
+        state = ProofState(
+            goals=(make_goal("n = n"),),
+            depth=2,
+            tactic_trace=("intro n", "simp"),
+        )
+        ledger.add_state(state)
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "intro n, simp" in text
+
+    def test_summarizes_dead_branches_with_category_counts(self):
+        ledger = Ledger()
+        state = make_proof_state(["n = n"])
+        state_id = ledger.add_state(state)
+        ledger.record_failure(state_id, "bad1", "hallucinated_lemma")
+        ledger.record_failure(state_id, "bad2", "hallucinated_lemma")
+        ledger.record_failure(state_id, "bad3", "type_mismatch")
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "Exhausted Attempts" in text
+        assert "hallucinated_lemma×2" in text
+        assert "type_mismatch×1" in text
+        # Raw failed tactic strings should not be replayed verbatim
+        assert "bad1" not in text
+
+    def test_no_dead_branch_section_when_nothing_failed(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n = n"]))
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "Exhausted Attempts" not in text
+
+    def test_abandoned_state_failures_excluded_from_summary(self):
+        ledger = Ledger()
+        state = make_proof_state(["n = n"])
+        state_id = ledger.add_state(state)
+        ledger.record_failure(state_id, "bad", "hallucinated_lemma")
+        ledger.abandon([state_id])
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "Exhausted Attempts" not in text
+        assert state_id not in text
+
+    def test_includes_premises_when_present(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n = n"]))
+        text = serialize_ledger("theorem foo := by", ledger, ["Nat.add_zero"], 8)
+        assert "Nat.add_zero" in text
+
+    def test_omits_premises_section_when_empty(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n = n"]))
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "Potentially Relevant Lemmas" not in text
+
+    def test_task_section_mentions_k(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n = n"]))
+        text = serialize_ledger("theorem foo := by", ledger, [], 5)
+        assert "5 tactic candidates" in text
+
+
+# ---------------------------------------------------------------------------
+# parse_director_response
+# ---------------------------------------------------------------------------
+
+class TestParseDirectorResponse:
+
+    def test_parses_well_formed_json(self):
+        raw = json.dumps({
+            "abandon": [],
+            "abandon_reason": "",
+            "chosen_state": "a1b2c3d4",
+            "tactics": ["simp", "ring"],
+        })
+        resp = parse_director_response(raw, k=8, fallback_state_id="fallback")
+        assert resp.chosen_state_id == "a1b2c3d4"
+        assert resp.abandoned_state_ids == []
+        assert [c.tactic for c in resp.tactics] == ["simp", "ring"]
+
+    def test_extracts_json_from_surrounding_text(self):
+        raw = (
+            "Sure, here's my decision:\n```json\n"
+            + json.dumps({"chosen_state": "abc", "tactics": ["omega"]})
+            + "\n```\nHope that helps!"
+        )
+        resp = parse_director_response(raw, k=8, fallback_state_id="fallback")
+        assert resp.chosen_state_id == "abc"
+        assert [c.tactic for c in resp.tactics] == ["omega"]
+
+    def test_parses_abandon_list_and_reason(self):
+        raw = json.dumps({
+            "abandon": ["dead1", "dead2"],
+            "abandon_reason": "wrong approach",
+            "chosen_state": "alive",
+            "tactics": ["tauto"],
+        })
+        resp = parse_director_response(raw, k=8, fallback_state_id="fallback")
+        assert resp.abandoned_state_ids == ["dead1", "dead2"]
+
+    def test_falls_back_on_malformed_json(self):
+        resp = parse_director_response("not json at all", k=8, fallback_state_id="fb")
+        assert resp.chosen_state_id == "fb"
+        assert resp.abandoned_state_ids == []
+        assert [c.tactic for c in resp.tactics] == ["simp"]
+
+    def test_falls_back_when_chosen_state_missing(self):
+        raw = json.dumps({"tactics": ["simp", "ring"]})
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.chosen_state_id == "fb"
+
+    def test_falls_back_tactics_to_simp_when_tactics_empty(self):
+        raw = json.dumps({"chosen_state": "abc", "tactics": []})
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert [c.tactic for c in resp.tactics] == ["simp"]
+
+    def test_truncates_tactics_to_k(self):
+        raw = json.dumps({
+            "chosen_state": "abc",
+            "tactics": ["t1", "t2", "t3", "t4", "t5"],
+        })
+        resp = parse_director_response(raw, k=3, fallback_state_id="fb")
+        assert len(resp.tactics) == 3
+
+    def test_abandon_list_filters_non_strings(self):
+        raw = json.dumps({
+            "abandon": ["ok", 123, None],
+            "chosen_state": "abc",
+            "tactics": ["simp"],
+        })
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.abandoned_state_ids == ["ok"]
+
+    def test_log_probs_are_descending(self):
+        raw = json.dumps({"chosen_state": "abc", "tactics": ["t1", "t2", "t3"]})
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        log_probs = [c.log_prob for c in resp.tactics]
+        assert log_probs == sorted(log_probs, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# BaseLLMPolicy.get_next_action (via DeepSeekPolicy with a mocked client)
+# ---------------------------------------------------------------------------
+
+def _make_api_response(text: str) -> MagicMock:
+    message = MagicMock()
+    message.content = text
+    choice = MagicMock()
+    choice.message = message
+    response = MagicMock()
+    response.choices = [choice]
+    return response
+
+
+class TestGetNextAction:
+
+    def _make_policy(self):
+        patcher = patch("policy.deepseek.AsyncOpenAI")
+        MockClient = patcher.start()
+        mock_instance = MagicMock()
+        mock_instance.close = AsyncMock()
+        MockClient.return_value = mock_instance
+        policy = DeepSeekPolicy(api_key="test-key")
+        return policy, mock_instance, patcher
+
+    def _ledger_with_one_state(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        return ledger, state_id
+
+    async def test_returns_parsed_director_response(self):
+        policy, client, patcher = self._make_policy()
+        try:
+            raw = json.dumps({"chosen_state": "will-be-overridden", "tactics": ["simp"]})
+            client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
+            ledger, state_id = self._ledger_with_one_state()
+
+            resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            assert isinstance(resp, DirectorResponse)
+            assert [c.tactic for c in resp.tactics] == ["simp"]
+        finally:
+            patcher.stop()
+
+    async def test_uses_director_system_prompt(self):
+        policy, client, patcher = self._make_policy()
+        try:
+            raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+            client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
+            ledger, _ = self._ledger_with_one_state()
+
+            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+
+            _, kwargs = client.chat.completions.create.call_args
+            assert kwargs["messages"][0]["content"] == DIRECTOR_SYSTEM_PROMPT
+        finally:
+            patcher.stop()
+
+    async def test_uses_director_max_tokens_not_regular_max_tokens(self):
+        patcher = patch("policy.deepseek.AsyncOpenAI")
+        MockClient = patcher.start()
+        mock_instance = MagicMock()
+        mock_instance.close = AsyncMock()
+        MockClient.return_value = mock_instance
+        policy = DeepSeekPolicy(api_key="test-key", max_tokens=256, director_max_tokens=999)
+        try:
+            raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+            mock_instance.chat.completions.create = AsyncMock(
+                return_value=_make_api_response(raw)
+            )
+            ledger, _ = self._ledger_with_one_state()
+
+            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+
+            _, kwargs = mock_instance.chat.completions.create.call_args
+            assert kwargs["max_tokens"] == 999
+        finally:
+            patcher.stop()
+
+    async def test_thinking_disabled_by_default_for_director_call(self):
+        policy, client, patcher = self._make_policy()
+        try:
+            raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+            client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
+            ledger, _ = self._ledger_with_one_state()
+
+            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+
+            _, kwargs = client.chat.completions.create.call_args
+            assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+        finally:
+            patcher.stop()
+
+    async def test_falls_back_gracefully_on_api_failure(self):
+        policy, client, patcher = self._make_policy()
+        try:
+            client.chat.completions.create = AsyncMock(side_effect=Exception("network error"))
+            ledger, state_id = self._ledger_with_one_state()
+
+            resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+
+            assert resp.chosen_state_id == state_id
+            assert resp.abandoned_state_ids == []
+            assert [c.tactic for c in resp.tactics] == ["simp"]
+        finally:
+            patcher.stop()

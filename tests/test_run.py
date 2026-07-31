@@ -262,7 +262,7 @@ class TestCLIIntegration:
 class TestCLIEndToEnd:
 
     def test_simple_theorem(self, capsys):
-        # Full stack: Claude Haiku → BestFirstSearch → real Lean REPL.
+        # Full stack: Claude Haiku → LedgerSearch → real Lean REPL.
         # ∀ n : Nat, n + 0 = n is closed by simp in one step.
         result = main([
             "theorem foo : ∀ n : Nat, n + 0 = n := by",
