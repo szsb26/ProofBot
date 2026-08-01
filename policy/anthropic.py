@@ -34,7 +34,7 @@ class AnthropicPolicy(BaseLLMPolicy):
         max_tokens: int = 256,
         temperature: float = 1.0,
         api_key: str | None = None,
-        director_max_tokens: int = 1024,
+        director_max_tokens: int = 4096,
         director_thinking: bool = False,
     ):
         super().__init__(

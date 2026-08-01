@@ -85,9 +85,13 @@ DIRECTOR_SYSTEM_PROMPT = (
     "summary of dead-end attempts already tried. Your job is to decide where "
     "to focus next.\n\n"
     "Rules:\n"
-    "- First, in \"reasoning\", write a short natural-language plan: what "
-    "mathematical fact or proof step you are trying to establish next at the "
-    "state you choose, and why you believe it moves the proof forward.\n"
+    "- First, in \"reasoning\", write a SHORT natural-language plan (2-4 "
+    "sentences, never more) : what mathematical fact or proof step you are "
+    "trying to establish next at the state you choose, and why you believe "
+    "it moves the proof forward. Keep it brief — you have a limited response "
+    "budget shared with the rest of this JSON, and an unfinished response is "
+    "discarded entirely, so a long reasoning that leaves no room for the "
+    "\"tactics\" array is worse than a short one.\n"
     "- If you are not fully confident of the exact Mathlib lemma name or its "
     "argument order, do not guess a specific identifier — prefer `apply?`, "
     "`exact?`, or a general-purpose tactic (`aesop`, `simp`, `omega`, "
@@ -96,8 +100,13 @@ DIRECTOR_SYSTEM_PROMPT = (
     "- You may abandon any open state you believe is a dead end — list its id "
     "in \"abandon\" with a brief \"abandon_reason\". Do not abandon a state "
     "just because a few tactics failed on it; only abandon it if you believe "
-    "the overall approach that led there is wrong.\n"
-    "- Choose exactly one open state (\"chosen_state\") to continue from.\n"
+    "the overall approach that led there is wrong. Never put the same id in "
+    "both \"abandon\" and \"chosen_state\" — choosing a state means you want "
+    "to keep working on it.\n"
+    "- Choose exactly one open state (\"chosen_state\") to continue from. "
+    "Copy its id exactly as shown in the state's bracket label, e.g. for "
+    "\"[state a1b2c3d4]\" use \"a1b2c3d4\" — do not include the word \"state\" "
+    "or the brackets.\n"
     "- Propose tactic candidates for the chosen state only, ordered from most "
     "to least promising. Check the \"Tactics already tried here\" list for "
     "your chosen state first — never propose a tactic that already appears "
@@ -105,7 +114,7 @@ DIRECTOR_SYSTEM_PROMPT = (
     "- Each tactic must be a single, syntactically valid Lean 4 tactic, with "
     "no explanations, numbering, backticks, or code fences.\n"
     "- Respond with JSON only, matching exactly this shape:\n"
-    '{"reasoning": "<your natural-language plan for the chosen state>", '
+    '{"reasoning": "<your SHORT natural-language plan for the chosen state>", '
     '"abandon": ["<state_id>", ...], "abandon_reason": "<brief reason, or '
     'empty string if abandon is empty>", "chosen_state": "<state_id>", '
     '"tactics": ["<tactic 1>", "<tactic 2>", ...]}'
@@ -295,7 +304,7 @@ class BaseLLMPolicy:
         model: str,
         max_tokens: int = 256,
         temperature: float = 1.0,
-        director_max_tokens: int = 1024,
+        director_max_tokens: int = 4096,
         director_thinking: bool = False,
     ):
         self._model = model
