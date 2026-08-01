@@ -198,7 +198,14 @@ class LedgerSearch:
             resp = await self.policy.get_next_action(
                 theorem, ledger, self.premises, k=self.k
             )
-            ledger.abandon(resp.abandoned_state_ids)
+            # A state named as both chosen and abandoned in the same turn is
+            # a self-contradictory response — choosing it is a clear signal
+            # to keep it, so drop it from the abandon list rather than
+            # abandoning the very state we're about to work on.
+            abandoned_ids = [
+                sid for sid in resp.abandoned_state_ids if sid != resp.chosen_state_id
+            ]
+            ledger.abandon(abandoned_ids)
 
             state = ledger.frontier.get(resp.chosen_state_id)
             if state is None:

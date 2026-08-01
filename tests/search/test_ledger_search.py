@@ -245,26 +245,59 @@ class TestLedgerSearchDirectorBehavior:
         assert result.proof_trace == ["simp"]
 
     def test_frontier_exhausted_when_only_state_is_abandoned(self):
-        """If the director abandons the only open state, the search fails
-        with frontier_exhausted rather than looping forever."""
+        """If the director abandons the only open state — targeting a
+        different chosen_state, so this isn't the self-referential case
+        below — the search fails with frontier_exhausted rather than
+        looping forever."""
 
-        class AlwaysAbandonPolicy:
+        class AbandonOnlyStatePolicy:
+            def __init__(self):
+                self.turn = 0
+
+            async def get_next_action(self, theorem, ledger, premises, k=8):
+                self.turn += 1
+                only_state = next(iter(ledger.frontier))
+                if self.turn == 1:
+                    # Fail a tactic first so there's something to abandon.
+                    return DirectorResponse(only_state, [], _tactics("nope"))
+                # Abandon the only state while "choosing" a different,
+                # nonexistent id — not the same self-referential case.
+                return DirectorResponse("some-other-id", [only_state], _tactics("simp"))
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=AbandonOnlyStatePolicy(), executor=MockExecutor(), k=4)
+        result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=10))
+        assert not result.success
+        assert result.failure_reason == "frontier_exhausted"
+        assert result.nodes_visited == 2
+
+    def test_self_abandon_of_chosen_state_is_ignored(self):
+        """A director response that both chooses and abandons the same
+        state in one turn is self-contradictory. Choosing a state signals
+        intent to continue it, so the self-abandon must be ignored rather
+        than honored — this was a real bug that silently killed an
+        otherwise-solvable search (see traces/ from the diff_implies_cont
+        failure it caused)."""
+
+        class SelfContradictingPolicy:
             async def get_next_action(self, theorem, ledger, premises, k=8):
                 chosen = next(iter(ledger.frontier))
                 return DirectorResponse(
                     chosen_state_id=chosen,
-                    abandoned_state_ids=[chosen],
+                    abandoned_state_ids=[chosen],  # contradicts choosing it
                     tactics=_tactics("simp"),
                 )
 
             async def close(self):
                 pass
 
-        search = LedgerSearch(policy=AlwaysAbandonPolicy(), executor=MockExecutor(), k=4)
+        search = LedgerSearch(policy=SelfContradictingPolicy(), executor=MockExecutor(), k=4)
         result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=10))
-        assert not result.success
-        assert result.failure_reason == "frontier_exhausted"
-        # Should stop as soon as the frontier empties, not burn the whole budget
+        # simp actually closes "n + 0 = n" — the self-abandon must not have
+        # prevented the tactic from being tried.
+        assert result.success
         assert result.nodes_visited == 1
 
     def test_bogus_chosen_state_id_does_not_crash(self):
