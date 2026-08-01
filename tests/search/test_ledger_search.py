@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 
+from core.executor import StepResult
 from core.ledger import Ledger
 from core.policy import TacticCandidate
-from core.proof_state import ProofState
+from core.proof_state import ProofState, make_proof_state
 from lean.mock_executor import MockExecutor
 from policy.base import DirectorResponse
 from policy.mock import MockPolicy
@@ -30,6 +31,30 @@ class ErroringExecutor:
 
     async def step(self, state, tactic):
         raise AssertionError("step() should never be called after a parse error")
+
+    async def close(self) -> None:
+        pass
+
+
+class AlwaysCloseExecutor:
+    """
+    Test-only executor that closes the proof on ANY tactic it receives.
+
+    Used to prove that banned tactics are stripped out before ever reaching
+    the executor — not merely that MockExecutor's own tactic simulation
+    happens not to recognize them as closing. If the filter were broken,
+    this executor would immediately "succeed" on the first banned tactic
+    handed to it.
+    """
+
+    capacity = 1
+
+    async def reset(self, theorem: str) -> ProofState:
+        return make_proof_state(["dummy goal"])
+
+    async def step(self, state: ProofState, tactic: str) -> StepResult:
+        closed_state = ProofState(goals=(), tactic_trace=state.tactic_trace + (tactic,))
+        return StepResult(next_state=closed_state, tactic=tactic)
 
     async def close(self) -> None:
         pass
@@ -187,6 +212,38 @@ class TestLedgerSearchDirectorBehavior:
         result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=5))
         assert not result.success
 
+    def test_embedded_sorry_is_filtered_not_just_bare_sorry(self):
+        """A tactic like 'exact absurd hcard (by sorry)' smuggles sorry in as
+        a nested term-mode proof — it must be rejected even though it isn't
+        literally the string "sorry". Uses AlwaysCloseExecutor so a real Lean
+        REPL would accept the tactic; only the filter can stop it."""
+
+        class EmbeddedSorryPolicy:
+            async def get_next_action(self, theorem, ledger, premises, k=8):
+                chosen = next(iter(ledger.frontier))
+                return DirectorResponse(
+                    chosen_state_id=chosen,
+                    abandoned_state_ids=[],
+                    tactics=_tactics(
+                        "exact absurd hcard (by sorry)",
+                        "have h := by admit",
+                        "simp",
+                    ),
+                )
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(
+            policy=EmbeddedSorryPolicy(), executor=AlwaysCloseExecutor(), k=4
+        )
+        result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=5))
+
+        assert result.success
+        # The sorry/admit-bearing candidates must never reach the executor —
+        # "simp" (the only clean candidate) is what actually closes it.
+        assert result.proof_trace == ["simp"]
+
     def test_frontier_exhausted_when_only_state_is_abandoned(self):
         """If the director abandons the only open state, the search fails
         with frontier_exhausted rather than looping forever."""
@@ -259,6 +316,37 @@ class TestLedgerSearchDirectorBehavior:
         state_id = next(iter(second_ledger.frontier))
         assert len(second_ledger.failures_for(state_id)) == 1
         assert second_ledger.failures_for(state_id)[0].tactic == "nope"
+
+    def test_reasoning_persists_into_ledger_across_turns(self):
+        """The director's stated plan for a state should be visible on the
+        ledger passed into the NEXT call, not just returned and discarded."""
+
+        calls: list[Ledger] = []
+
+        class ReasoningPolicy:
+            async def get_next_action(self, theorem, ledger, premises, k=8):
+                calls.append(ledger)
+                chosen = next(iter(ledger.frontier))
+                if len(calls) == 1:
+                    return DirectorResponse(
+                        chosen, [], _tactics("nope"),
+                        reasoning="Trying nope first because it seemed promising.",
+                    )
+                return DirectorResponse(chosen, [], _tactics("simp"), reasoning="")
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=ReasoningPolicy(), executor=MockExecutor(), k=4)
+        result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=5))
+
+        assert result.success
+        second_ledger = calls[1]
+        state_id = next(iter(second_ledger.frontier))
+        assert (
+            second_ledger.reasoning[state_id]
+            == "Trying nope first because it seemed promising."
+        )
 
     def test_explicit_abandon_removes_state_but_search_continues_via_new_states(self):
         """Abandoning one state should not end the search if other open

@@ -15,6 +15,7 @@ executor for every problem — no repeated 10-minute cold starts.
     python run_eval.py --problems add_zero       # single problem by name
     python run_eval.py --policy deepseek         # switch LLM backend
     python run_eval.py --workers 2 --budget 150  # tune search params
+    python run_eval.py --problems hard,stretch --trials 5 --trace  # save traces of failed trials
 """
 
 import argparse
@@ -34,6 +35,7 @@ from policy.deepseek import DeepSeekPolicy
 from policy.mock import MockPolicy
 
 RESULTS_DIR = Path(__file__).parent / "results"
+TRACES_DIR = Path(__file__).parent / "traces"
 
 _POLICY_DEFAULTS = {
     "anthropic": "claude-haiku-4-5-20251001",
@@ -62,6 +64,7 @@ examples:
   python run_eval.py --problems easy,medium --budget 150
   python run_eval.py --problems add_zero,contrapositive --policy deepseek
   python run_eval.py --workers 2 --budget 200
+  python run_eval.py --problems stretch --policy deepseek --trials 5 --trace
         """,
     )
     parser.add_argument(
@@ -123,6 +126,15 @@ examples:
         "--tactics",
         default="simp,ring,omega,intro n,aesop,linarith,norm_num,tauto",
         help="comma-separated tactic list for --policy mock",
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        default=False,
+        help=(
+            "save a turn-by-turn director prompt/response trace for every "
+            "FAILED trial to traces/eval_<timestamp>/ (no-op for --policy mock)"
+        ),
     )
     # Hidden: lets tests bypass real Lean
     parser.add_argument(
@@ -241,6 +253,8 @@ async def _run(args: argparse.Namespace) -> int:
             policy_name=policy_name,
             model_name=model_name,
             trials=args.trials,
+            trace=args.trace,
+            traces_dir=TRACES_DIR,
         )
     finally:
         if use_real_lean:

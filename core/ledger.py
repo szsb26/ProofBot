@@ -44,10 +44,16 @@ class Ledger:
                    summarize dead branches back to the LLM.
         abandoned: Ids the LLM has explicitly given up on. Permanently
                    excluded from the frontier and from future prompts.
+        reasoning: The director's most recent stated natural-language plan
+                   for each state, keyed by state id. Otherwise a director
+                   call's reasoning is discarded the moment the turn ends —
+                   this is the only memory of "why" that persists across
+                   turns for a given branch.
     """
     frontier: dict[str, ProofState] = field(default_factory=dict)
     entries: list[LedgerEntry] = field(default_factory=list)
     abandoned: set[str] = field(default_factory=set)
+    reasoning: dict[str, str] = field(default_factory=dict)
 
     def add_state(self, state: ProofState) -> str:
         """Register a state as open. No-op if it was already abandoned."""
@@ -74,3 +80,8 @@ class Ledger:
             e for e in self.entries
             if e.parent_id == state_id and e.outcome != "success"
         ]
+
+    def set_reasoning(self, state_id: str, text: str) -> None:
+        """Record the director's stated plan for a state. No-op on blank text."""
+        if text:
+            self.reasoning[state_id] = text

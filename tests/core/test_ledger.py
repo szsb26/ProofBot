@@ -88,3 +88,26 @@ class TestLedgerFailuresFor:
     def test_failures_for_empty_when_none_recorded(self):
         ledger = Ledger()
         assert ledger.failures_for("nonexistent") == []
+
+
+class TestLedgerReasoning:
+
+    def test_set_reasoning_stores_text(self):
+        ledger = Ledger()
+        ledger.set_reasoning("abc123", "Trying to establish the base case via simp.")
+        assert ledger.reasoning["abc123"] == "Trying to establish the base case via simp."
+
+    def test_set_reasoning_blank_text_is_a_noop(self):
+        ledger = Ledger()
+        ledger.set_reasoning("abc123", "")
+        assert "abc123" not in ledger.reasoning
+
+    def test_set_reasoning_overwrites_previous_plan(self):
+        ledger = Ledger()
+        ledger.set_reasoning("abc123", "First plan.")
+        ledger.set_reasoning("abc123", "Revised plan after failures.")
+        assert ledger.reasoning["abc123"] == "Revised plan after failures."
+
+    def test_reasoning_defaults_to_empty_dict(self):
+        ledger = Ledger()
+        assert ledger.reasoning == {}

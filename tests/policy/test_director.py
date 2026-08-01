@@ -77,8 +77,73 @@ class TestSerializeLedger:
         assert "Exhausted Attempts" in text
         assert "hallucinated_lemma×2" in text
         assert "type_mismatch×1" in text
-        # Raw failed tactic strings should not be replayed verbatim
-        assert "bad1" not in text
+
+    def test_lists_specific_failed_tactics_to_prevent_verbatim_repeats(self):
+        """The model must be able to see exactly which tactics already
+        failed at a state, not just aggregate counts — otherwise it can't
+        tell it's about to repeat a verbatim failure."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "omega", "tactic_failed")
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "Tactics already tried here" in text
+        assert "omega" in text
+
+    def test_repeated_identical_failed_tactic_is_deduplicated(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        for _ in range(4):
+            ledger.record_failure(state_id, "omega", "tactic_failed")
+        ledger.record_failure(state_id, "ring_nf", "tactic_failed")
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert text.count("- omega") == 1
+        assert "- ring_nf" in text
+
+    def test_tried_tactics_list_is_capped_with_omitted_note(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        # Long (>30 char) tactics so none qualify for short-tactic protection.
+        for i in range(20):
+            ledger.record_failure(
+                state_id, f"exact SomeVeryLongLemmaName.tactic_number_{i}", "tactic_failed"
+            )
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "showing 15 of 20 unique" in text
+        # Most recent ones should be the ones kept
+        assert "tactic_number_19" in text
+        assert "tactic_number_0" not in text
+
+    def test_short_generic_tactics_are_never_evicted_even_when_old(self):
+        """A bare tactic like "omega" tried once, long before many longer
+        tactics fill up the recency cap, must still appear — otherwise the
+        model can't tell it already tried the exact thing it's about to
+        propose again."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "omega", "tactic_failed")
+        for i in range(20):
+            ledger.record_failure(
+                state_id, f"exact SomeVeryLongLemmaName.tactic_number_{i}", "tactic_failed"
+            )
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "- omega" in text
+        # Still evicts old long tactics to keep the long-tactic budget bounded
+        assert "tactic_number_0" not in text
+        assert "tactic_number_19" in text
+
+    def test_long_multiline_tactic_is_truncated_and_flattened(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        long_tactic = "induction n with\n| zero => simp\n| succ n ih => " + ("x" * 150)
+        ledger.record_failure(state_id, long_tactic, "tactic_failed")
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "\n| zero" not in text  # flattened to one line
+        assert "…" in text  # truncated
 
     def test_no_dead_branch_section_when_nothing_failed(self):
         ledger = Ledger()
@@ -114,6 +179,19 @@ class TestSerializeLedger:
         ledger.add_state(make_proof_state(["n = n"]))
         text = serialize_ledger("theorem foo := by", ledger, [], 5)
         assert "5 tactic candidates" in text
+
+    def test_shows_persisted_reasoning_for_open_state(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.set_reasoning(state_id, "Plan to close via induction on n.")
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "Plan to close via induction on n." in text
+
+    def test_no_plan_line_when_no_reasoning_recorded(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n = n"]))
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "Last stated plan" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +265,29 @@ class TestParseDirectorResponse:
         resp = parse_director_response(raw, k=8, fallback_state_id="fb")
         assert resp.abandoned_state_ids == ["ok"]
 
+    def test_parses_reasoning_field(self):
+        raw = json.dumps({
+            "reasoning": "Try induction on n since the goal is universally quantified.",
+            "chosen_state": "abc",
+            "tactics": ["induction n"],
+        })
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.reasoning == "Try induction on n since the goal is universally quantified."
+
+    def test_reasoning_defaults_to_empty_string_when_missing(self):
+        raw = json.dumps({"chosen_state": "abc", "tactics": ["simp"]})
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.reasoning == ""
+
+    def test_reasoning_defaults_to_empty_string_when_not_a_string(self):
+        raw = json.dumps({"chosen_state": "abc", "tactics": ["simp"], "reasoning": 42})
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.reasoning == ""
+
+    def test_fallback_response_has_empty_reasoning(self):
+        resp = parse_director_response("not json at all", k=8, fallback_state_id="fb")
+        assert resp.reasoning == ""
+
     def test_log_probs_are_descending(self):
         raw = json.dumps({"chosen_state": "abc", "tactics": ["t1", "t2", "t3"]})
         resp = parse_director_response(raw, k=8, fallback_state_id="fb")
@@ -234,6 +335,27 @@ class TestGetNextAction:
             resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
             assert isinstance(resp, DirectorResponse)
             assert [c.tactic for c in resp.tactics] == ["simp"]
+        finally:
+            patcher.stop()
+
+    async def test_reasoning_flows_through_to_response_and_ledger(self):
+        policy, client, patcher = self._make_policy()
+        try:
+            raw = json.dumps({
+                "reasoning": "Close the reflexive goal directly.",
+                "chosen_state": "will-be-overridden",
+                "tactics": ["rfl"],
+            })
+            client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
+            ledger, state_id = self._ledger_with_one_state()
+
+            resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            assert resp.reasoning == "Close the reflexive goal directly."
+
+            # The caller (LedgerSearch) is responsible for persisting this into
+            # the ledger — get_next_action itself only returns it.
+            ledger.set_reasoning(resp.chosen_state_id, resp.reasoning)
+            assert ledger.reasoning[resp.chosen_state_id] == "Close the reflexive goal directly."
         finally:
             patcher.stop()
 

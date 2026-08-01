@@ -9,6 +9,9 @@ TestEvalCLI          — fast, mock executor + mock policy; validates CLI
 
 import json
 import os
+import re
+from pathlib import Path
+
 import pytest
 
 from eval.problems import (
@@ -19,6 +22,7 @@ from eval.problems import (
     select_problems,
 )
 from eval.harness import run_eval, EvalSummary, ProblemResult
+from policy.base import BaseLLMPolicy
 from run_eval import parse_args, main
 
 
@@ -303,6 +307,146 @@ class TestRunEval:
             assert r.trials == 1
             assert r.passes in (0, 1)
             assert r.success == (r.passes == 1)
+
+
+# ---------------------------------------------------------------------------
+# --trace: saving director prompt/response traces for failed trials
+# ---------------------------------------------------------------------------
+
+class FakeTracingCompatiblePolicy(BaseLLMPolicy):
+    """
+    Test-only real BaseLLMPolicy subclass (so get_next_action works
+    unwrapped, matching trace=False, as well as wrapped by TracingPolicy for
+    trace=True) without needing a real DeepSeek/Anthropic client. Always
+    proposes one fixed tactic against whichever state appears first in the
+    serialized ledger prompt.
+    """
+
+    def __init__(self, tactic: str):
+        super().__init__(model="fake", director_max_tokens=1024, director_thinking=False)
+        self._tactic = tactic
+        self.closed = False
+
+    async def _call_api(self, user_prompt, system_prompt="", max_tokens=None, enable_thinking=False):
+        match = re.search(r"\[state (\w+)\]", user_prompt)
+        state_id = match.group(1) if match else "unknown"
+        return json.dumps({
+            "chosen_state": state_id,
+            "tactics": [self._tactic],
+            "reasoning": "test reasoning",
+        })
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+_TRACE_TEST_PROBLEM = EvalProblem(
+    name="trace_test_problem",
+    statement="theorem foo : n + 0 = n := by",
+    difficulty="easy",
+)
+
+
+class TestRunEvalTracing:
+
+    @pytest.fixture
+    def executors(self):
+        from lean.mock_executor import MockExecutor
+        return [MockExecutor()]
+
+    @pytest.mark.asyncio
+    async def test_trace_disabled_by_default_saves_nothing(self, executors, tmp_path):
+        policy = FakeTracingCompatiblePolicy(tactic="nope")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=3,
+            policy_name="fake",
+            model_name="fake",
+            trace=False,
+            traces_dir=tmp_path,
+        )
+        assert not summary.results[0].success
+        assert summary.results[0].failed_trial_traces == []
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_trace_enabled_saves_file_for_failed_trial(self, executors, tmp_path):
+        policy = FakeTracingCompatiblePolicy(tactic="nope")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=3,
+            policy_name="fake",
+            model_name="fake",
+            trace=True,
+            traces_dir=tmp_path,
+        )
+        result = summary.results[0]
+        assert not result.success
+        assert len(result.failed_trial_traces) == 1
+
+        trace_path = Path(result.failed_trial_traces[0])
+        assert trace_path.exists()
+        content = trace_path.read_text()
+        assert "PROMPT SENT TO LLM" in content
+        assert "nope" in content
+
+    @pytest.mark.asyncio
+    async def test_trace_enabled_saves_no_file_for_successful_trial(self, executors, tmp_path):
+        policy = FakeTracingCompatiblePolicy(tactic="simp")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=3,
+            policy_name="fake",
+            model_name="fake",
+            trace=True,
+            traces_dir=tmp_path,
+        )
+        result = summary.results[0]
+        assert result.success
+        assert result.failed_trial_traces == []
+
+    @pytest.mark.asyncio
+    async def test_trace_saves_one_file_per_failed_trial(self, executors, tmp_path):
+        policy = FakeTracingCompatiblePolicy(tactic="nope")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=2,
+            policy_name="fake",
+            model_name="fake",
+            trials=3,
+            trace=True,
+            traces_dir=tmp_path,
+        )
+        result = summary.results[0]
+        assert result.passes == 0
+        assert len(result.failed_trial_traces) == 3
+
+    @pytest.mark.asyncio
+    async def test_trace_ignored_for_policy_without_call_api(self, executors, tmp_path, capsys):
+        from policy.mock import MockPolicy
+        policy = MockPolicy(tactics=["nope"])
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=3,
+            policy_name="mock",
+            model_name="mock",
+            trace=True,
+            traces_dir=tmp_path,
+        )
+        assert summary.results[0].failed_trial_traces == []
+        assert list(tmp_path.iterdir()) == []
+        captured = capsys.readouterr()
+        assert "trace" in captured.out.lower()
 
 
 # ---------------------------------------------------------------------------

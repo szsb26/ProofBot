@@ -26,6 +26,7 @@ to DGX Spark (10+ workers) with zero code changes.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -33,8 +34,16 @@ from core.executor import LeanExecutor
 from core.ledger import Ledger
 from core.policy import PolicyModel
 
-# Strip sorry/admit — they close any goal but are not real proofs.
-_BANNED_TACTICS = {"sorry", "admit"}
+# Reject sorry/admit anywhere in a tactic, not just as the whole tactic —
+# both are valid Lean terms, so they can be smuggled in nested inside an
+# otherwise legitimate-looking tactic (e.g. "exact absurd hcard (by sorry)").
+# Word boundaries avoid false positives on identifiers that merely contain
+# these substrings.
+_BANNED_TACTIC_PATTERN = re.compile(r"\b(sorry|admit)\b")
+
+
+def _contains_banned_tactic(tactic: str) -> bool:
+    return bool(_BANNED_TACTIC_PATTERN.search(tactic))
 
 
 def _classify_tactic_error(error: str) -> str:
@@ -197,8 +206,10 @@ class LedgerSearch:
                 # Nothing to expand this turn — try again next call.
                 continue
 
+            ledger.set_reasoning(resp.chosen_state_id, resp.reasoning)
+
             candidates = [
-                c for c in resp.tactics if c.tactic.strip() not in _BANNED_TACTICS
+                c for c in resp.tactics if not _contains_banned_tactic(c.tactic)
             ]
 
             results = [
@@ -217,7 +228,8 @@ class LedgerSearch:
                     )
 
                 if result.success:
-                    ledger.add_state(result.next_state)
+                    new_id = ledger.add_state(result.next_state)
+                    ledger.set_reasoning(new_id, resp.reasoning)
                 else:
                     err = result.next_state.error or ""
                     category = _classify_tactic_error(err)

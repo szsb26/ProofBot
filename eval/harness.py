@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from core.trace import TracingPolicy
 from eval.problems import DIFFICULTIES, EvalProblem
 from search.ledger_search import LedgerSearch, prove_parallel
 
@@ -29,6 +30,7 @@ class ProblemResult:
     proof_trace: list[str]  # from first successful trial (empty if none)
     failure_modes: dict = field(default_factory=dict)   # search-level: {reason: count}
     tactic_errors: dict = field(default_factory=dict)   # tactic-level: {category: count}
+    failed_trial_traces: list[str] = field(default_factory=list)  # paths, only when --trace is on
 
 
 @dataclass
@@ -63,6 +65,8 @@ async def run_eval(
     policy_name: str,
     model_name: str,
     trials: int = 1,
+    trace: bool = False,
+    traces_dir: str | Path = "traces",
 ) -> EvalSummary:
     """
     Run every problem in *problems* through the prover and collect results.
@@ -74,9 +78,27 @@ async def run_eval(
     With trials > 1, each problem is attempted `trials` times independently.
     Results report both pass@k (any trial succeeded) and mean pass rate
     (fraction of trials that succeeded, a pass@1 estimate).
+
+    trace: if True, every trial's director calls are captured verbatim
+    (see core.trace.TracingPolicy) and — only for trials that fail — saved
+    to <traces_dir>/eval_<timestamp>/<problem>_trial<N>_worker<M>.txt, so a
+    specific failed attempt can be inspected after the fact rather than
+    needing to separately reproduce it (which, at temperature=1.0, won't
+    give you the same attempt anyway). Successful trials aren't saved —
+    their winning proof_trace is already in the results JSON. Requires
+    *policy* to be a BaseLLMPolicy-compatible object (has _call_api); if not
+    (e.g. MockPolicy), tracing is silently skipped since there's no real LLM
+    call to capture.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results: list[ProblemResult] = []
+
+    can_trace = trace and hasattr(policy, "_call_api")
+    if trace and not can_trace:
+        print(
+            "  (--trace ignored: policy has no _call_api, nothing to capture)\n"
+        )
+    trial_traces_dir = Path(traces_dir) / f"eval_{timestamp}"
 
     for problem in problems:
         print(
@@ -91,12 +113,21 @@ async def run_eval(
         proof_trace: list[str] = []
         failure_modes: dict[str, int] = {}
         tactic_errors: dict[str, int] = {}
+        trace_paths: list[str] = []
 
         for t in range(trials):
-            searches = [
-                LedgerSearch(policy=policy, executor=e)
-                for e in executors
-            ]
+            if can_trace:
+                traced_policies = [TracingPolicy(policy) for _ in executors]
+                searches = [
+                    LedgerSearch(policy=tp, executor=e)
+                    for tp, e in zip(traced_policies, executors)
+                ]
+            else:
+                traced_policies = []
+                searches = [
+                    LedgerSearch(policy=policy, executor=e)
+                    for e in executors
+                ]
             result = await prove_parallel(
                 problem.statement, searches=searches, budget=budget
             )
@@ -109,6 +140,14 @@ async def run_eval(
                 failure_modes[reason] = failure_modes.get(reason, 0) + 1
                 for cat, cnt in result.tactic_errors.items():
                     tactic_errors[cat] = tactic_errors.get(cat, 0) + cnt
+
+                if can_trace:
+                    trial_traces_dir.mkdir(parents=True, exist_ok=True)
+                    for w, tp in enumerate(traced_policies, start=1):
+                        path = trial_traces_dir / f"{problem.name}_trial{t + 1}_worker{w}.txt"
+                        path.write_text(tp.render())
+                        trace_paths.append(str(path))
+
             total_nodes += result.nodes_visited
             total_ms += result.elapsed_ms
 
@@ -143,6 +182,8 @@ async def run_eval(
             print(f"              ↳ search: {fm_str}")
             if te_str:
                 print(f"              ↳ errors: {te_str}")
+            if trace_paths:
+                print(f"              ↳ traces: {trial_traces_dir}/")
 
         results.append(
             ProblemResult(
@@ -158,6 +199,7 @@ async def run_eval(
                 proof_trace=proof_trace,
                 failure_modes=failure_modes,
                 tactic_errors=tactic_errors,
+                failed_trial_traces=trace_paths,
             )
         )
 

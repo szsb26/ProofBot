@@ -85,17 +85,28 @@ DIRECTOR_SYSTEM_PROMPT = (
     "summary of dead-end attempts already tried. Your job is to decide where "
     "to focus next.\n\n"
     "Rules:\n"
+    "- First, in \"reasoning\", write a short natural-language plan: what "
+    "mathematical fact or proof step you are trying to establish next at the "
+    "state you choose, and why you believe it moves the proof forward.\n"
+    "- If you are not fully confident of the exact Mathlib lemma name or its "
+    "argument order, do not guess a specific identifier — prefer `apply?`, "
+    "`exact?`, or a general-purpose tactic (`aesop`, `simp`, `omega`, "
+    "`nlinarith`) that can find or verify the step itself instead of naming "
+    "a lemma you are unsure of.\n"
     "- You may abandon any open state you believe is a dead end — list its id "
     "in \"abandon\" with a brief \"abandon_reason\". Do not abandon a state "
     "just because a few tactics failed on it; only abandon it if you believe "
     "the overall approach that led there is wrong.\n"
     "- Choose exactly one open state (\"chosen_state\") to continue from.\n"
     "- Propose tactic candidates for the chosen state only, ordered from most "
-    "to least promising.\n"
+    "to least promising. Check the \"Tactics already tried here\" list for "
+    "your chosen state first — never propose a tactic that already appears "
+    "there verbatim, since it is guaranteed to fail the same way again.\n"
     "- Each tactic must be a single, syntactically valid Lean 4 tactic, with "
     "no explanations, numbering, backticks, or code fences.\n"
     "- Respond with JSON only, matching exactly this shape:\n"
-    '{"abandon": ["<state_id>", ...], "abandon_reason": "<brief reason, or '
+    '{"reasoning": "<your natural-language plan for the chosen state>", '
+    '"abandon": ["<state_id>", ...], "abandon_reason": "<brief reason, or '
     'empty string if abandon is empty>", "chosen_state": "<state_id>", '
     '"tactics": ["<tactic 1>", "<tactic 2>", ...]}'
 )
@@ -107,10 +118,34 @@ class DirectorResponse:
     The director's decision for one turn of ledger-guided search: which open
     state to continue from (and which, if any, to give up on), plus tactic
     candidates for the chosen state.
+
+    Attributes:
+        reasoning: The director's stated natural-language plan for the
+                   chosen state this turn. Persisted in the Ledger and shown
+                   back on future turns (see Ledger.set_reasoning), so the
+                   model's own prior plan for a branch isn't lost between
+                   calls the way its hidden reasoning tokens are.
     """
     chosen_state_id: str
     abandoned_state_ids: list[str]
     tactics: list[TacticCandidate]
+    reasoning: str = ""
+
+
+_MAX_TRIED_TACTICS_SHOWN = 15
+_MAX_TACTIC_DISPLAY_LEN = 100
+# Bare/generic tactics (e.g. "omega", "simp", "ring") are cheap to remember
+# and exactly the ones most likely to be blindly retried once they age out
+# of a recency-capped list — so they're never evicted, regardless of order.
+_SHORT_TACTIC_MAX_LEN = 30
+
+
+def _format_tactic_for_display(tactic: str) -> str:
+    """Collapse a (possibly multi-line) tactic to one truncated display line."""
+    oneline = " ".join(tactic.split())
+    if len(oneline) > _MAX_TACTIC_DISPLAY_LEN:
+        return oneline[:_MAX_TACTIC_DISPLAY_LEN] + "…"
+    return oneline
 
 
 def serialize_ledger(
@@ -123,9 +158,12 @@ def serialize_ledger(
     Render a Ledger into prompt text for the director call.
 
     Lists every open state with the tactic path that reached it, then a
-    compact per-state summary of failed attempts (dead branches are never
-    replayed verbatim — only their category counts). Abandoned states are
-    omitted entirely; once given up on, they no longer cost context.
+    per-state summary of failed attempts: category counts plus the specific
+    tactic strings already tried (deduplicated, most-recent-first, capped),
+    so the model can check "have I already tried this" before re-proposing
+    a tactic verbatim rather than only seeing an aggregate failure count.
+    Abandoned states are omitted entirely; once given up on, they no longer
+    cost context.
     """
     parts = [f"## Theorem\n\n{theorem}\n"]
 
@@ -133,6 +171,9 @@ def serialize_ledger(
     for state_id, state in ledger.frontier.items():
         path = ", ".join(state.tactic_trace) if state.tactic_trace else "(root)"
         parts.append(f"\n[state {state_id}] (path: {path})\n{state.serialize()}\n")
+        plan = ledger.reasoning.get(state_id)
+        if plan:
+            parts.append(f"Last stated plan for this state: {plan}\n")
 
     dead_by_parent: dict[str, list] = {}
     for entry in ledger.entries:
@@ -150,6 +191,33 @@ def serialize_ledger(
             )
             parts.append(
                 f"\nstate {state_id}: {len(failures)} tactics tried, all failed — {summary}"
+            )
+
+            seen: list[str] = []
+            for f in failures:
+                if f.tactic not in seen:
+                    seen.append(f.tactic)
+
+            # Short/generic tactics are never evicted — they're cheap to
+            # keep and exactly the ones a recency cap would otherwise drop
+            # right before the model blindly re-tries them (e.g. "omega"
+            # tried once long ago, then proposed again once it ages out).
+            short = {t for t in seen if len(t) <= _SHORT_TACTIC_MAX_LEN}
+            long_recent_budget = max(_MAX_TRIED_TACTICS_SHOWN - len(short), 0)
+            kept_long = set(
+                [t for t in seen if t not in short][-long_recent_budget:]
+            )
+            shown = [t for t in seen if t in short or t in kept_long]
+
+            tactic_lines = "\n".join(f"  - {_format_tactic_for_display(t)}" for t in shown)
+            omitted_note = (
+                f" (showing {len(shown)} of {len(seen)} unique)"
+                if len(seen) > len(shown)
+                else ""
+            )
+            parts.append(
+                f"Tactics already tried here{omitted_note} — do not repeat verbatim:\n"
+                f"{tactic_lines}"
             )
 
     if premises:
@@ -184,6 +252,10 @@ def parse_director_response(text: str, k: int, fallback_state_id: str) -> Direct
 
         abandoned = [s for s in data.get("abandon", []) if isinstance(s, str)]
 
+        reasoning = data.get("reasoning")
+        if not isinstance(reasoning, str):
+            reasoning = ""
+
         raw_tactics = [
             t for t in data.get("tactics", [])
             if isinstance(t, str) and t.strip()
@@ -199,12 +271,14 @@ def parse_director_response(text: str, k: int, fallback_state_id: str) -> Direct
             chosen_state_id=chosen,
             abandoned_state_ids=abandoned,
             tactics=tactics,
+            reasoning=reasoning,
         )
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         return DirectorResponse(
             chosen_state_id=fallback_state_id,
             abandoned_state_ids=[],
             tactics=[TacticCandidate(tactic="simp", log_prob=0.0)],
+            reasoning="",
         )
 
 
@@ -221,7 +295,7 @@ class BaseLLMPolicy:
         model: str,
         max_tokens: int = 256,
         temperature: float = 1.0,
-        director_max_tokens: int = 512,
+        director_max_tokens: int = 1024,
         director_thinking: bool = False,
     ):
         self._model = model

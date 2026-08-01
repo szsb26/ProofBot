@@ -9,3 +9,4 @@ data/
 .env
 lean_project/.lake/
 results/
+traces/
