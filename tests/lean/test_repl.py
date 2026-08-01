@@ -17,12 +17,13 @@ import os
 import pytest
 import pytest_asyncio
 import asyncio
-from lean.repl import SubprocessExecutor, _parse_goal_string, LEAN_PROJECT_DIR
-from core.proof_state import ProofState
+from unittest.mock import AsyncMock
+from lean.repl import LeanWorker, SubprocessExecutor, _parse_goal_string, LEAN_PROJECT_DIR
+from core.proof_state import ProofState, make_proof_state
 from policy.mock import MockPolicy
 from policy.anthropic import AnthropicPolicy
 from policy.deepseek import DeepSeekPolicy
-from search.ledger_search import LedgerSearch, prove_parallel
+from search.ledger_search import LedgerSearch, _classify_tactic_error, prove_parallel
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,79 @@ class TestParseGoalString:
         # the string contains " : ".
         result = _parse_goal_string("⊢ ∀ (n : Nat), n + 0 = n")
         assert result.goals[0].target == "∀ (n : Nat), n + 0 = n"
+
+
+# ---------------------------------------------------------------------------
+# LeanWorker.step() closure detection (fast, no real Lean — mocks _send)
+# ---------------------------------------------------------------------------
+
+class TestLeanWorkerStepClosureDetection:
+    """
+    Regression coverage for a real bug: apply?/exact? can report empty
+    goals while proofStatus says "Incomplete: contains sorry" — no full
+    match was found, so Lean fell back to a placeholder. The old condition
+    `if not goals_raw or proof_status == "Completed":` treated empty goals
+    ALONE as a genuine close, silently accepting these as full proofs. Only
+    proofStatus == "Completed" may signal a genuine close now.
+
+    No real Lean process needed — _send() is mocked with the exact raw
+    response shapes captured from a live REPL session.
+    """
+
+    def _make_worker_with_cached_state(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])
+        worker._proof_state_cache[state.stable_hash()] = 0
+        return worker, state
+
+    async def test_completed_status_is_a_genuine_close(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "Completed", "proofState": 1, "goals": [],
+        })
+        result = await worker.step(state, "simp")
+        assert result.success
+        assert result.proof_closed
+
+    async def test_empty_goals_without_completed_status_is_not_a_close(self):
+        """The apply?/exact? bug, reproduced from a real captured response."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "Incomplete: contains sorry",
+            "proofState": 1,
+            "goals": [],
+            "messages": [
+                {"severity": "info", "data": "Try this:\n  refine ?_"},
+            ],
+        })
+        result = await worker.step(state, "apply?")
+        assert not result.success
+        assert not result.proof_closed
+        assert "hidden sorry" in result.next_state.error.lower()
+
+    async def test_empty_goals_without_completed_status_classified_as_hidden_sorry(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "Incomplete: contains sorry",
+            "proofState": 1,
+            "goals": [],
+        })
+        result = await worker.step(state, "apply?")
+        assert _classify_tactic_error(result.next_state.error) == "hidden_sorry"
+
+    async def test_nonempty_goals_still_parsed_normally(self):
+        """Sanity check: the fix must not disturb the ordinary
+        'tactic succeeded, goals remain' path."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "",
+            "proofState": 1,
+            "goals": ["n : Nat\n⊢ n = n"],
+        })
+        result = await worker.step(state, "intro n")
+        assert result.success
+        assert not result.proof_closed
+        assert result.next_state.goals[0].target == "n = n"
 
 
 # ---------------------------------------------------------------------------

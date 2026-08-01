@@ -431,7 +431,7 @@ class LeanWorker:
         goals_raw = response.get("goals", [])
         proof_status = response.get("proofStatus", "")
 
-        if not goals_raw or proof_status == "Completed":
+        if proof_status == "Completed":
             # Proof closed
             closed_state = ProofState(
                 goals=(),
@@ -440,6 +440,31 @@ class LeanWorker:
             )
             return StepResult(
                 next_state=closed_state,
+                tactic=tactic,
+                elapsed_ms=elapsed,
+            )
+
+        if not goals_raw:
+            # goals is empty but proofStatus is NOT "Completed" — e.g.
+            # "Incomplete: contains sorry". This happens with apply?/exact?
+            # when no full match is found: Lean reports no goals left to
+            # display, but the proof term itself is incomplete. Treat as a
+            # failed tactic, not a close — accepting it as a "next_state"
+            # with empty goals would independently re-derive is_closed=True
+            # downstream (ProofState.is_closed only checks len(goals) == 0),
+            # silently reproducing the same false-success bug.
+            error_state = ProofState(
+                goals=state.goals,
+                error=(
+                    "Lean error:\nTactic reported no remaining goals but "
+                    f"proofStatus={proof_status!r} (not Completed) — likely "
+                    "inserted a hidden sorry/placeholder."
+                ),
+                depth=state.depth,
+                tactic_trace=state.tactic_trace,
+            )
+            return StepResult(
+                next_state=error_state,
                 tactic=tactic,
                 elapsed_ms=elapsed,
             )

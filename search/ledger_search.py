@@ -66,6 +66,8 @@ def _classify_tactic_error(error: str) -> str:
         return "syntax_error"
     if "maximum heart beats" in e or "deterministic timeout" in e:
         return "max_heartbeats"
+    if "inserted a hidden sorry" in e:
+        return "hidden_sorry"
     return "tactic_failed"
 
 
