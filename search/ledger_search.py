@@ -62,7 +62,12 @@ def _classify_tactic_error(error: str) -> str:
         return "unsolved_goals"
     if "no goals" in e:
         return "no_goals"
-    if "expected token" in e or "unexpected token" in e or "unexpected end of input" in e:
+    if (
+        "expected token" in e
+        or "unexpected token" in e
+        or "unexpected end of input" in e
+        or "expected end of input" in e
+    ):
         return "syntax_error"
     if "maximum heart beats" in e or "deterministic timeout" in e:
         return "max_heartbeats"
@@ -243,7 +248,9 @@ class LedgerSearch:
                     err = result.next_state.error or ""
                     category = _classify_tactic_error(err)
                     tactic_errors[category] = tactic_errors.get(category, 0) + 1
-                    ledger.record_failure(resp.chosen_state_id, candidate.tactic, category)
+                    ledger.record_failure(
+                        resp.chosen_state_id, candidate.tactic, category, err
+                    )
 
         failure_reason = "frontier_exhausted" if not ledger.frontier else "budget_exhausted"
         return ProofResult(

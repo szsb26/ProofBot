@@ -448,6 +448,92 @@ class TestRunEvalTracing:
         captured = capsys.readouterr()
         assert "trace" in captured.out.lower()
 
+    @pytest.mark.asyncio
+    async def test_trace_successes_disabled_by_default_even_with_trace_on(self, executors, tmp_path):
+        """trace=True alone must not save successful trials — that's what
+        the separate trace_successes flag is for."""
+        policy = FakeTracingCompatiblePolicy(tactic="simp")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=3,
+            policy_name="fake",
+            model_name="fake",
+            trace=True,
+            trace_successes=False,
+            traces_dir=tmp_path,
+        )
+        result = summary.results[0]
+        assert result.success
+        assert result.successful_trial_traces == []
+
+    @pytest.mark.asyncio
+    async def test_trace_successes_saves_file_for_successful_trial(self, executors, tmp_path):
+        policy = FakeTracingCompatiblePolicy(tactic="simp")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=3,
+            policy_name="fake",
+            model_name="fake",
+            trace_successes=True,
+            traces_dir=tmp_path,
+        )
+        result = summary.results[0]
+        assert result.success
+        assert len(result.successful_trial_traces) == 1
+
+        trace_path = Path(result.successful_trial_traces[0])
+        assert trace_path.exists()
+        content = trace_path.read_text()
+        assert "PROMPT SENT TO LLM" in content
+        assert "simp" in content
+
+    @pytest.mark.asyncio
+    async def test_trace_successes_saves_no_file_for_failed_trial(self, executors, tmp_path):
+        """trace_successes=True alone must not save failed trials — that's
+        what the separate trace flag is for."""
+        policy = FakeTracingCompatiblePolicy(tactic="nope")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=3,
+            policy_name="fake",
+            model_name="fake",
+            trace=False,
+            trace_successes=True,
+            traces_dir=tmp_path,
+        )
+        result = summary.results[0]
+        assert not result.success
+        assert result.successful_trial_traces == []
+        assert result.failed_trial_traces == []
+
+    @pytest.mark.asyncio
+    async def test_both_trace_flags_together_save_both_outcomes(self, executors, tmp_path):
+        policy = FakeTracingCompatiblePolicy(tactic="nope")
+        summary = await run_eval(
+            problems=[_TRACE_TEST_PROBLEM],
+            policy=policy,
+            executors=executors,
+            budget=2,
+            policy_name="fake",
+            model_name="fake",
+            trials=1,
+            trace=True,
+            trace_successes=True,
+            traces_dir=tmp_path,
+        )
+        result = summary.results[0]
+        # This policy always fails, so only the failed-trace path is
+        # exercised here, but both flags being on shouldn't error out.
+        assert not result.success
+        assert len(result.failed_trial_traces) == 1
+        assert result.successful_trial_traces == []
+
 
 # ---------------------------------------------------------------------------
 # CLI (mock executor + mock policy)

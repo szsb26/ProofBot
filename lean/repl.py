@@ -52,6 +52,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -62,9 +63,72 @@ from core.proof_state import Goal, Hypothesis, ProofState
 logger = logging.getLogger(__name__)
 
 # Path to the lean_project directory — where lake exe repl is run from
-# Think of a lean project as something that is similar to a python virtual environment - 
+# Think of a lean project as something that is similar to a python virtual environment -
 # it contains the Lean files, dependencies, and compiled artifacts needed to run the REPL.
 LEAN_PROJECT_DIR = Path(__file__).parent.parent / "lean_project"
+
+_BY_KEYWORD_RE = re.compile(r"\bby\b")
+
+
+def _split_top_level_tactics(tactic: str) -> list[str]:
+    """
+    Split a tactic string on top-level ';' into individual Lean 4 tactics.
+
+    The REPL's tactic-stepping endpoint (`{"tactic": ..., "proofState": ...}`)
+    only parses one atomic `tactic` per call, not a `tacticSeq` — confirmed
+    empirically: even a trivially valid "t1; t2" is rejected outright with
+    "expected end of input" right after t1, regardless of whether t2 is
+    separated by ';' or by a newline. Splitting on our end and sending each
+    step as its own sequential call lets a chained candidate actually run
+    instead of being silently lost to a parse error.
+
+    Semicolons inside brackets, or anywhere after a top-level 'by' (a
+    reserved keyword, so an unbracketed occurrence unambiguously opens a
+    nested tacticSeq — e.g. "have h := by t1; t2"), are left untouched: in
+    a flat, unindented one-line string there's no dedent boundary to close
+    that block early, so everything to the right of 'by' belongs to it and
+    must be sent to Lean as a single unit.
+    """
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    n = len(tactic)
+    while i < n:
+        c = tactic[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(depth - 1, 0)
+        elif depth == 0:
+            if c == ";":
+                parts.append(tactic[start:i].strip())
+                start = i + 1
+            elif _BY_KEYWORD_RE.match(tactic, i):
+                break
+        i += 1
+    parts.append(tactic[start:].strip())
+    return [p for p in parts if p]
+
+
+def _annotate_chain_error(raw_error: str, sub_tactics: list[str], failed_idx: int) -> str:
+    """
+    Prefix a Lean error with which step of a multi-step chain caused it.
+
+    A no-op (returns raw_error unchanged) when the candidate wasn't split
+    into multiple steps, so single-tactic candidates are unaffected.
+    """
+    if len(sub_tactics) <= 1:
+        return raw_error
+    body = raw_error
+    if body.startswith("Lean error:\n"):
+        body = body[len("Lean error:\n"):]
+    prefix = "; ".join(sub_tactics[:failed_idx])
+    header = f'Lean error (step {failed_idx + 1} of {len(sub_tactics)} in this chain — "{sub_tactics[failed_idx]}" — failed'
+    if prefix:
+        header += f', after "{prefix}" succeeded'
+    header += "):\n"
+    return header + body
 
 
 class LeanREPLError(Exception):
@@ -126,12 +190,17 @@ class LeanWorker:
 
         """
         # start the lean REPL subprocess.
+        # limit raised well past asyncio's 64KB default: apply?/exact? can
+        # emit dozens of verbose "Try this" info messages in one response,
+        # producing single lines that exceed the default and crash readline
+        # with "Separator is found, but chunk is longer than limit".
         self._proc = await asyncio.create_subprocess_exec(
             "lake", "exe", "repl",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=str(self._dir),
+            limit=10 * 1024 * 1024,
         )
         logger.debug(f"Started Lean worker pid={self._proc.pid}")
 
@@ -339,12 +408,22 @@ class LeanWorker:
         worker.step(): step() sends a tactic to the REPL and waits for the result. This also involves multiple async steps:
         1. Send the tactic to the REPL (async because it writes to the subprocess stdin).
         2. Wait for the REPL to respond with the new proof state and success/failure info (async because it reads from the subprocess stdout).
+
+        If tactic is a top-level ';'-chain (e.g. "intro n; simp"), it is
+        split (see _split_top_level_tactics) and each step is sent to the
+        REPL as its own sequential call, chaining proofState ids forward —
+        the REPL only parses one atomic tactic per call, so an unsplit
+        chain is rejected outright regardless of whether it's
+        mathematically sound. This also localizes a mid-chain failure to
+        the specific step that caused it (see _annotate_chain_error)
+        instead of an opaque terminal error. Single-tactic candidates (the
+        common case) take exactly one loop iteration and are unaffected.
         """
         start = time.perf_counter()
 
         # Look up the REPL proof state id for this state, stable_hash identifies which branch of the proof tree we are on within the workers' REPL process.
         repl_ps_id = self._proof_state_cache.get(state.stable_hash())
-        # error out if we dont have this state in our cache. This should not happen if our caching and routing logic is correct, 
+        # error out if we dont have this state in our cache. This should not happen if our caching and routing logic is correct,
         # but we check just in case.
         if repl_ps_id is None:
             # State not in cache — return error
@@ -360,16 +439,11 @@ class LeanWorker:
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
 
-        # Send tactic to REPL, send tactic (a string) to the given proofState id.
-        try:
-            response = await self._send({
-                "tactic": tactic,
-                "proofState": repl_ps_id,
-            })
-        except LeanREPLError as e:
+        sub_tactics = _split_top_level_tactics(tactic)
+        if not sub_tactics:
             error_state = ProofState(
                 goals=state.goals,
-                error=str(e),
+                error="Lean error:\nempty tactic",
                 depth=state.depth,
                 tactic_trace=state.tactic_trace,
             )
@@ -379,55 +453,94 @@ class LeanWorker:
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
 
+        current_ps_id = repl_ps_id
+        response: dict = {}
+
+        for step_idx, sub_tactic in enumerate(sub_tactics):
+            # Send this step of the chain to the REPL, against whatever
+            # proofState the previous step (or the original state, for the
+            # first step) left us at.
+            try:
+                response = await self._send({
+                    "tactic": sub_tactic,
+                    "proofState": current_ps_id,
+                })
+            except LeanREPLError as e:
+                error_state = ProofState(
+                    goals=state.goals,
+                    error=str(e),
+                    depth=state.depth,
+                    tactic_trace=state.tactic_trace,
+                )
+                return StepResult(
+                    next_state=error_state,
+                    tactic=tactic,
+                    elapsed_ms=(time.perf_counter() - start) * 1000,
+                )
+
+            # Parse response. Note that response is a JSON object which contains keys like proofState, goals, proofStatus, etc...
+            if "message" in response:
+                # Tactic failed (REPL top-level error string)
+                error_state = ProofState(
+                    goals=state.goals,
+                    error=_annotate_chain_error(response["message"], sub_tactics, step_idx),
+                    depth=state.depth,
+                    tactic_trace=state.tactic_trace,
+                )
+                return StepResult(
+                    next_state=error_state,
+                    tactic=tactic,
+                    elapsed_ms=(time.perf_counter() - start) * 1000,
+                )
+
+            # The REPL can also report errors via a "messages" list even when it
+            # returns goals:[] — e.g. `exact bad_term` closes the goal syntactically
+            # but reports "Unknown identifier" in messages. Treat those as failures.
+            msg_errors = [
+                m for m in response.get("messages", [])
+                if m.get("severity") == "error"
+            ]
+            if msg_errors:
+                error_msg = "Lean error:\n" + msg_errors[0].get("data", "unknown error")
+                error_state = ProofState(
+                    goals=state.goals,
+                    error=_annotate_chain_error(error_msg, sub_tactics, step_idx),
+                    depth=state.depth,
+                    tactic_trace=state.tactic_trace,
+                )
+                return StepResult(
+                    next_state=error_state,
+                    tactic=tactic,
+                    elapsed_ms=(time.perf_counter() - start) * 1000,
+                )
+
+            # This step succeeded
+            if "proofState" not in response:
+                error_state = ProofState(
+                    goals=state.goals,
+                    error=f"unexpected REPL response (no proofState): {response}",
+                    depth=state.depth,
+                    tactic_trace=state.tactic_trace,
+                )
+                return StepResult(
+                    next_state=error_state,
+                    tactic=tactic,
+                    elapsed_ms=(time.perf_counter() - start) * 1000,
+                )
+
+            current_ps_id = response["proofState"]
+            if response.get("proofStatus", "") == "Completed":
+                # Goal closed before exhausting the chain — nothing left to
+                # prove, so remaining steps (which would error on "no
+                # goals" if run anyway) don't need to execute.
+                break
+
         elapsed = (time.perf_counter() - start) * 1000
 
-        # Parse response. Note that response is a JSON object which contains keys like proofState, goals, proofStatus, etc...
-        if "message" in response:
-            # Tactic failed (REPL top-level error string)
-            error_state = ProofState(
-                goals=state.goals,
-                error=response["message"],
-                depth=state.depth,
-                tactic_trace=state.tactic_trace,
-            )
-            return StepResult(
-                next_state=error_state,
-                tactic=tactic,
-                elapsed_ms=elapsed,
-            )
-
-        # The REPL can also report errors via a "messages" list even when it
-        # returns goals:[] — e.g. `exact bad_term` closes the goal syntactically
-        # but reports "Unknown identifier" in messages. Treat those as failures.
-        msg_errors = [
-            m for m in response.get("messages", [])
-            if m.get("severity") == "error"
-        ]
-        if msg_errors:
-            error_msg = "Lean error:\n" + msg_errors[0].get("data", "unknown error")
-            error_state = ProofState(
-                goals=state.goals,
-                error=error_msg,
-                depth=state.depth,
-                tactic_trace=state.tactic_trace,
-            )
-            return StepResult(
-                next_state=error_state,
-                tactic=tactic,
-                elapsed_ms=elapsed,
-            )
-
-        # Tactic succeeded
-        if "proofState" not in response:
-            error_state = ProofState(
-                goals=state.goals,
-                error=f"unexpected REPL response (no proofState): {response}",
-                depth=state.depth,
-                tactic_trace=state.tactic_trace,
-            )
-            return StepResult(next_state=error_state, tactic=tactic, elapsed_ms=elapsed)
-
-        new_repl_ps_id = response["proofState"]
+        # From here on, `response` is whichever sub-step actually ran last
+        # (the whole chain if all steps succeeded, or the step that closed
+        # the goal early) — identical to the pre-chaining single-tactic path.
+        new_repl_ps_id = current_ps_id
         goals_raw = response.get("goals", [])
         proof_status = response.get("proofStatus", "")
 

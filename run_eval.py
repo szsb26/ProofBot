@@ -16,6 +16,7 @@ executor for every problem — no repeated 10-minute cold starts.
     python run_eval.py --policy deepseek         # switch LLM backend
     python run_eval.py --workers 2 --budget 150  # tune search params
     python run_eval.py --problems hard,stretch --trials 5 --trace  # save traces of failed trials
+  python run_eval.py --problems stretch --trials 5 --trace --trace-successes  # save all trials
 """
 
 import argparse
@@ -136,6 +137,17 @@ examples:
             "FAILED trial to traces/eval_<timestamp>/ (no-op for --policy mock)"
         ),
     )
+    parser.add_argument(
+        "--trace-successes",
+        action="store_true",
+        default=False,
+        help=(
+            "also save traces for SUCCESSFUL trials (independent of --trace) "
+            "— useful for auditing why the model chose a tactic even when it "
+            "worked, not just diagnosing failures; off by default since it's "
+            "rarely needed (no-op for --policy mock)"
+        ),
+    )
     # Hidden: lets tests bypass real Lean
     parser.add_argument(
         "--executor",
@@ -254,6 +266,7 @@ async def _run(args: argparse.Namespace) -> int:
             model_name=model_name,
             trials=args.trials,
             trace=args.trace,
+            trace_successes=args.trace_successes,
             traces_dir=TRACES_DIR,
         )
     finally:

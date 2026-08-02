@@ -31,6 +31,7 @@ class ProblemResult:
     failure_modes: dict = field(default_factory=dict)   # search-level: {reason: count}
     tactic_errors: dict = field(default_factory=dict)   # tactic-level: {category: count}
     failed_trial_traces: list[str] = field(default_factory=list)  # paths, only when --trace is on
+    successful_trial_traces: list[str] = field(default_factory=list)  # paths, only when --trace-successes is on
 
 
 @dataclass
@@ -66,6 +67,7 @@ async def run_eval(
     model_name: str,
     trials: int = 1,
     trace: bool = False,
+    trace_successes: bool = False,
     traces_dir: str | Path = "traces",
 ) -> EvalSummary:
     """
@@ -79,24 +81,33 @@ async def run_eval(
     Results report both pass@k (any trial succeeded) and mean pass rate
     (fraction of trials that succeeded, a pass@1 estimate).
 
-    trace: if True, every trial's director calls are captured verbatim
-    (see core.trace.TracingPolicy) and — only for trials that fail — saved
-    to <traces_dir>/eval_<timestamp>/<problem>_trial<N>_worker<M>.txt, so a
-    specific failed attempt can be inspected after the fact rather than
-    needing to separately reproduce it (which, at temperature=1.0, won't
-    give you the same attempt anyway). Successful trials aren't saved —
-    their winning proof_trace is already in the results JSON. Requires
-    *policy* to be a BaseLLMPolicy-compatible object (has _call_api); if not
-    (e.g. MockPolicy), tracing is silently skipped since there's no real LLM
-    call to capture.
+    trace: if True, every trial's director calls are captured verbatim (see
+    core.trace.TracingPolicy) and — for trials that fail — saved to
+    <traces_dir>/eval_<timestamp>/<problem>_trial<N>_worker<M>_failed.txt,
+    so a specific failed attempt can be inspected after the fact rather
+    than needing to separately reproduce it (which, at temperature=1.0,
+    won't give you the same attempt anyway).
+
+    trace_successes: if True, successful trials are ALSO saved (as
+    ..._success.txt), for analysis that needs the model's turn-by-turn
+    reasoning even when it succeeded — e.g. understanding why it chose a
+    particular tactic — which the results JSON's flat proof_trace can't
+    show. Off by default since it's rarely needed and adds disk/latency
+    overhead; the winning proof_trace is already in the results JSON for
+    the common case.
+
+    Both require *policy* to be a BaseLLMPolicy-compatible object (has
+    _call_api); if not (e.g. MockPolicy), tracing is silently skipped since
+    there's no real LLM call to capture.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results: list[ProblemResult] = []
 
-    can_trace = trace and hasattr(policy, "_call_api")
-    if trace and not can_trace:
+    can_trace = (trace or trace_successes) and hasattr(policy, "_call_api")
+    if (trace or trace_successes) and not can_trace:
         print(
-            "  (--trace ignored: policy has no _call_api, nothing to capture)\n"
+            "  (--trace/--trace-successes ignored: policy has no _call_api, "
+            "nothing to capture)\n"
         )
     trial_traces_dir = Path(traces_dir) / f"eval_{timestamp}"
 
@@ -113,7 +124,8 @@ async def run_eval(
         proof_trace: list[str] = []
         failure_modes: dict[str, int] = {}
         tactic_errors: dict[str, int] = {}
-        trace_paths: list[str] = []
+        failed_trace_paths: list[str] = []
+        success_trace_paths: list[str] = []
 
         for t in range(trials):
             if can_trace:
@@ -135,18 +147,25 @@ async def run_eval(
                 passes += 1
                 if not proof_trace:
                     proof_trace = result.proof_trace
+
+                if can_trace and trace_successes:
+                    trial_traces_dir.mkdir(parents=True, exist_ok=True)
+                    for w, tp in enumerate(traced_policies, start=1):
+                        path = trial_traces_dir / f"{problem.name}_trial{t + 1}_worker{w}_success.txt"
+                        path.write_text(tp.render())
+                        success_trace_paths.append(str(path))
             else:
                 reason = result.failure_reason or "unknown"
                 failure_modes[reason] = failure_modes.get(reason, 0) + 1
                 for cat, cnt in result.tactic_errors.items():
                     tactic_errors[cat] = tactic_errors.get(cat, 0) + cnt
 
-                if can_trace:
+                if can_trace and trace:
                     trial_traces_dir.mkdir(parents=True, exist_ok=True)
                     for w, tp in enumerate(traced_policies, start=1):
-                        path = trial_traces_dir / f"{problem.name}_trial{t + 1}_worker{w}.txt"
+                        path = trial_traces_dir / f"{problem.name}_trial{t + 1}_worker{w}_failed.txt"
                         path.write_text(tp.render())
-                        trace_paths.append(str(path))
+                        failed_trace_paths.append(str(path))
 
             total_nodes += result.nodes_visited
             total_ms += result.elapsed_ms
@@ -182,8 +201,8 @@ async def run_eval(
             print(f"              ↳ search: {fm_str}")
             if te_str:
                 print(f"              ↳ errors: {te_str}")
-            if trace_paths:
-                print(f"              ↳ traces: {trial_traces_dir}/")
+        if failed_trace_paths or success_trace_paths:
+            print(f"              ↳ traces: {trial_traces_dir}/")
 
         results.append(
             ProblemResult(
@@ -199,7 +218,8 @@ async def run_eval(
                 proof_trace=proof_trace,
                 failure_modes=failure_modes,
                 tactic_errors=tactic_errors,
-                failed_trial_traces=trace_paths,
+                failed_trial_traces=failed_trace_paths,
+                successful_trial_traces=success_trace_paths,
             )
         )
 

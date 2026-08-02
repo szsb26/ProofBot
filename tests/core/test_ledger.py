@@ -55,6 +55,19 @@ class TestLedgerRecording:
         assert entry.outcome == "hallucinated_lemma"
         assert entry.child_id is None
 
+    def test_record_failure_defaults_error_to_empty_string(self):
+        ledger = Ledger()
+        ledger.record_failure("abc123", "bad_tactic", "hallucinated_lemma")
+        assert ledger.entries[0].error == ""
+
+    def test_record_failure_stores_raw_error_text(self):
+        ledger = Ledger()
+        ledger.record_failure(
+            "abc123", "bad_tactic", "hallucinated_lemma",
+            "unknown identifier 'Finset.bad_lemma'",
+        )
+        assert ledger.entries[0].error == "unknown identifier 'Finset.bad_lemma'"
+
 
 class TestLedgerAbandon:
 

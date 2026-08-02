@@ -110,9 +110,16 @@ DIRECTOR_SYSTEM_PROMPT = (
     "- Propose tactic candidates for the chosen state only, ordered from most "
     "to least promising. Check the \"Tactics already tried here\" list for "
     "your chosen state first — never propose a tactic that already appears "
-    "there verbatim, since it is guaranteed to fail the same way again.\n"
+    "there verbatim, since it is guaranteed to fail the same way again. Each "
+    "failed tactic is shown with Lean's actual error message (marked with "
+    "\"→\") — read it before retrying a similar idea: it tells you the real "
+    "reason (wrong lemma name, wrong argument shape, type mismatch, etc.), "
+    "which is far more useful than guessing again blindly.\n"
     "- Each tactic must be a single, syntactically valid Lean 4 tactic, with "
-    "no explanations, numbering, backticks, or code fences.\n"
+    "no explanations, numbering, backticks, or code fences. You may chain "
+    "steps with ';' (e.g. \"intro n; simp\") — each step is run in sequence "
+    "and, if one fails, the error you see next turn will say exactly which "
+    "step of the chain it was, not just the chain as a whole.\n"
     "- Respond with JSON only, matching exactly this shape:\n"
     '{"reasoning": "<your SHORT natural-language plan for the chosen state>", '
     '"abandon": ["<state_id>", ...], "abandon_reason": "<brief reason, or '
@@ -147,6 +154,11 @@ _MAX_TACTIC_DISPLAY_LEN = 100
 # and exactly the ones most likely to be blindly retried once they age out
 # of a recency-capped list — so they're never evicted, regardless of order.
 _SHORT_TACTIC_MAX_LEN = 30
+# Generous cap on the raw Lean error shown per tactic: full text for the
+# common case (type mismatch, unknown identifier, unsolved goals are
+# normally well under this), truncated only for pathological outliers like
+# apply?/exact? dumping dozens of "Try this" suggestions onto one line.
+_MAX_ERROR_DISPLAY_LEN = 2000
 
 
 def _format_tactic_for_display(tactic: str) -> str:
@@ -155,6 +167,14 @@ def _format_tactic_for_display(tactic: str) -> str:
     if len(oneline) > _MAX_TACTIC_DISPLAY_LEN:
         return oneline[:_MAX_TACTIC_DISPLAY_LEN] + "…"
     return oneline
+
+
+def _format_error_for_display(error: str) -> str:
+    """Cap a raw Lean error to a generous length rather than a category label."""
+    text = error.strip()
+    if len(text) > _MAX_ERROR_DISPLAY_LEN:
+        return text[:_MAX_ERROR_DISPLAY_LEN] + "… [truncated]"
+    return text
 
 
 def serialize_ledger(
@@ -203,9 +223,11 @@ def serialize_ledger(
             )
 
             seen: list[str] = []
+            errors_by_tactic: dict[str, str] = {}
             for f in failures:
                 if f.tactic not in seen:
                     seen.append(f.tactic)
+                    errors_by_tactic[f.tactic] = f.error
 
             # Short/generic tactics are never evicted — they're cheap to
             # keep and exactly the ones a recency cap would otherwise drop
@@ -218,7 +240,14 @@ def serialize_ledger(
             )
             shown = [t for t in seen if t in short or t in kept_long]
 
-            tactic_lines = "\n".join(f"  - {_format_tactic_for_display(t)}" for t in shown)
+            tactic_lines = []
+            for t in shown:
+                line = f"  - {_format_tactic_for_display(t)}"
+                err = errors_by_tactic.get(t, "")
+                if err:
+                    line += f"\n    → {_format_error_for_display(err)}"
+                tactic_lines.append(line)
+            tactic_lines = "\n".join(tactic_lines)
             omitted_note = (
                 f" (showing {len(shown)} of {len(seen)} unique)"
                 if len(seen) > len(shown)

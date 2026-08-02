@@ -18,7 +18,14 @@ import pytest
 import pytest_asyncio
 import asyncio
 from unittest.mock import AsyncMock
-from lean.repl import LeanWorker, SubprocessExecutor, _parse_goal_string, LEAN_PROJECT_DIR
+from lean.repl import (
+    LeanWorker,
+    SubprocessExecutor,
+    _parse_goal_string,
+    _split_top_level_tactics,
+    _annotate_chain_error,
+    LEAN_PROJECT_DIR,
+)
 from core.proof_state import ProofState, make_proof_state
 from policy.mock import MockPolicy
 from policy.anthropic import AnthropicPolicy
@@ -61,6 +68,86 @@ class TestParseGoalString:
         # the string contains " : ".
         result = _parse_goal_string("⊢ ∀ (n : Nat), n + 0 = n")
         assert result.goals[0].target == "∀ (n : Nat), n + 0 = n"
+
+
+# ---------------------------------------------------------------------------
+# _split_top_level_tactics / _annotate_chain_error (fast, pure functions)
+# ---------------------------------------------------------------------------
+
+class TestSplitTopLevelTactics:
+    """
+    The REPL's tactic-stepping endpoint only parses one atomic Lean 4
+    `tactic` per call, not a `tacticSeq` — confirmed empirically: even
+    "constructor; simp" is rejected outright with "expected end of input"
+    right after "constructor". This splitter lets a chained candidate like
+    the model naturally writes actually run, by sending each step as its
+    own sequential REPL call.
+    """
+
+    def test_single_tactic_is_not_split(self):
+        assert _split_top_level_tactics("simp") == ["simp"]
+
+    def test_simple_top_level_chain_is_split(self):
+        assert _split_top_level_tactics("intro n; simp") == ["intro n", "simp"]
+
+    def test_three_step_top_level_chain_is_split(self):
+        assert _split_top_level_tactics("by_contra h; push_neg at h; omega") == [
+            "by_contra h", "push_neg at h", "omega",
+        ]
+
+    def test_semicolon_inside_brackets_is_not_split(self):
+        assert _split_top_level_tactics("simp [foo, bar]; omega") == [
+            "simp [foo, bar]", "omega",
+        ]
+
+    def test_nested_by_block_is_not_split(self):
+        """'by' is a reserved keyword — an unbracketed top-level occurrence
+        unambiguously opens a nested tacticSeq that (in a flat, unindented
+        string) absorbs everything to its right."""
+        tactic = "have h : P := by intro y hy; simp at hy; exact hy"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_top_level_chain_before_nested_by_block_splits_correctly(self):
+        tactic = "by_contra h; push_neg at h; have hsub : P := by intro y; simp"
+        assert _split_top_level_tactics(tactic) == [
+            "by_contra h",
+            "push_neg at h",
+            "have hsub : P := by intro y; simp",
+        ]
+
+    def test_whitespace_only_tactic_splits_to_empty_list(self):
+        assert _split_top_level_tactics("   ") == []
+
+    def test_parts_are_stripped_of_surrounding_whitespace(self):
+        assert _split_top_level_tactics(" intro n ; simp ") == ["intro n", "simp"]
+
+
+class TestAnnotateChainError:
+
+    def test_single_step_returns_error_unchanged(self):
+        assert _annotate_chain_error("Lean error:\nboom", ["simp"], 0) == "Lean error:\nboom"
+
+    def test_multi_step_error_names_the_failing_step(self):
+        result = _annotate_chain_error(
+            "Lean error:\nunknown identifier `y`",
+            ["by_contra h", "push_neg at h", "exact y"],
+            2,
+        )
+        assert "step 3 of 3" in result
+        assert '"exact y"' in result
+        assert "unknown identifier `y`" in result
+
+    def test_multi_step_error_mentions_preceding_successful_steps(self):
+        result = _annotate_chain_error(
+            "boom",
+            ["intro n", "simp"],
+            1,
+        )
+        assert 'after "intro n" succeeded' in result
+
+    def test_first_step_failure_has_no_preceding_steps_mentioned(self):
+        result = _annotate_chain_error("boom", ["intro n", "simp"], 0)
+        assert "succeeded" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +221,96 @@ class TestLeanWorkerStepClosureDetection:
         assert result.success
         assert not result.proof_closed
         assert result.next_state.goals[0].target == "n = n"
+
+
+# ---------------------------------------------------------------------------
+# LeanWorker.step() chained-tactic execution (fast, no real Lean — mocks _send)
+# ---------------------------------------------------------------------------
+
+class TestLeanWorkerStepChaining:
+    """
+    The REPL only parses one atomic tactic per call, so a top-level ';'
+    chain like "intro n; simp" is split and each step sent as its own
+    sequential call, chaining proofState ids forward. Regression coverage
+    for that behavior — no real Lean process needed, _send is mocked.
+    """
+
+    def _make_worker_with_cached_state(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])
+        worker._proof_state_cache[state.stable_hash()] = 0
+        return worker, state
+
+    async def test_unchained_tactic_sends_exactly_one_request(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "", "proofState": 1, "goals": ["⊢ True"],
+        })
+        await worker.step(state, "simp")
+        assert worker._send.await_count == 1
+
+    async def test_two_step_chain_sends_each_step_against_prior_proofstate(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n"]},
+            {"proofStatus": "Completed", "proofState": 2, "goals": []},
+        ])
+        result = await worker.step(state, "intro n; rfl")
+
+        assert worker._send.await_count == 2
+        first_call, second_call = worker._send.await_args_list
+        assert first_call.args[0] == {"tactic": "intro n", "proofState": 0}
+        assert second_call.args[0] == {"tactic": "rfl", "proofState": 1}
+        assert result.success
+        assert result.proof_closed
+
+    async def test_chain_stops_and_reports_the_step_that_failed(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n"]},
+            {"message": "Lean error:\nunknown identifier `bogus`"},
+        ])
+        result = await worker.step(state, "intro n; exact bogus")
+
+        assert worker._send.await_count == 2
+        assert not result.success
+        assert "step 2 of 2" in result.next_state.error
+        assert '"exact bogus"' in result.next_state.error
+        assert "unknown identifier `bogus`" in result.next_state.error
+
+    async def test_chain_does_not_execute_steps_after_a_step_that_failed(self):
+        """A 3-step chain that fails on step 2 must never send step 3."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n"]},
+            {"message": "Lean error:\nboom"},
+            {"proofStatus": "Completed", "proofState": 99, "goals": []},
+        ])
+        await worker.step(state, "intro n; bad_tactic; rfl")
+        assert worker._send.await_count == 2
+
+    async def test_chain_stops_early_once_goal_closes(self):
+        """If step 1 of a 3-step chain already closes the goal, steps 2
+        and 3 must not run — there's nothing left to prove."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "Completed", "proofState": 1, "goals": []},
+        ])
+        result = await worker.step(state, "aesop; simp; omega")
+
+        assert worker._send.await_count == 1
+        assert result.success
+        assert result.proof_closed
+
+    async def test_single_tactic_error_message_is_not_annotated_with_step_info(self):
+        """A non-chained tactic's error must look exactly as it did before
+        chaining existed — no 'step 1 of 1' noise."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "message": "Lean error:\nunknown identifier `bogus`",
+        })
+        result = await worker.step(state, "exact bogus")
+        assert result.next_state.error == "Lean error:\nunknown identifier `bogus`"
 
 
 # ---------------------------------------------------------------------------

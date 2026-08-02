@@ -18,7 +18,24 @@ from core.proof_state import ProofState, make_proof_state
 from lean.mock_executor import MockExecutor
 from policy.base import DirectorResponse
 from policy.mock import MockPolicy
-from search.ledger_search import LedgerSearch, ProofResult, prove_parallel
+from search.ledger_search import LedgerSearch, ProofResult, _classify_tactic_error, prove_parallel
+
+
+class TestClassifyTacticError:
+
+    def test_expected_end_of_input_is_syntax_error(self):
+        """Regression coverage: the REPL's tactic-stepping endpoint only
+        parses one atomic tactic per call, so an unsplit ';'-chain used to
+        fail with "expected end of input" and land in the generic
+        tactic_failed bucket rather than being flagged as a syntax issue.
+        Chaining is now split before it reaches Lean, but this stays as a
+        safety net for any remaining unsplit case."""
+        error = "Lean error:\n<input>:1:11: expected end of input"
+        assert _classify_tactic_error(error) == "syntax_error"
+
+    def test_unexpected_end_of_input_still_syntax_error(self):
+        error = "Lean error:\nunexpected end of input"
+        assert _classify_tactic_error(error) == "syntax_error"
 
 
 class ErroringExecutor:

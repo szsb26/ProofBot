@@ -193,6 +193,62 @@ class TestSerializeLedger:
         text = serialize_ledger("theorem foo := by", ledger, [], 8)
         assert "Last stated plan" not in text
 
+    def test_shows_raw_error_under_failed_tactic(self):
+        """The model must see the actual Lean diagnostic, not just a
+        category label — otherwise it can't tell *why* a tactic failed
+        (wrong lemma name vs. wrong argument shape vs. type mismatch)."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(
+            state_id,
+            "exact Finset.card_lt_card hsub",
+            "type_mismatch",
+            "Lean error:\ntype mismatch\n  hsub\nhas type\n  s ⊆ t\nbut is expected to have type\n  s ⊂ t",
+        )
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "s ⊆ t" in text
+        assert "s ⊂ t" in text
+
+    def test_no_error_line_when_error_is_blank(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "omega", "tactic_failed")
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "→" not in text
+
+    def test_pathologically_long_error_is_capped(self):
+        """Guards against reintroducing an unbounded-blob risk into the
+        prompt (the same class of issue that overflowed the asyncio
+        stream buffer for verbose apply?/exact? responses) — a huge raw
+        error must be truncated, not passed through verbatim."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        huge_error = "Try this: " + ("x" * 5000)
+        ledger.record_failure(state_id, "exact?", "tactic_failed", huge_error)
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "[truncated]" in text
+        assert len(text) < len(huge_error) + 2000
+
+    def test_error_shown_survives_tactic_dedup(self):
+        """When an identical tactic is retried and deduplicated to one
+        display line, its error must still be shown (from the first
+        occurrence), not silently dropped."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(
+            state_id, "omega", "tactic_failed", "unsolved goals\n⊢ False"
+        )
+        ledger.record_failure(
+            state_id, "omega", "tactic_failed", "unsolved goals\n⊢ False"
+        )
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert text.count("- omega") == 1
+        assert "unsolved goals" in text
+
 
 # ---------------------------------------------------------------------------
 # parse_director_response

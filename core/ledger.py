@@ -25,11 +25,16 @@ class LedgerEntry:
         outcome:   "success", or an error category from
                    search.ledger_search._classify_tactic_error.
         child_id:  id of the resulting state. Set only when outcome == "success".
+        error:     The raw Lean error text (empty on success). Kept verbatim
+                   (the caller is responsible for capping pathological sizes,
+                   e.g. apply?/exact? "Try this" dumps) so the director sees
+                   what Lean actually said, not just a category label.
     """
     parent_id: str
     tactic: str
     outcome: str
     child_id: str | None = None
+    error: str = ""
 
 
 @dataclass
@@ -65,8 +70,8 @@ class Ledger:
     def record_success(self, parent_id: str, tactic: str, child_id: str) -> None:
         self.entries.append(LedgerEntry(parent_id, tactic, "success", child_id))
 
-    def record_failure(self, parent_id: str, tactic: str, category: str) -> None:
-        self.entries.append(LedgerEntry(parent_id, tactic, category, None))
+    def record_failure(self, parent_id: str, tactic: str, category: str, error: str = "") -> None:
+        self.entries.append(LedgerEntry(parent_id, tactic, category, None, error))
 
     def abandon(self, state_ids: list[str]) -> None:
         """Permanently remove states from consideration."""
