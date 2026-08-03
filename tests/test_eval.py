@@ -340,6 +340,54 @@ class FakeTracingCompatiblePolicy(BaseLLMPolicy):
         self.closed = True
 
 
+class TestRunEvalCandidatesPerTurn:
+    """
+    candidates_per_turn controls LedgerSearch's k (tactic candidates per
+    director call) — separate from --workers/-k, which is parallel search
+    *instances*. Worth being able to reduce it: a director response with
+    many long candidates can exhaust director_max_tokens before its JSON
+    closing brace is ever written, silently falling back to a blind "simp"
+    guess for that turn (see the tournament_champion turn-1 truncation).
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_of_eight_reaches_a_tactic_at_index_five(self):
+        from lean.mock_executor import MockExecutor
+        from policy.mock import MockPolicy
+
+        # add_zero: "∀ n : Nat, n + 0 = n". MockExecutor's `simp` only
+        # closes it after `intro n`, and only "simp" (index 5) can close
+        # it — bad1..bad4 always fail — so success here proves all 6
+        # candidates were available, not just the first few.
+        policy = MockPolicy(tactics=["intro n", "bad1", "bad2", "bad3", "bad4", "simp"])
+        summary = await run_eval(
+            problems=[PROBLEM_BY_NAME["add_zero"]],
+            policy=policy,
+            executors=[MockExecutor()],
+            budget=10,
+            policy_name="mock",
+            model_name="mock",
+        )
+        assert summary.results[0].success
+
+    @pytest.mark.asyncio
+    async def test_reduced_candidates_per_turn_never_reaches_the_closing_tactic(self):
+        from lean.mock_executor import MockExecutor
+        from policy.mock import MockPolicy
+
+        policy = MockPolicy(tactics=["intro n", "bad1", "bad2", "bad3", "bad4", "simp"])
+        summary = await run_eval(
+            problems=[PROBLEM_BY_NAME["add_zero"]],
+            policy=policy,
+            executors=[MockExecutor()],
+            budget=10,
+            policy_name="mock",
+            model_name="mock",
+            candidates_per_turn=4,
+        )
+        assert not summary.results[0].success
+
+
 _TRACE_TEST_PROBLEM = EvalProblem(
     name="trace_test_problem",
     statement="theorem foo : n + 0 = n := by",
@@ -587,6 +635,32 @@ class TestEvalCLI:
         args = parse_args(["--policy", "deepseek"])
         policy, policy_name, model_name = _make_policy(args)
         assert policy._director_thinking is False
+
+    def test_director_max_tokens_defaults_to_4096(self):
+        args = parse_args([])
+        assert args.director_max_tokens == 4096
+
+    def test_parse_director_max_tokens_flag(self):
+        args = parse_args(["--director-max-tokens", "8192"])
+        assert args.director_max_tokens == 8192
+
+    def test_make_policy_forwards_director_max_tokens(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+        args = parse_args(["--policy", "deepseek", "--director-max-tokens", "8192"])
+        policy, policy_name, model_name = _make_policy(args)
+        assert policy._director_max_tokens == 8192
+
+    def test_candidates_defaults_to_eight(self):
+        args = parse_args([])
+        assert args.candidates == 8
+
+    def test_parse_candidates_flag(self):
+        args = parse_args(["--candidates", "4"])
+        assert args.candidates == 4
+
+    def test_parse_candidates_short_flag(self):
+        args = parse_args(["-c", "3"])
+        assert args.candidates == 3
 
     def test_make_policy_forwards_model_override(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")

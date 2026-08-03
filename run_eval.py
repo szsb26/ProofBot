@@ -106,11 +106,37 @@ examples:
         ),
     )
     parser.add_argument(
+        "--director-max-tokens",
+        type=int,
+        default=4096,
+        metavar="N",
+        help=(
+            "max_tokens for director calls (default: 4096). A verbose "
+            "response (many long tactic candidates, or thinking) can "
+            "exhaust this before its JSON closing brace is ever written, "
+            "silently falling back to a blind \"simp\" guess for that turn — "
+            "raise this if that's happening often."
+        ),
+    )
+    parser.add_argument(
         "--workers", "-k",
         type=int,
         default=1,
         metavar="K",
         help="parallel searches per problem (default: 1)",
+    )
+    parser.add_argument(
+        "--candidates", "-c",
+        type=int,
+        default=8,
+        metavar="N",
+        help=(
+            "tactic candidates proposed per director call (default: 8). "
+            "Lower this on problems whose candidates run long — a verbose "
+            "response can exhaust director_max_tokens before its JSON "
+            "closing brace is written, silently falling back to a blind "
+            "\"simp\" guess for that turn."
+        ),
     )
     parser.add_argument(
         "--budget", "-b",
@@ -188,14 +214,21 @@ def _make_policy(args: argparse.Namespace):
     model = args.model or _POLICY_DEFAULTS[args.policy]
     temp = args.temperature
     thinking = args.director_thinking
+    director_max_tokens = args.director_max_tokens
     if args.policy == "anthropic":
         return (
-            AnthropicPolicy(model=model, temperature=temp, api_key=api_key, director_thinking=thinking),
+            AnthropicPolicy(
+                model=model, temperature=temp, api_key=api_key,
+                director_thinking=thinking, director_max_tokens=director_max_tokens,
+            ),
             "anthropic",
             model,
         )
     return (
-        DeepSeekPolicy(model=model, temperature=temp, api_key=api_key, director_thinking=thinking),
+        DeepSeekPolicy(
+            model=model, temperature=temp, api_key=api_key,
+            director_thinking=thinking, director_max_tokens=director_max_tokens,
+        ),
         "deepseek",
         model,
     )
@@ -270,9 +303,10 @@ async def _run(args: argparse.Namespace) -> int:
     trials_str = f", trials={args.trials}" if args.trials > 1 else ""
     temp_str = f", temp={args.temperature}" if args.executor != "mock" else ""
     thinking_str = ", director_thinking=on" if args.director_thinking else ""
+    candidates_str = f", candidates={args.candidates}" if args.candidates != 8 else ""
     print(
         f"Evaluating {len(problems)} problem(s) — "
-        f"{workers_str}, budget={args.budget}{trials_str}{temp_str}{thinking_str}, "
+        f"{workers_str}, budget={args.budget}{trials_str}{temp_str}{thinking_str}{candidates_str}, "
         f"policy={policy_name} ({model_name})\n"
     )
 
@@ -288,6 +322,7 @@ async def _run(args: argparse.Namespace) -> int:
             trace=args.trace,
             trace_successes=args.trace_successes,
             traces_dir=TRACES_DIR,
+            candidates_per_turn=args.candidates,
         )
     finally:
         if use_real_lean:
