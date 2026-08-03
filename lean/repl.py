@@ -455,6 +455,7 @@ class LeanWorker:
 
         current_ps_id = repl_ps_id
         response: dict = {}
+        intermediate_states: list[ProofState] = []
 
         for step_idx, sub_tactic in enumerate(sub_tactics):
             # Send this step of the chain to the REPL, against whatever
@@ -476,6 +477,7 @@ class LeanWorker:
                     next_state=error_state,
                     tactic=tactic,
                     elapsed_ms=(time.perf_counter() - start) * 1000,
+                    intermediate_states=tuple(intermediate_states),
                 )
 
             # Parse response. Note that response is a JSON object which contains keys like proofState, goals, proofStatus, etc...
@@ -491,6 +493,7 @@ class LeanWorker:
                     next_state=error_state,
                     tactic=tactic,
                     elapsed_ms=(time.perf_counter() - start) * 1000,
+                    intermediate_states=tuple(intermediate_states),
                 )
 
             # The REPL can also report errors via a "messages" list even when it
@@ -512,6 +515,7 @@ class LeanWorker:
                     next_state=error_state,
                     tactic=tactic,
                     elapsed_ms=(time.perf_counter() - start) * 1000,
+                    intermediate_states=tuple(intermediate_states),
                 )
 
             # This step succeeded
@@ -526,6 +530,7 @@ class LeanWorker:
                     next_state=error_state,
                     tactic=tactic,
                     elapsed_ms=(time.perf_counter() - start) * 1000,
+                    intermediate_states=tuple(intermediate_states),
                 )
 
             current_ps_id = response["proofState"]
@@ -534,6 +539,28 @@ class LeanWorker:
                 # prove, so remaining steps (which would error on "no
                 # goals" if run anyway) don't need to execute.
                 break
+
+            # A genuinely verified checkpoint — everything up through this
+            # sub-step compiled. Expose it so the search can later choose
+            # to continue from here even if a *later* step in this same
+            # chain (this one or a future candidate) turns out to be a
+            # dead end, instead of only ever having "the whole chain" as
+            # an atomic, all-or-nothing unit. Skip the last sub-tactic:
+            # its outcome becomes next_state below, not an intermediate.
+            if step_idx < len(sub_tactics) - 1:
+                goals_raw = response.get("goals", [])
+                if goals_raw:
+                    checkpoint = ProofState(
+                        goals=_parse_goals(goals_raw),
+                        depth=state.depth + step_idx + 1,
+                        tactic_trace=state.tactic_trace + tuple(sub_tactics[:step_idx + 1]),
+                    )
+                    # Must cache now, at the same point the REPL id is
+                    # actually known — a future turn choosing to continue
+                    # from this checkpoint calls step() with only the
+                    # ProofState, which looks itself up via stable_hash().
+                    self._proof_state_cache[checkpoint.stable_hash()] = current_ps_id
+                    intermediate_states.append(checkpoint)
 
         elapsed = (time.perf_counter() - start) * 1000
 
@@ -555,6 +582,7 @@ class LeanWorker:
                 next_state=closed_state,
                 tactic=tactic,
                 elapsed_ms=elapsed,
+                intermediate_states=tuple(intermediate_states),
             )
 
         if not goals_raw:
@@ -580,17 +608,11 @@ class LeanWorker:
                 next_state=error_state,
                 tactic=tactic,
                 elapsed_ms=elapsed,
+                intermediate_states=tuple(intermediate_states),
             )
 
-        # Parse new goals
-        new_goals = tuple(
-            _parse_goal_string(g) .goals[0]
-            for g in goals_raw
-            if _parse_goal_string(g).goals
-        )
-
         next_state = ProofState(
-            goals=new_goals,
+            goals=_parse_goals(goals_raw),
             depth=state.depth + 1,
             tactic_trace=state.tactic_trace + (tactic,),
         )
@@ -602,6 +624,7 @@ class LeanWorker:
             next_state=next_state,
             tactic=tactic,
             elapsed_ms=elapsed,
+            intermediate_states=tuple(intermediate_states),
         )
 
 
@@ -679,6 +702,15 @@ class SubprocessExecutor:
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
+
+def _parse_goals(goals_raw: list[str]) -> tuple[Goal, ...]:
+    """Parse the REPL's raw `goals` list into a tuple of Goal objects."""
+    return tuple(
+        _parse_goal_string(g).goals[0]
+        for g in goals_raw
+        if _parse_goal_string(g).goals
+    )
+
 
 def _parse_goal_string(goal_str: str) -> ProofState:
     """

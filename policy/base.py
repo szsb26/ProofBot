@@ -150,6 +150,14 @@ class DirectorResponse:
 
 _MAX_TRIED_TACTICS_SHOWN = 15
 _MAX_TACTIC_DISPLAY_LEN = 100
+# Cap on how many open states get shown at once. Without this, the frontier
+# can grow unboundedly — e.g. once every verified sub-step of a chained
+# candidate becomes its own frontier state — and showing all of them would
+# reproduce the same runaway-prompt-size problem as the tactic-eviction cap
+# (a single turn's prompt once reached ~120K characters before that was
+# fixed). When over budget, the deepest (most-progressed) states are kept,
+# since they represent the most work already verified.
+_MAX_OPEN_STATES_SHOWN = 20
 # Bare/generic tactics (e.g. "omega", "simp", "ring") are cheap to remember
 # and exactly the ones most likely to be blindly retried once they age out
 # of a recency-capped list — so they're never evicted, regardless of order.
@@ -196,8 +204,23 @@ def serialize_ledger(
     """
     parts = [f"## Theorem\n\n{theorem}\n"]
 
-    parts.append("\n## Currently Open States\n")
-    for state_id, state in ledger.frontier.items():
+    all_open = list(ledger.frontier.items())
+    if len(all_open) > _MAX_OPEN_STATES_SHOWN:
+        # Stable sort: ties keep their original (insertion) order, so
+        # among equal-depth states the more-recently-added ones win.
+        shown_open = sorted(all_open, key=lambda kv: -kv[1].depth)[:_MAX_OPEN_STATES_SHOWN]
+        omitted = len(all_open) - len(shown_open)
+        parts.append(
+            f"\n## Currently Open States "
+            f"(showing {len(shown_open)} of {len(all_open)}, deepest first — "
+            f"{omitted} shallower state(s) omitted)\n"
+        )
+    else:
+        shown_open = all_open
+        parts.append("\n## Currently Open States\n")
+
+    shown_state_ids = {state_id for state_id, _ in shown_open}
+    for state_id, state in shown_open:
         path = ", ".join(state.tactic_trace) if state.tactic_trace else "(root)"
         parts.append(f"\n[state {state_id}] (path: {path})\n{state.serialize()}\n")
         plan = ledger.reasoning.get(state_id)
@@ -206,7 +229,7 @@ def serialize_ledger(
 
     dead_by_parent: dict[str, list] = {}
     for entry in ledger.entries:
-        if entry.outcome != "success" and entry.parent_id in ledger.frontier:
+        if entry.outcome != "success" and entry.parent_id in shown_state_ids:
             dead_by_parent.setdefault(entry.parent_id, []).append(entry)
 
     if dead_by_parent:
@@ -235,9 +258,12 @@ def serialize_ledger(
             # tried once long ago, then proposed again once it ages out).
             short = {t for t in seen if len(t) <= _SHORT_TACTIC_MAX_LEN}
             long_recent_budget = max(_MAX_TRIED_TACTICS_SHOWN - len(short), 0)
-            kept_long = set(
-                [t for t in seen if t not in short][-long_recent_budget:]
-            )
+            long_tactics = [t for t in seen if t not in short]
+            # `long_tactics[-0:]` is the WHOLE list, not empty — Python
+            # treats -0 as 0, so a naive negative slice here silently
+            # disables the cap entirely once short tactics alone reach the
+            # display budget. Must special-case zero explicitly.
+            kept_long = set(long_tactics[-long_recent_budget:] if long_recent_budget else [])
             shown = [t for t in seen if t in short or t in kept_long]
 
             tactic_lines = []

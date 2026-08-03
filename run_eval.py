@@ -96,6 +96,16 @@ examples:
         help="API key (overrides ANTHROPIC_API_KEY / DEEPSEEK_API_KEY env var)",
     )
     parser.add_argument(
+        "--director-thinking",
+        action="store_true",
+        default=False,
+        help=(
+            "enable extended thinking on director calls (no-op for --policy "
+            "mock; DeepSeek v4 models reason by default so this can burn "
+            "significant tokens before answering)"
+        ),
+    )
+    parser.add_argument(
         "--workers", "-k",
         type=int,
         default=1,
@@ -177,9 +187,18 @@ def _make_policy(args: argparse.Namespace):
 
     model = args.model or _POLICY_DEFAULTS[args.policy]
     temp = args.temperature
+    thinking = args.director_thinking
     if args.policy == "anthropic":
-        return AnthropicPolicy(model=model, temperature=temp, api_key=api_key), "anthropic", model
-    return DeepSeekPolicy(model=model, temperature=temp, api_key=api_key), "deepseek", model
+        return (
+            AnthropicPolicy(model=model, temperature=temp, api_key=api_key, director_thinking=thinking),
+            "anthropic",
+            model,
+        )
+    return (
+        DeepSeekPolicy(model=model, temperature=temp, api_key=api_key, director_thinking=thinking),
+        "deepseek",
+        model,
+    )
 
 
 def _make_executors(args: argparse.Namespace, k: int):
@@ -250,9 +269,10 @@ async def _run(args: argparse.Namespace) -> int:
     workers_str = f"{args.workers} worker" + ("s" if args.workers > 1 else "")
     trials_str = f", trials={args.trials}" if args.trials > 1 else ""
     temp_str = f", temp={args.temperature}" if args.executor != "mock" else ""
+    thinking_str = ", director_thinking=on" if args.director_thinking else ""
     print(
         f"Evaluating {len(problems)} problem(s) — "
-        f"{workers_str}, budget={args.budget}{trials_str}{temp_str}, "
+        f"{workers_str}, budget={args.budget}{trials_str}{temp_str}{thinking_str}, "
         f"policy={policy_name} ({model_name})\n"
     )
 

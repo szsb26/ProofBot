@@ -23,7 +23,7 @@ from eval.problems import (
 )
 from eval.harness import run_eval, EvalSummary, ProblemResult
 from policy.base import BaseLLMPolicy
-from run_eval import parse_args, main
+from run_eval import parse_args, main, _make_policy
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +567,33 @@ class TestEvalCLI:
     def test_trials_default_is_one(self):
         args = parse_args([])
         assert args.trials == 1
+
+    def test_director_thinking_defaults_to_false(self):
+        args = parse_args([])
+        assert args.director_thinking is False
+
+    def test_parse_director_thinking_flag(self):
+        args = parse_args(["--director-thinking"])
+        assert args.director_thinking is True
+
+    def test_make_policy_forwards_director_thinking(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+        args = parse_args(["--policy", "deepseek", "--director-thinking"])
+        policy, policy_name, model_name = _make_policy(args)
+        assert policy._director_thinking is True
+
+    def test_make_policy_defaults_director_thinking_off(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+        args = parse_args(["--policy", "deepseek"])
+        policy, policy_name, model_name = _make_policy(args)
+        assert policy._director_thinking is False
+
+    def test_make_policy_forwards_model_override(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+        args = parse_args(["--policy", "deepseek", "--model", "deepseek-v4-pro"])
+        policy, policy_name, model_name = _make_policy(args)
+        assert model_name == "deepseek-v4-pro"
+        assert policy._model == "deepseek-v4-pro"
 
     def test_runs_subset_with_mock(self):
         result = main(["--problems", "easy", *_MOCK_FLAGS, "--budget", "5"])

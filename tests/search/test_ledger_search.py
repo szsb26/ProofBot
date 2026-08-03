@@ -14,7 +14,7 @@ import asyncio
 from core.executor import StepResult
 from core.ledger import Ledger
 from core.policy import TacticCandidate
-from core.proof_state import ProofState, make_proof_state
+from core.proof_state import ProofState, make_goal, make_proof_state
 from lean.mock_executor import MockExecutor
 from policy.base import DirectorResponse
 from policy.mock import MockPolicy
@@ -432,6 +432,116 @@ class TestLedgerSearchDirectorBehavior:
         assert result.success
         assert "intro n" in result.proof_trace
         assert "simp" in result.proof_trace
+
+
+# ---------------------------------------------------------------------------
+# Intermediate-state checkpointing
+# ---------------------------------------------------------------------------
+
+class TestLedgerSearchIntermediateStates:
+    """
+    Every genuinely-verified sub-step of a chained candidate (see
+    StepResult.intermediate_states) must become its own frontier state, not
+    just the chain's final outcome — otherwise a multi-step candidate is
+    all-or-nothing: the director can only ever continue from the very end
+    of whatever chain last succeeded, with no way back to an earlier
+    checkpoint if further extending it keeps failing.
+    """
+
+    def test_intermediate_states_are_added_to_the_frontier(self):
+        class ChainedExecutor:
+            capacity = 1
+
+            async def reset(self, theorem):
+                return make_proof_state(["dummy goal"])
+
+            async def step(self, state, tactic):
+                checkpoint = ProofState(
+                    goals=(make_goal("intermediate goal"),),
+                    depth=state.depth + 1,
+                    tactic_trace=state.tactic_trace + ("step1",),
+                )
+                final_state = ProofState(
+                    goals=(make_goal("final goal"),),
+                    depth=state.depth + 2,
+                    tactic_trace=state.tactic_trace + ("step1", "step2"),
+                )
+                return StepResult(
+                    next_state=final_state,
+                    tactic=tactic,
+                    intermediate_states=(checkpoint,),
+                )
+
+            async def close(self):
+                pass
+
+        captured_ledgers: list[Ledger] = []
+
+        class RecordingPolicy:
+            async def get_next_action(self, theorem, ledger, premises, k=8):
+                captured_ledgers.append(ledger)
+                chosen = next(iter(ledger.frontier))
+                return DirectorResponse(chosen, [], _tactics("step1; step2"))
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=RecordingPolicy(), executor=ChainedExecutor(), k=1)
+        asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=1))
+
+        ledger = captured_ledgers[0]
+        goal_targets = {s.goals[0].target for s in ledger.frontier.values() if s.goals}
+        assert "intermediate goal" in goal_targets
+        assert "final goal" in goal_targets
+
+    def test_intermediate_states_from_a_failed_candidate_still_get_added(self):
+        """A chain that fails partway must still expose the checkpoints
+        from the steps that DID succeed before the failure."""
+
+        class PartialFailExecutor:
+            capacity = 1
+
+            async def reset(self, theorem):
+                return make_proof_state(["dummy goal"])
+
+            async def step(self, state, tactic):
+                checkpoint = ProofState(
+                    goals=(make_goal("survived checkpoint"),),
+                    depth=state.depth + 1,
+                    tactic_trace=state.tactic_trace + ("step1",),
+                )
+                error_state = ProofState(
+                    goals=state.goals,
+                    error="Lean error:\nboom",
+                    depth=state.depth,
+                    tactic_trace=state.tactic_trace,
+                )
+                return StepResult(
+                    next_state=error_state,
+                    tactic=tactic,
+                    intermediate_states=(checkpoint,),
+                )
+
+            async def close(self):
+                pass
+
+        captured_ledgers: list[Ledger] = []
+
+        class RecordingPolicy:
+            async def get_next_action(self, theorem, ledger, premises, k=8):
+                captured_ledgers.append(ledger)
+                chosen = next(iter(ledger.frontier))
+                return DirectorResponse(chosen, [], _tactics("step1; bad_step2"))
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=RecordingPolicy(), executor=PartialFailExecutor(), k=1)
+        asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=1))
+
+        ledger = captured_ledgers[0]
+        goal_targets = {s.goals[0].target for s in ledger.frontier.values() if s.goals}
+        assert "survived checkpoint" in goal_targets
 
 
 # ---------------------------------------------------------------------------

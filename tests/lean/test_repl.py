@@ -314,6 +314,103 @@ class TestLeanWorkerStepChaining:
 
 
 # ---------------------------------------------------------------------------
+# LeanWorker.step() intermediate-state checkpointing (fast, mocks _send)
+# ---------------------------------------------------------------------------
+
+class TestLeanWorkerStepIntermediateStates:
+    """
+    Each genuinely-verified sub-step of a chained candidate must be exposed
+    as its own checkpoint, not just the chain's final outcome — otherwise a
+    multi-step candidate is all-or-nothing: a later step failing discards
+    everything earlier that DID compile. No real Lean needed — _send mocked.
+    """
+
+    def _make_worker_with_cached_state(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])
+        worker._proof_state_cache[state.stable_hash()] = 0
+        return worker, state
+
+    async def test_single_tactic_has_no_intermediate_states(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "", "proofState": 1, "goals": ["⊢ True"],
+        })
+        result = await worker.step(state, "simp")
+        assert result.intermediate_states == ()
+
+    async def test_successful_chain_exposes_all_but_the_last_step(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n → True"]},
+            {"proofStatus": "", "proofState": 2, "goals": ["n : Nat\nh : n = n\n⊢ True"]},
+            {"proofStatus": "Completed", "proofState": 3, "goals": []},
+        ])
+        result = await worker.step(state, "intro n; intro h; trivial")
+
+        assert len(result.intermediate_states) == 2
+        assert result.intermediate_states[0].tactic_trace == ("intro n",)
+        assert result.intermediate_states[1].tactic_trace == ("intro n", "intro h")
+        # The final step's outcome is next_state, not a third intermediate.
+        assert result.proof_closed
+
+    async def test_intermediate_states_have_increasing_depth(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ A"]},
+            {"proofStatus": "", "proofState": 2, "goals": ["⊢ B"]},
+        ])
+        result = await worker.step(state, "tac1; tac2")
+        assert result.intermediate_states[0].depth == state.depth + 1
+
+    async def test_failed_chain_still_exposes_steps_that_succeeded_first(self):
+        """A 3-step chain failing on step 3 must still expose the
+        checkpoints from steps 1 and 2, which genuinely compiled."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ A"]},
+            {"proofStatus": "", "proofState": 2, "goals": ["⊢ B"]},
+            {"message": "Lean error:\nboom"},
+        ])
+        result = await worker.step(state, "tac1; tac2; bad_tac3")
+
+        assert not result.success
+        assert len(result.intermediate_states) == 2
+        assert result.intermediate_states[0].tactic_trace == ("tac1",)
+        assert result.intermediate_states[1].tactic_trace == ("tac1", "tac2")
+
+    async def test_chain_failing_on_first_step_has_no_intermediate_states(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={"message": "Lean error:\nboom"})
+        result = await worker.step(state, "bad_tac; tac2")
+        assert result.intermediate_states == ()
+
+    async def test_intermediate_state_is_cached_so_a_later_step_can_continue_from_it(self):
+        """The whole point of exposing a checkpoint is that a future turn
+        can call step() again starting from it — which requires its
+        stable_hash() to already be in the proof-state cache, since step()
+        looks the REPL id up from the state alone."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ A"]},
+            {"proofStatus": "", "proofState": 2, "goals": ["⊢ B"]},
+        ])
+        result = await worker.step(state, "tac1; tac2")
+        checkpoint = result.intermediate_states[0]
+
+        # Now continue from that checkpoint with a brand-new tactic.
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "Completed", "proofState": 5, "goals": [],
+        })
+        follow_up = await worker.step(checkpoint, "omega")
+        assert follow_up.success
+        # Confirms the lookup succeeded against the REPL id recorded for
+        # the checkpoint (proofState 1), not a cache-miss error.
+        sent_proof_state = worker._send.await_args.args[0]["proofState"]
+        assert sent_proof_state == 1
+
+
+# ---------------------------------------------------------------------------
 # Integration tests (slow, real Lean)
 # ---------------------------------------------------------------------------
 

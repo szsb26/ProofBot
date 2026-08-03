@@ -232,6 +232,19 @@ class LedgerSearch:
             ]
 
             for candidate, result in zip(candidates, results):
+                # Every genuinely-verified sub-step of a chained candidate
+                # (e.g. "intro n; simp; omega") becomes its own frontier
+                # state, not just the chain's final outcome — otherwise a
+                # multi-step candidate is all-or-nothing: if it succeeds,
+                # only the end state is reachable; if a later step fails,
+                # everything earlier that DID compile is silently thrown
+                # away. This gives the director real checkpoints to
+                # continue from instead of only ever re-authoring a whole
+                # new multi-step attempt from the last accepted state.
+                for checkpoint in result.intermediate_states:
+                    checkpoint_id = ledger.add_state(checkpoint)
+                    ledger.set_reasoning(checkpoint_id, resp.reasoning)
+
                 if result.proof_closed:
                     return ProofResult(
                         success=True,

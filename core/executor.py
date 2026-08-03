@@ -33,10 +33,22 @@ class StepResult:
         tactic:       The tactic that was applied. Stored for logging.
         elapsed_ms:   How long Lean took to verify this tactic. Used to
                       track REPL latency and detect hangs.
+        intermediate_states: If `tactic` was a top-level ';'-chain (e.g.
+                      "intro n; simp"), the verified ProofState after each
+                      successfully-executed sub-step EXCEPT the last one
+                      (which becomes next_state, or determines next_state's
+                      error if the chain failed there). Empty for a
+                      single-tactic candidate, or a chain that fails on its
+                      first sub-step. Exists so the search can add every
+                      genuinely-checked intermediate step to the frontier
+                      as its own state — not just the end result of the
+                      whole chain — giving it somewhere real to backtrack
+                      to instead of only the final outcome.
     """
     next_state: ProofState
     tactic: str
     elapsed_ms: float = 0.0
+    intermediate_states: tuple[ProofState, ...] = ()
 
     @property
     def success(self) -> bool:

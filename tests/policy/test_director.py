@@ -48,6 +48,50 @@ class TestSerializeLedger:
         assert "n + 0 = n" in text
         assert "n : ℕ" in text
 
+    def test_open_states_capped_when_frontier_is_large(self):
+        """Without a cap, the frontier can grow unboundedly (e.g. once
+        every verified sub-step of a chained candidate becomes its own
+        state) and showing all of them would reproduce the same
+        runaway-prompt-size problem the tactic-eviction cap exists to
+        prevent. Deepest (most-progressed) states are kept when over
+        budget."""
+        ledger = Ledger()
+        for i in range(25):
+            ledger.add_state(make_proof_state([f"goal number {i}"], depth=i))
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "showing 20 of 25" in text
+        # Depths 5-24 (the 20 deepest) are kept...
+        assert "goal number 24" in text
+        assert "goal number 5" in text
+        # ...depths 0-4 (the shallowest 5) are evicted.
+        assert "goal number 0" not in text
+        assert "goal number 4" not in text
+
+    def test_open_states_not_capped_at_or_below_budget(self):
+        ledger = Ledger()
+        for i in range(20):
+            ledger.add_state(make_proof_state([f"goal number {i}"], depth=i))
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        open_states_section = text.split("## Currently Open States")[1].split("##")[0]
+        assert "showing" not in open_states_section
+        for i in range(20):
+            assert f"goal number {i}" in text
+
+    def test_exhausted_attempts_omitted_for_states_evicted_from_display(self):
+        ledger = Ledger()
+        for i in range(25):
+            state_id = ledger.add_state(make_proof_state([f"goal number {i}"], depth=i))
+            if i == 0:
+                # A shallow state (guaranteed to be evicted) with a
+                # recorded failure — its failure history must not leak
+                # into the prompt once the state itself is off-screen.
+                ledger.record_failure(state_id, "a_uniquely_named_failed_tactic", "tactic_failed")
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        assert "a_uniquely_named_failed_tactic" not in text
+
     def test_root_state_shows_path_as_root(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n + 0 = n"]))
@@ -134,6 +178,31 @@ class TestSerializeLedger:
         # Still evicts old long tactics to keep the long-tactic budget bounded
         assert "tactic_number_0" not in text
         assert "tactic_number_19" in text
+
+    def test_many_short_tactics_still_cap_long_tactics_at_zero(self):
+        """Regression test: when >=15 distinct short tactics accumulate,
+        the long-tactic budget hits exactly 0. A naive `list[-0:]` slice
+        returns the WHOLE list in Python (since -0 == 0), not an empty
+        one — silently disabling the cap entirely instead of showing
+        none. This is exactly what happened on a real tournament_champion
+        trace: a state with 16 short tactics ended up displaying all 289
+        long ones (305 total) instead of being capped near 15, ballooning
+        that turn's prompt past 100K characters."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        for i in range(16):
+            ledger.record_failure(state_id, f"omega{i}", "tactic_failed")
+        for i in range(50):
+            ledger.record_failure(
+                state_id,
+                f"have h{i} : some_long_proposition_{i} := by some_long_proof_term_{i}",
+                "tactic_failed",
+            )
+
+        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        shown = text.count("\n  - ")
+        assert shown == 16, f"expected only the 16 short tactics to show, got {shown} entries"
+        assert "showing 16 of 66 unique" in text
 
     def test_long_multiline_tactic_is_truncated_and_flattened(self):
         ledger = Ledger()
