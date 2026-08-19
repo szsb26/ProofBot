@@ -114,9 +114,30 @@ class TestBuildUserPrompt:
 def _make_api_response(text: str) -> MagicMock:
     """Build a fake Anthropic API message response."""
     content_block = MagicMock()
+    content_block.type = "text"
     content_block.text = text
     response = MagicMock()
     response.content = [content_block]
+    return response
+
+
+def _make_thinking_then_text_response(thinking: str, text: str) -> MagicMock:
+    """
+    Build a fake response shaped like the newest Claude generation, which
+    thinks by default regardless of the `thinking` param — content[0] is a
+    ThinkingBlock (no .text attribute at all in the real SDK), with the
+    actual answer in a later text block.
+    """
+    thinking_block = MagicMock(spec=["type", "thinking"])
+    thinking_block.type = "thinking"
+    thinking_block.thinking = thinking
+
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = text
+
+    response = MagicMock()
+    response.content = [thinking_block, text_block]
     return response
 
 
@@ -149,6 +170,24 @@ class TestAnthropicPolicyGetTactics:
         assert results[0].tactic == "simp"
         assert results[1].tactic == "ring"
         assert results[2].tactic == "omega"
+
+    async def test_thinking_block_before_text_is_skipped_not_crashed_on(self, mock_policy):
+        """Regression test: the newest Claude generation thinks by default
+        regardless of the `thinking` param, so content[0] can be a
+        ThinkingBlock with no .text attribute at all — content[0].text
+        raises AttributeError. The real answer must still be found in a
+        later text block instead of crashing."""
+        policy, client = mock_policy
+        client.messages.create.return_value = _make_thinking_then_text_response(
+            thinking="Let me work through this proof step by step...",
+            text="simp\nring\nomega",
+        )
+
+        state = make_proof_state(["n + 0 = n"])
+        results = await policy.get_tactics(state, [], k=3)
+
+        assert len(results) == 3
+        assert results[0].tactic == "simp"
 
     async def test_log_probs_are_descending(self, mock_policy):
         """First candidate should have the highest log_prob (closest to 0)."""
@@ -183,6 +222,24 @@ class TestAnthropicPolicyGetTactics:
         user_content = kwargs["messages"][0]["content"]
         assert "Nat.add_zero" in user_content
         assert "Nat.add_comm" in user_content
+
+    async def test_system_prompt_is_marked_cacheable(self, mock_policy):
+        """The system prompt is identical on every director call — every
+        turn, every trial, every problem — so it should be sent as a
+        cache_control-tagged block, not a plain string, letting every call
+        after the first pay the cheaper cache-read rate for it instead of
+        full input price."""
+        policy, client = mock_policy
+        client.messages.create.return_value = _make_api_response("simp")
+
+        state = make_proof_state(["n + 0 = n"])
+        await policy.get_tactics(state, [], k=1)
+
+        _, kwargs = client.messages.create.call_args
+        system = kwargs["system"]
+        assert isinstance(system, list)
+        assert system[0]["cache_control"] == {"type": "ephemeral"}
+        assert system[0]["text"]  # the actual prompt text is still present
 
     async def test_api_failure_returns_simp_fallback(self, mock_policy):
         """If the API raises, the policy should return [simp] rather than crashing."""

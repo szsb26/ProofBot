@@ -58,14 +58,32 @@ class AnthropicPolicy(BaseLLMPolicy):
         # enable_thinking is not yet wired up for Claude (would use the
         # `thinking` extended-thinking param) — accepted for interface
         # parity with DeepSeekPolicy, currently a no-op here.
+        #
+        # system_prompt is identical on every single director call — every
+        # turn, every trial, every problem — so it's marked cacheable. The
+        # user_prompt (serialize_ledger's output) is NOT cached: its
+        # "Currently Open States"/"Exhausted Attempts" sections get
+        # re-sorted and re-capped each turn rather than purely growing at
+        # the end, so there's no stable prefix for later turns to match.
         message = await self._client.messages.create(
             model=self._model,
             max_tokens=max_tokens or self._max_tokens,
             temperature=self._temperature,
-            system=system_prompt,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
             messages=[{"role": "user", "content": user_prompt}],
         )
-        return message.content[0].text
+        # Some models (e.g. the newest Claude generation) think by default
+        # regardless of the `thinking` param, so content[0] is often a
+        # ThinkingBlock, not text — content[0].text then raises
+        # AttributeError. Find the actual text block(s) instead of
+        # assuming position 0.
+        return "".join(block.text for block in message.content if block.type == "text")
 
     async def close(self) -> None:
         await self._client.close()
