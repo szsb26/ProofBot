@@ -239,6 +239,43 @@ PROBLEMS: list[EvalProblem] = [
         tags=["combinatorics", "graph-theory", "finset", "tournament"],
     ),
 
+    # IMO 1968: in any tetrahedron some vertex has its three incident edges
+    # forming a triangle. Stated purely in terms of the 6 edge lengths and the
+    # 12 face inequalities, so no Euclidean-geometry library is needed.
+    #
+    # This one specifically exercises sub-goal decomposition. The known proof
+    # takes the globally longest edge, proves a reusable two-vertex lemma, and
+    # applies it in each of 6 cases. Since a search is scoped to a single
+    # theorem, that lemma has to be introduced *inside* the proof with
+    # `have name : statement` — which is exactly the capability we want to
+    # measure. A prover that can only extend one flat tactic chain forward
+    # cannot express this proof's structure at all.
+    EvalProblem(
+        name="imo1968_tetrahedron",
+        statement=(
+            "theorem eval_imo1968_tetrahedron "
+            "(AB AC AD BC BD CD : ℝ) "
+            "(hAB : 0 < AB) (hAC : 0 < AC) (hAD : 0 < AD) "
+            "(hBC : 0 < BC) (hBD : 0 < BD) (hCD : 0 < CD) "
+            "(hABC1 : AB < AC + BC) (hABC2 : AC < AB + BC) (hABC3 : BC < AB + AC) "
+            "(hABD1 : AB < AD + BD) (hABD2 : AD < AB + BD) (hABD3 : BD < AB + AD) "
+            "(hACD1 : AC < AD + CD) (hACD2 : AD < AC + CD) (hACD3 : CD < AC + AD) "
+            "(hBCD1 : BC < BD + CD) (hBCD2 : BD < BC + CD) (hBCD3 : CD < BC + BD) : "
+            "(AB < AC + AD ∧ AC < AB + AD ∧ AD < AB + AC) ∨ "
+            "(AB < BC + BD ∧ BC < AB + BD ∧ BD < AB + BC) ∨ "
+            "(AC < BC + CD ∧ BC < AC + CD ∧ CD < AC + BC) ∨ "
+            "(AD < BD + CD ∧ BD < AD + CD ∧ CD < AD + BD) := by"
+        ),
+        difficulty="stretch",
+        description=(
+            "IMO 1968: in any tetrahedron there is a vertex whose three incident "
+            "edges are the side lengths of a triangle. Given the 6 edge lengths "
+            "and the 4 faces' triangle inequalities, prove some vertex's three "
+            "edges satisfy the triangle inequality."
+        ),
+        tags=["geometry", "real", "case-split", "sub-lemma", "linarith", "imo"],
+    ),
+
     # -------------------------------------------------------------------------
     # Custom — put custom problems here
     # -------------------------------------------------------------------------

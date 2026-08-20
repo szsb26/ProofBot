@@ -320,6 +320,40 @@ class TestSerializeLedger:
 
 
 # ---------------------------------------------------------------------------
+# DIRECTOR_SYSTEM_PROMPT guidance
+# ---------------------------------------------------------------------------
+
+class TestDirectorSystemPromptGuidance:
+    """
+    The director can only use a capability it has been told exists. These
+    assert the prompt actually teaches the two facts that unlock sub-goal
+    decomposition — the structural move behind proofs that need a reusable
+    helper lemma (IMO 1968 tetrahedron, tournament_champion).
+
+    Motivation, measured from real traces: the director proposed 347
+    inlined sub-lemmas of the form `have h : ∀ ... := by <long chain>`, and
+    every sampled one failed on a mechanical error *inside* the `by` block.
+    Everything after `by` is executed as one atomic unit, so those failures
+    discarded the whole decomposition and surfaced only a single error. A
+    bare `have h : STMT` instead opens STMT as its own goal, which the
+    search can then prove incrementally with per-step feedback.
+    """
+
+    def test_prompt_explains_that_a_state_may_have_several_goals(self):
+        assert "SEVERAL goals" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_explains_tactics_apply_to_the_first_goal(self):
+        assert "FIRST goal" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_teaches_bare_have_to_open_a_subgoal(self):
+        assert "have name : statement" in DIRECTOR_SYSTEM_PROMPT
+        assert "NO `:= by ...` proof" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_warns_that_inline_by_proofs_are_all_or_nothing(self):
+        assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
 # parse_director_response
 # ---------------------------------------------------------------------------
 

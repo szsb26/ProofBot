@@ -32,6 +32,7 @@ from eval.harness import run_eval
 from lean.repl import SubprocessExecutor, LEAN_PROJECT_DIR
 from lean.mock_executor import MockExecutor
 from policy.anthropic import AnthropicPolicy
+from policy.claude_cli import ClaudeCLIPolicy
 from policy.deepseek import DeepSeekPolicy
 from policy.mock import MockPolicy
 
@@ -40,6 +41,7 @@ TRACES_DIR = Path(__file__).parent / "traces"
 
 _POLICY_DEFAULTS = {
     "anthropic": "claude-haiku-4-5-20251001",
+    "claude-cli": "sonnet",
     "deepseek": "deepseek-v4-flash",
 }
 _POLICY_ENV_VARS = {
@@ -79,9 +81,15 @@ examples:
     )
     parser.add_argument(
         "--policy",
-        choices=["anthropic", "deepseek", "mock"],
+        choices=["anthropic", "claude-cli", "deepseek", "mock"],
         default="anthropic",
-        help="tactic policy (default: anthropic)",
+        help=(
+            "tactic policy (default: anthropic). \"claude-cli\" shells out to "
+            "the claude CLI so usage bills against a Claude subscription "
+            "instead of API credits — but the CLI injects ~10K tokens of its "
+            "own context per call and supports neither max_tokens nor "
+            "temperature, so use a small --budget with it."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -199,6 +207,16 @@ def _make_policy(args: argparse.Namespace):
     if args.policy == "mock":
         tactics = [t.strip() for t in args.tactics.split(",") if t.strip()]
         return MockPolicy(tactics=tactics), "mock", "mock"
+
+    # The CLI authenticates itself (subscription or its own stored
+    # credentials), so it needs no API key from us.
+    if args.policy == "claude-cli":
+        model = args.model or _POLICY_DEFAULTS["claude-cli"]
+        return (
+            ClaudeCLIPolicy(model=model, director_max_tokens=args.director_max_tokens),
+            "claude-cli",
+            model,
+        )
 
     env_var = _POLICY_ENV_VARS[args.policy]
     api_key = args.api_key or os.environ.get(env_var, "")
