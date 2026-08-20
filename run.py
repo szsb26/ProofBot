@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from lean.repl import SubprocessExecutor, LEAN_PROJECT_DIR
 from lean.mock_executor import MockExecutor
 from policy.anthropic import AnthropicPolicy
+from policy.claude_cli import ClaudeCLIPolicy
 from policy.deepseek import DeepSeekPolicy
 from policy.mock import MockPolicy
 from search.ledger_search import LedgerSearch, prove_parallel
@@ -68,9 +69,11 @@ examples:
     )
     parser.add_argument(
         "--policy",
-        choices=["anthropic", "deepseek", "mock"],
+        choices=["anthropic", "deepseek", "claude_cli", "mock"],
         default="anthropic",
-        help="tactic generation policy: anthropic (default), deepseek, or mock (no API calls, for testing)",
+        help="tactic generation policy: anthropic (default), deepseek, claude_cli "
+             "(shells out to the `claude` CLI, no API key needed), or mock "
+             "(no API calls, for testing)",
     )
     parser.add_argument(
         "--tactics",
@@ -108,6 +111,7 @@ examples:
 _POLICY_DEFAULTS = {
     "anthropic": "claude-haiku-4-5-20251001",
     "deepseek": "deepseek-v4-flash",
+    "claude_cli": "sonnet",
 }
 
 _POLICY_ENV_VARS = {
@@ -120,6 +124,10 @@ def _make_policy(args: argparse.Namespace):
     if args.policy == "mock":
         tactics = [t.strip() for t in args.tactics.split(",") if t.strip()]
         return MockPolicy(tactics=tactics)
+
+    if args.policy == "claude_cli":
+        model = args.model or _POLICY_DEFAULTS["claude_cli"]
+        return ClaudeCLIPolicy(model=model)
 
     env_var = _POLICY_ENV_VARS[args.policy]
     api_key = args.api_key or os.environ.get(env_var, "")
