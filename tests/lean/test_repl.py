@@ -100,19 +100,22 @@ class TestSplitTopLevelTactics:
             "simp [foo, bar]", "omega",
         ]
 
-    def test_nested_by_block_is_not_split(self):
+    def test_nested_by_block_is_not_split_for_non_have_constructs(self):
         """'by' is a reserved keyword — an unbracketed top-level occurrence
         unambiguously opens a nested tacticSeq that (in a flat, unindented
-        string) absorbs everything to its right."""
-        tactic = "have h : P := by intro y hy; simp at hy; exact hy"
+        string) absorbs everything to its right. This still holds for any
+        construct other than "have NAME : STMT := by ..." (see
+        TestSplitHaveWithInlineProof for that specific, deliberate
+        exception)."""
+        tactic = "suffices h : P by intro y hy; simp at hy; exact hy"
         assert _split_top_level_tactics(tactic) == [tactic]
 
     def test_top_level_chain_before_nested_by_block_splits_correctly(self):
-        tactic = "by_contra h; push_neg at h; have hsub : P := by intro y; simp"
+        tactic = "by_contra h; push_neg at h; suffices hsub : P by intro y; simp"
         assert _split_top_level_tactics(tactic) == [
             "by_contra h",
             "push_neg at h",
-            "have hsub : P := by intro y; simp",
+            "suffices hsub : P by intro y; simp",
         ]
 
     def test_whitespace_only_tactic_splits_to_empty_list(self):
@@ -120,6 +123,107 @@ class TestSplitTopLevelTactics:
 
     def test_parts_are_stripped_of_surrounding_whitespace(self):
         assert _split_top_level_tactics(" intro n ; simp ") == ["intro n", "simp"]
+
+
+class TestSplitProtectsSemicolonCombinator:
+    """
+    Lean's '<;>' combinator ("run this tactic on every goal produced by the
+    previous one") contains a ';' that must NOT be treated as a step
+    separator — splitting there corrupts it into two dangling, syntactically
+    invalid fragments. A real eval trace caught this live: every candidate
+    using '<;>' failed with a syntax error at exactly that point (e.g.
+    "cases h1 <;> cases h2" became "cases h1 <" then "> cases h2"), for
+    every model tried, until one model diagnosed the harness bug itself and
+    worked around it with 'all_goals' instead.
+    """
+
+    def test_simple_semicolon_combinator_is_not_split(self):
+        tactic = "cases h1 <;> cases h2 <;> linarith"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_semicolon_combinator_after_rcases_pattern_is_not_split(self):
+        tactic = "rcases h1 with h1 | h1 | h1 <;> linarith"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_semicolon_combinator_mixed_with_real_top_level_chain(self):
+        tactic = "intro n; rcases h with h | h <;> nlinarith; simp"
+        assert _split_top_level_tactics(tactic) == [
+            "intro n",
+            "rcases h with h | h <;> nlinarith",
+            "simp",
+        ]
+
+    def test_semicolon_combinator_inside_brackets_still_not_split_either_way(self):
+        tactic = "simp [foo <;> bar]; omega"
+        assert _split_top_level_tactics(tactic) == ["simp [foo <;> bar]", "omega"]
+
+
+class TestSplitHaveWithInlineProof:
+    """
+    "have NAME : STMT := by REST" is deliberately split into the bare
+    "have NAME : STMT" plus REST (recursively split), instead of being kept
+    atomic like every other "... := by ..." construct. Measured motivation:
+    347 inlined sub-lemmas of exactly this shape were proposed against
+    tournament_champion, and every sampled failure was a mechanical error
+    *inside* REST — discarding a correct decomposition on every one, since
+    the whole block previously passed or failed as a single unit.
+
+    Confirmed against a real Lean REPL: sending the bare "have NAME : STMT"
+    alone opens STMT as a new first goal and keeps the original goal
+    available with NAME as a hypothesis, and Lean's default "operate on the
+    first goal" behavior then routes REST's own steps onto that new
+    sub-goal automatically — no separate goal-targeting logic needed.
+    """
+
+    def test_have_with_type_and_inline_proof_is_split(self):
+        tactic = "have hsub : ∀ y, beats c y → beats p y := by intro y hy; simp; exact h"
+        assert _split_top_level_tactics(tactic) == [
+            "have hsub : ∀ y, beats c y → beats p y",
+            "intro y hy",
+            "simp",
+            "exact h",
+        ]
+
+    def test_top_level_chain_before_a_have_still_splits_the_have_too(self):
+        tactic = "by_contra h; push_neg at h; have hcardp : X := by exact hmax p"
+        assert _split_top_level_tactics(tactic) == [
+            "by_contra h",
+            "push_neg at h",
+            "have hcardp : X",
+            "exact hmax p",
+        ]
+
+    def test_nested_have_inside_the_proof_is_also_unrolled(self):
+        """A have-with-inline-proof inside REST is itself split the same
+        way, recursively — fully flattening any depth of nesting."""
+        tactic = "have h1 : P := by have h2 : Q := by tac_a; tac_b; tac_c"
+        assert _split_top_level_tactics(tactic) == [
+            "have h1 : P", "have h2 : Q", "tac_a", "tac_b", "tac_c",
+        ]
+
+    def test_anonymous_have_with_inline_proof_is_split(self):
+        tactic = "have : p ≠ c := by intro h; exact hp h"
+        assert _split_top_level_tactics(tactic) == [
+            "have : p ≠ c", "intro h", "exact hp h",
+        ]
+
+    def test_have_with_no_type_annotation_is_not_split(self):
+        """"have h := by simp" states no separate type — h's type is only
+        inferred once the proof exists, so there is nothing valid to open
+        as a bare sub-goal. Confirmed against a real Lean REPL: bare
+        "have h" with no type at all is rejected outright."""
+        tactic = "have h := by simp"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_have_used_as_a_plain_rewrite_target_is_unaffected(self):
+        """"have" appearing without ":=" at all (e.g. referencing an
+        existing hypothesis) must not trip the have-split path."""
+        tactic = "have hp; simp"
+        assert _split_top_level_tactics(tactic) == ["have hp", "simp"]
+
+    def test_single_have_with_inline_proof_and_no_chain_before_it(self):
+        tactic = "have h : True := by trivial"
+        assert _split_top_level_tactics(tactic) == ["have h : True", "trivial"]
 
 
 class TestAnnotateChainError:

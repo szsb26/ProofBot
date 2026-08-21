@@ -10,6 +10,7 @@ Shared by AnthropicPolicy, DeepSeekPolicy, and any future LLM backend.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from core.ledger import Ledger
@@ -85,13 +86,10 @@ DIRECTOR_SYSTEM_PROMPT = (
     "summary of dead-end attempts already tried. Your job is to decide where "
     "to focus next.\n\n"
     "Rules:\n"
-    "- First, in \"reasoning\", write a SHORT natural-language plan (2-4 "
-    "sentences, never more) : what mathematical fact or proof step you are "
-    "trying to establish next at the state you choose, and why you believe "
-    "it moves the proof forward. Keep it brief — you have a limited response "
-    "budget shared with the rest of this JSON, and an unfinished response is "
-    "discarded entirely, so a long reasoning that leaves no room for the "
-    "\"tactics\" array is worse than a short one.\n"
+    "- First, in \"reasoning\", think through the actual mathematical "
+    "strategy for the chosen state — the real argument (case split, key "
+    "inequality, sub-lemma, contradiction, WLOG reduction, etc.), not just "
+    "which Lean tactic to try next.\n"
     "- If you are not fully confident of the exact Mathlib lemma name or its "
     "argument order, do not guess a specific identifier — prefer `apply?`, "
     "`exact?`, or a general-purpose tactic (`aesop`, `simp`, `omega`, "
@@ -136,7 +134,7 @@ DIRECTOR_SYSTEM_PROMPT = (
     "This is also the only way to build a reusable lemma you intend to apply "
     "more than once.\n"
     "- Respond with JSON only, matching exactly this shape:\n"
-    '{"reasoning": "<your SHORT natural-language plan for the chosen state>", '
+    '{"reasoning": "<your natural-language plan for the chosen state>", '
     '"abandon": ["<state_id>", ...], "abandon_reason": "<brief reason, or '
     'empty string if abandon is empty>", "chosen_state": "<state_id>", '
     '"tactics": ["<tactic 1>", "<tactic 2>", ...]}'
@@ -312,53 +310,157 @@ def serialize_ledger(
     return "".join(parts)
 
 
+# Matches the body of a JSON string (between its quotes): any run of
+# non-quote/non-backslash characters, or a backslash followed by one
+# escaped character (\", \\, \n, the two hex digits of a \uXXXX escape
+# consumed one at a time by the [^"\\] branch, etc.).
+_JSON_STRING_BODY = r'(?:[^"\\]|\\.)*'
+
+
+def _json_unescape(raw: str) -> str:
+    """Decode a JSON string body (no surrounding quotes) via json.loads,
+    falling back to the raw text if it contains a dangling escape (e.g. a
+    \\uXXXX cut off mid-sequence by truncation)."""
+    try:
+        return json.loads(f'"{raw}"')
+    except json.JSONDecodeError:
+        return raw
+
+
+def _find_matching_bracket(text: str, open_pos: int, open_ch: str, close_ch: str) -> int | None:
+    """
+    Find the index of the close_ch matching the open_ch at text[open_pos],
+    tracking string context so a close_ch inside a quoted string (e.g. the
+    ']' inside a tactic like "nlinarith [h1, h2]") isn't mistaken for the
+    real closing bracket. Returns None if the text ends first (the array
+    was truncated before it closed).
+    """
+    depth = 1
+    in_string = False
+    i = open_pos + 1
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+        else:
+            if c == '"':
+                in_string = True
+            elif c == open_ch:
+                depth += 1
+            elif c == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return None
+
+
+def _extract_json_string_field(text: str, key: str) -> str | None:
+    """
+    Regex-recover a single string field's value from malformed or
+    truncated JSON, once a strict json.loads on the full response has
+    already failed. Handles two shapes seen in practice: (1) the field
+    itself is intact but something *else* in the response is broken (extra
+    trailing content, a stray bracket, a missing final '}') — the
+    closing-quote-anchored regex recovers it whole; (2) the response was
+    cut off by the token budget mid-string, so there is no closing quote
+    before the text ends — the second regex recovers whatever text came
+    through before the cutoff instead of discarding it.
+    """
+    m = re.search(rf'"{key}"\s*:\s*"({_JSON_STRING_BODY})"', text)
+    if m:
+        return _json_unescape(m.group(1))
+    m = re.search(rf'"{key}"\s*:\s*"({_JSON_STRING_BODY})$', text, re.DOTALL)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_json_string_array_field(text: str, key: str) -> list[str] | None:
+    """
+    Regex-recover a string-array field's elements the same way — e.g. a
+    tactics array that never got its closing ']' still yields every
+    complete tactic string that came through before the cutoff (only a
+    final, mid-write element is dropped). Also tolerates trailing garbage
+    after a *properly* closed array, a shape seen when the model appends
+    an extra element outside the array by mistake.
+    """
+    m = re.search(rf'"{key}"\s*:\s*\[', text)
+    if not m:
+        return None
+    open_pos = m.end() - 1
+    close = _find_matching_bracket(text, open_pos, "[", "]")
+    body = text[open_pos + 1:close] if close is not None else text[open_pos + 1:]
+    return [_json_unescape(g) for g in re.findall(rf'"({_JSON_STRING_BODY})"', body)]
+
+
 def parse_director_response(text: str, k: int, fallback_state_id: str) -> DirectorResponse:
     """
     Parse the director's JSON response.
 
-    Never raises — falls back to continuing fallback_state_id with a single
-    ["simp"] candidate on any malformed or missing data, mirroring the
-    fallback contract of parse_tactics().
+    Tries a strict json.loads first. If that fails — most often because
+    the response was cut off before its closing brace, or the model wrote
+    slightly malformed JSON around an otherwise-intact tactics array —
+    falls back to regex-recovering each field independently, so a
+    truncated or garbled response doesn't discard reasoning and tactics
+    that actually came through intact. Only returns the fully-empty
+    ["simp"]-only fallback when nothing usable can be recovered at all.
+    Never raises.
     """
+    data = None
     try:
         start = text.index("{")
         end = text.rindex("}") + 1
         data = json.loads(text[start:end])
+    except (ValueError, json.JSONDecodeError):
+        pass
 
-        chosen = data.get("chosen_state")
-        if not isinstance(chosen, str) or not chosen:
-            chosen = fallback_state_id
+    chosen = abandoned = reasoning = raw_tactics = None
+    if isinstance(data, dict):
+        try:
+            chosen = data.get("chosen_state")
+            chosen = chosen if isinstance(chosen, str) and chosen else None
+            abandon_field = data.get("abandon", [])
+            abandoned = [s for s in abandon_field if isinstance(s, str)] if isinstance(abandon_field, list) else None
+            reasoning = data.get("reasoning")
+            reasoning = reasoning if isinstance(reasoning, str) else None
+            tactics_field = data.get("tactics", [])
+            raw_tactics = (
+                [t for t in tactics_field if isinstance(t, str) and t.strip()]
+                if isinstance(tactics_field, list) else None
+            )
+        except (KeyError, TypeError):
+            pass
+    abandoned = abandoned or []
+    raw_tactics = raw_tactics or []
 
-        abandoned = [s for s in data.get("abandon", []) if isinstance(s, str)]
+    if chosen is None:
+        chosen = _extract_json_string_field(text, "chosen_state")
+    if reasoning is None:
+        reasoning = _extract_json_string_field(text, "reasoning")
+    if not raw_tactics:
+        recovered = _extract_json_string_array_field(text, "tactics")
+        if recovered:
+            raw_tactics = [t for t in recovered if t.strip()]
+    if not abandoned:
+        recovered_abandon = _extract_json_string_array_field(text, "abandon")
+        if recovered_abandon:
+            abandoned = recovered_abandon
 
-        reasoning = data.get("reasoning")
-        if not isinstance(reasoning, str):
-            reasoning = ""
-
-        raw_tactics = [
-            t for t in data.get("tactics", [])
-            if isinstance(t, str) and t.strip()
-        ]
-        if not raw_tactics:
-            raw_tactics = ["simp"]
-
-        tactics = [
-            TacticCandidate(tactic=t, log_prob=float(-i))
-            for i, t in enumerate(raw_tactics[:k])
-        ]
-        return DirectorResponse(
-            chosen_state_id=chosen,
-            abandoned_state_ids=abandoned,
-            tactics=tactics,
-            reasoning=reasoning,
-        )
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return DirectorResponse(
-            chosen_state_id=fallback_state_id,
-            abandoned_state_ids=[],
-            tactics=[TacticCandidate(tactic="simp", log_prob=0.0)],
-            reasoning="",
-        )
+    tactics = [
+        TacticCandidate(tactic=t, log_prob=float(-i))
+        for i, t in enumerate(raw_tactics[:k] if raw_tactics else ["simp"])
+    ]
+    return DirectorResponse(
+        chosen_state_id=chosen or fallback_state_id,
+        abandoned_state_ids=abandoned,
+        tactics=tactics,
+        reasoning=reasoning or "",
+    )
 
 
 class BaseLLMPolicy:
@@ -374,7 +476,7 @@ class BaseLLMPolicy:
         model: str,
         max_tokens: int = 256,
         temperature: float = 1.0,
-        director_max_tokens: int = 4096,
+        director_max_tokens: int = 16000,
         director_thinking: bool = False,
     ):
         self._model = model

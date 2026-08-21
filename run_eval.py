@@ -116,14 +116,14 @@ examples:
     parser.add_argument(
         "--director-max-tokens",
         type=int,
-        default=4096,
+        default=16000,
         metavar="N",
         help=(
-            "max_tokens for director calls (default: 4096). A verbose "
+            "max_tokens for director calls (default: 16000). A verbose "
             "response (many long tactic candidates, or thinking) can "
             "exhaust this before its JSON closing brace is ever written, "
             "silently falling back to a blind \"simp\" guess for that turn — "
-            "raise this if that's happening often."
+            "raise this further if that's still happening often."
         ),
     )
     parser.add_argument(

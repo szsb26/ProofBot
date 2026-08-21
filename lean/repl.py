@@ -68,6 +68,16 @@ logger = logging.getLogger(__name__)
 LEAN_PROJECT_DIR = Path(__file__).parent.parent / "lean_project"
 
 _BY_KEYWORD_RE = re.compile(r"\bby\b")
+# Matches a top-level segment ending in "have NAME : STMT :=" (or the
+# anonymous "have : STMT :="), right before its inline proof's "by" —
+# the shape auto-split into a bare sub-goal, see _split_top_level_tactics.
+# Requires an explicit type annotation (a ':' not immediately
+# followed by '=') between "have" and the trailing ":=" — "have h :=
+# by simp" has no separately-stated type, so there is nothing valid to
+# open as a bare sub-goal; its type only exists once the proof does.
+# Confirmed against a real Lean REPL: bare "have h" with no type at
+# all is rejected outright.
+_HAVE_WITH_INLINE_PROOF_RE = re.compile(r"^have\b(\s+\S+)?\s*:(?!=).*:=$", re.DOTALL)
 
 
 def _split_top_level_tactics(tactic: str) -> list[str]:
@@ -82,12 +92,37 @@ def _split_top_level_tactics(tactic: str) -> list[str]:
     step as its own sequential call lets a chained candidate actually run
     instead of being silently lost to a parse error.
 
+    Semicolons that are part of Lean's '<;>' combinator ("run this tactic
+    on every goal produced by the previous one") are also left untouched —
+    splitting there corrupts the token into two dangling fragments (e.g.
+    "cases h1 <;> cases h2" becomes "cases h1 <" and "> cases h2", both
+    invalid syntax). Confirmed as a real, previously-uncaught bug: a live
+    trace showed every candidate using '<;>' failing with a syntax error
+    at exactly that point, for every model, until one caught it and
+    rewrote around it with 'all_goals' instead.
+
     Semicolons inside brackets, or anywhere after a top-level 'by' (a
     reserved keyword, so an unbracketed occurrence unambiguously opens a
     nested tacticSeq — e.g. "have h := by t1; t2"), are left untouched: in
     a flat, unindented one-line string there's no dedent boundary to close
     that block early, so everything to the right of 'by' belongs to it and
-    must be sent to Lean as a single unit.
+    must be sent to Lean as a single unit — WITH ONE EXCEPTION:
+
+    "have NAME : STMT := by REST" is special-cased. Sending it whole makes
+    the sub-goal's entire proof pass or fail atomically, discarding a
+    correct decomposition whenever anything inside REST goes wrong — the
+    single largest measured cause of tournament_champion's failures (347
+    inlined sub-lemmas proposed, every sampled one failing inside `by`).
+    Confirmed against a real Lean REPL: sending the bare "have NAME : STMT"
+    alone (no proof) opens STMT as a new first goal and keeps the original
+    goal available with NAME as a hypothesis — and Lean's default "operate
+    on the first goal" behavior then routes REST's own steps onto that new
+    sub-goal with no extra bookkeeping needed. So instead of shipping
+    "have NAME : STMT := by REST" as one block, this yields the bare
+    "have NAME : STMT" as its own step, then recurses on REST — meaning a
+    nested "have ... := by ..." inside REST gets split again the same way,
+    fully unrolling any depth of nesting into a flat sequence of
+    individually-checkpointed steps.
     """
     parts: list[str] = []
     depth = 0
@@ -101,10 +136,20 @@ def _split_top_level_tactics(tactic: str) -> list[str]:
         elif c in ")]}":
             depth = max(depth - 1, 0)
         elif depth == 0:
-            if c == ";":
+            if c == ";" and i > 0 and i + 1 < n and tactic[i - 1] == "<" and tactic[i + 1] == ">":
+                # Part of Lean's '<;>' combinator ("apply to every resulting
+                # goal"), not a step separator — splitting here corrupts it
+                # into two dangling fragments (e.g. "cases h1 <" / "> ...").
+                i += 1
+            elif c == ";":
                 parts.append(tactic[start:i].strip())
                 start = i + 1
             elif _BY_KEYWORD_RE.match(tactic, i):
+                segment = tactic[start:i].strip()
+                if segment.endswith(":=") and _HAVE_WITH_INLINE_PROOF_RE.match(segment):
+                    parts.append(segment[:-2].strip())
+                    parts.extend(_split_top_level_tactics(tactic[i + 2:]))
+                    return [p for p in parts if p]
                 break
         i += 1
     parts.append(tactic[start:].strip())

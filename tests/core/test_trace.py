@@ -115,3 +115,47 @@ class TestTracingPolicy:
         inner = FakeBaseLLMPolicy([])
         policy = TracingPolicy(inner)
         assert policy.render() == ""
+
+
+class TestTracingPolicyRecordsSystemPrompt:
+    """
+    Regression coverage for a real diagnostic failure: a trace recorded only
+    the user prompt, so when a DIRECTOR_SYSTEM_PROMPT change appeared to have
+    no effect there was no way to tell from the trace whether the model
+    ignored the new instruction or the edit never reached it. A trace must
+    state which instructions were in force for that run.
+    """
+
+    async def test_system_prompt_appears_in_the_trace(self):
+        from policy.base import DIRECTOR_SYSTEM_PROMPT
+
+        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        policy = TracingPolicy(FakeBaseLLMPolicy([raw]))
+        ledger, _ = _ledger_with_one_state()
+
+        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+
+        assert DIRECTOR_SYSTEM_PROMPT in policy.render()
+
+    async def test_system_prompt_emitted_once_not_per_turn(self):
+        """It is identical every turn; emitting it 150 times would bloat the
+        trace for no information gain."""
+        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        policy = TracingPolicy(FakeBaseLLMPolicy([raw, raw, raw]))
+        ledger, _ = _ledger_with_one_state()
+
+        for _ in range(3):
+            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+
+        assert policy.render().count("SYSTEM PROMPT (identical for every turn below)") == 1
+        assert policy.turn == 3
+
+    async def test_system_prompt_precedes_the_first_turn(self):
+        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        policy = TracingPolicy(FakeBaseLLMPolicy([raw]))
+        ledger, _ = _ledger_with_one_state()
+
+        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+
+        text = policy.render()
+        assert text.index("SYSTEM PROMPT") < text.index("TURN 1 — PROMPT SENT TO LLM")

@@ -1,8 +1,8 @@
 """
 TracingPolicy: wraps a BaseLLMPolicy so every director call is recorded
-verbatim — the exact prompt sent and the exact raw response received —
-without changing how the search consumes it (still returns a normal
-DirectorResponse).
+verbatim — the system prompt in force, the exact user prompt sent, and the
+exact raw response received — without changing how the search consumes it
+(still returns a normal DirectorResponse).
 
 Requires a BaseLLMPolicy-compatible object (something with _call_api,
 _director_max_tokens, _director_thinking) so the raw pre-parse response
@@ -32,11 +32,29 @@ class TracingPolicy:
         self.turn = 0
         self.lines: list[str] = []
         self._verbose = verbose
+        self._system_prompt_emitted = False
 
     def _emit(self, text: str) -> None:
         self.lines.append(text)
         if self._verbose:
             print(text, flush=True)
+
+    def _emit_system_prompt_once(self) -> None:
+        """
+        Record the system prompt at the top of the trace.
+
+        It is identical on every turn, so it is emitted once rather than
+        150 times. Without it a trace cannot tell you which instructions
+        were actually in effect for that run — which matters whenever the
+        prompt is being changed between runs, since a behavioural
+        difference is otherwise indistinguishable from the prompt edit not
+        having taken effect at all.
+        """
+        if self._system_prompt_emitted:
+            return
+        self._system_prompt_emitted = True
+        self._emit(f"\n{'=' * 80}\nSYSTEM PROMPT (identical for every turn below)\n{'=' * 80}")
+        self._emit(DIRECTOR_SYSTEM_PROMPT)
 
     async def get_next_action(
         self,
@@ -45,6 +63,7 @@ class TracingPolicy:
         premises: list[str],
         k: int = 8,
     ) -> DirectorResponse:
+        self._emit_system_prompt_once()
         self.turn += 1
         prompt = serialize_ledger(theorem, ledger, premises, k)
         self._emit(f"\n{'=' * 80}\nTURN {self.turn} — PROMPT SENT TO LLM\n{'=' * 80}")

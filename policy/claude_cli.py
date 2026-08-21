@@ -99,7 +99,7 @@ class ClaudeCLIPolicy(BaseLLMPolicy):
         max_tokens: int = 256,
         temperature: float = 1.0,
         cli_path: str | None = None,
-        director_max_tokens: int = 4096,
+        director_max_tokens: int = 16000,
         director_thinking: bool = False,
         timeout_s: float = 300.0,
     ):

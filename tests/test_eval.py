@@ -636,9 +636,9 @@ class TestEvalCLI:
         policy, policy_name, model_name = _make_policy(args)
         assert policy._director_thinking is False
 
-    def test_director_max_tokens_defaults_to_4096(self):
+    def test_director_max_tokens_defaults_to_16000(self):
         args = parse_args([])
-        assert args.director_max_tokens == 4096
+        assert args.director_max_tokens == 16000
 
     def test_parse_director_max_tokens_flag(self):
         args = parse_args(["--director-max-tokens", "8192"])

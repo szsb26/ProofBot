@@ -17,16 +17,35 @@ class TestLedgerAddState:
         assert state_id in ledger.frontier
         assert ledger.frontier[state_id] is state
 
-    def test_add_state_does_not_revive_abandoned_state(self):
+    def test_abandon_immediately_removes_from_frontier(self):
         ledger = Ledger()
         state = make_proof_state(["n + 0 = n"])
         state_id = ledger.add_state(state)
         ledger.abandon([state_id])
         assert state_id not in ledger.frontier
 
-        # Re-adding the same state should not put it back in the frontier
-        ledger.add_state(state)
+    def test_add_state_re_registers_a_previously_abandoned_id(self):
+        """
+        A state's id depends only on its goals, not on how it was reached —
+        so two independent tactic paths can legitimately converge on the
+        same logical state. If one branch abandons it, that must not
+        permanently block a later, unrelated branch from registering a
+        freshly-verified success that happens to hash to the same id
+        (regression test for the silent-discard bug: add_state used to
+        return the id as if it succeeded while never actually inserting
+        the state, losing real progress with no record of it anywhere).
+        """
+        ledger = Ledger()
+        state = make_proof_state(["n + 0 = n"])
+        state_id = ledger.add_state(state)
+        ledger.abandon([state_id])
         assert state_id not in ledger.frontier
+
+        # A different branch later re-derives the identical state.
+        returned_id = ledger.add_state(state)
+        assert returned_id == state_id
+        assert state_id in ledger.frontier
+        assert ledger.frontier[state_id] is state
 
     def test_same_goal_different_path_shares_id(self):
         """Two states with identical goals hash identically regardless of path."""

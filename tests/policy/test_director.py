@@ -455,6 +455,82 @@ class TestParseDirectorResponse:
 
 
 # ---------------------------------------------------------------------------
+# parse_director_response — malformed/truncated recovery
+#
+# A live eval run of imo1968_tetrahedron showed the director's raw response
+# comes back as broken JSON on a meaningful fraction of turns — sometimes a
+# genuine token-budget cutoff mid-reasoning, sometimes the model just
+# forgets the final '}', sometimes it tacks an extra element on after the
+# tactics array already closed. Before this recovery path existed, ANY of
+# these discarded the whole response (including correct, on-strategy
+# reasoning) down to an empty-reasoning, single-["simp"] default. These
+# tests pin the recovered behavior for each shape actually observed.
+# ---------------------------------------------------------------------------
+
+class TestParseDirectorResponseRecovery:
+
+    def test_recovers_when_final_brace_is_missing(self):
+        raw = (
+            '{"reasoning": "Use wlog on the maximal edge to force a '
+            'contradiction.", "abandon": [], "abandon_reason": "", '
+            '"chosen_state": "36793c2b", "tactics": ["nlinarith", "aesop"]'
+        )
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.chosen_state_id == "36793c2b"
+        assert resp.reasoning == "Use wlog on the maximal edge to force a contradiction."
+        assert [c.tactic for c in resp.tactics] == ["nlinarith", "aesop"]
+
+    def test_recovers_tactics_array_containing_brackets(self):
+        # A tactic like "nlinarith [h1, h2]" has a ']' inside the string —
+        # a naive text.find("]") would stop there instead of at the array's
+        # real closing bracket.
+        raw = (
+            '{"reasoning": "close it", "chosen_state": "s1", '
+            '"tactics": ["nlinarith [h1, h2]", "simp"]'
+        )
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert [c.tactic for c in resp.tactics] == ["nlinarith [h1, h2]", "simp"]
+
+    def test_recovers_when_extra_element_appended_after_array_closes(self):
+        raw = (
+            '{"reasoning": "case split", "chosen_state": "c1", '
+            '"tactics": ["linarith", "omega"],"stray tactic outside the array"]}'
+        )
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.chosen_state_id == "c1"
+        assert resp.reasoning == "case split"
+        assert [c.tactic for c in resp.tactics] == ["linarith", "omega"]
+
+    def test_recovers_partial_reasoning_when_cut_off_mid_string(self):
+        raw = '{"reasoning": "The key insight is to use wlog on the maximal edge and then'
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert resp.reasoning == (
+            "The key insight is to use wlog on the maximal edge and then"
+        )
+        # No tactics ever came through — still falls back to simp for those.
+        assert [c.tactic for c in resp.tactics] == ["simp"]
+        assert resp.chosen_state_id == "fb"
+
+    def test_recovers_only_complete_tactics_when_array_cut_off_mid_element(self):
+        raw = (
+            '{"reasoning": "ok", "chosen_state": "s1", '
+            '"tactics": ["linarith", "have h : AB < AC + AD := by nlinari'
+        )
+        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        assert [c.tactic for c in resp.tactics] == ["linarith"]
+
+    def test_completely_unparseable_text_still_falls_back_cleanly(self):
+        resp = parse_director_response(
+            "The model wrote prose instead of JSON this time.",
+            k=8,
+            fallback_state_id="fb",
+        )
+        assert resp.chosen_state_id == "fb"
+        assert resp.reasoning == ""
+        assert [c.tactic for c in resp.tactics] == ["simp"]
+
+
+# ---------------------------------------------------------------------------
 # BaseLLMPolicy.get_next_action (via DeepSeekPolicy with a mocked client)
 # ---------------------------------------------------------------------------
 

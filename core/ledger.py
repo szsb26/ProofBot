@@ -47,8 +47,9 @@ class Ledger:
                    (ProofState.stable_hash()[:8]).
         entries:   Every tactic attempted across the whole search — used to
                    summarize dead branches back to the LLM.
-        abandoned: Ids the LLM has explicitly given up on. Permanently
-                   excluded from the frontier and from future prompts.
+        abandoned: Ids the LLM has explicitly given up on. Removed from the
+                   frontier at the moment of abandonment, but NOT a
+                   permanent blacklist — see add_state.
         reasoning: The director's most recent stated natural-language plan
                    for each state, keyed by state id. Otherwise a director
                    call's reasoning is discarded the moment the turn ends —
@@ -61,10 +62,26 @@ class Ledger:
     reasoning: dict[str, str] = field(default_factory=dict)
 
     def add_state(self, state: ProofState) -> str:
-        """Register a state as open. No-op if it was already abandoned."""
+        """
+        Register a state as open, always — even if a state with this exact
+        id was abandoned earlier in the search.
+
+        A state's id is a hash of its goals only, not of how it was
+        reached, so two independent tactic paths can legitimately converge
+        on the identical logical state. Refusing to re-register an id that
+        was ever abandoned — regardless of which branch abandoned it or
+        why — used to silently drop that state: add_state still returned
+        the id as if it had succeeded, but nothing was inserted into
+        frontier, so a newly-verified success from an unrelated branch
+        could vanish with no record of it as either a success or a
+        failure. Confirmed live: a trace showed the same trivially-true
+        goal proposed and (per the Lean error log) never once recorded as
+        tried, because every successful close of it collided with an
+        unrelated earlier abandon and was thrown away before the director
+        could ever see the result.
+        """
         state_id = state.stable_hash()[:8]
-        if state_id not in self.abandoned:
-            self.frontier[state_id] = state
+        self.frontier[state_id] = state
         return state_id
 
     def record_success(self, parent_id: str, tactic: str, child_id: str) -> None:
