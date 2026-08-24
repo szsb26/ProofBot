@@ -4,11 +4,20 @@ LLM-guided proof search over a Ledger.
 Maintains a Ledger of every open proof state and every tactic attempted
 against it. At each step:
     1. Ask the policy to choose which open state to continue from — and
-       optionally abandon any state it considers a dead end — plus k tactic
-       candidates for its chosen state (PolicyModel.get_next_action)
-    2. Verify each candidate in Lean
-    3. Push successful results back onto the ledger's frontier
-    4. If any result closes the proof, return success
+       optionally abandon any state it considers a dead end — plus a single
+       tactic for its chosen state (PolicyModel.get_next_action)
+    2. Verify the tactic in Lean
+    3. Push a successful result back onto the ledger's frontier
+    4. If the result closes the proof, return success
+
+There is deliberately no "propose k independent tactic candidates per turn"
+mechanism. That design let a single turn spawn several permanent sibling
+frontier branches at once, and in practice the model often used the k slots
+to encode fragments of one sequential plan rather than genuinely independent
+alternatives — producing frontier growth that outpaced one-state-per-turn
+triage ("tree poisoning"). A single tactic (optionally ';'-chained, or using
+Lean's `first | ... | ...` to hedge within one turn) removes the mechanism
+without removing the model's ability to plan multi-step or hedge.
 
 There is no value function and no priority queue. Earlier versions of this
 search ranked states with a hand-coded heuristic (goal count + depth) driving
@@ -133,7 +142,6 @@ class LedgerSearch:
         self,
         policy: PolicyModel,
         executor: LeanExecutor,
-        k: int = 8,
         premises: list[str] | None = None,
     ):
         """
@@ -141,12 +149,10 @@ class LedgerSearch:
             policy:   Tactic/director generator (MockPolicy, AnthropicPolicy,
                       DeepSeekPolicy). Must implement get_next_action().
             executor: Lean verifier (MockExecutor, SubprocessExecutor, etc.)
-            k:        Number of tactic candidates requested per director call.
             premises: Mathlib lemma names to pass to the policy as context.
         """
         self.policy = policy
         self.executor = executor
-        self.k = k
         self.premises = premises or []
 
     async def prove(
@@ -160,8 +166,8 @@ class LedgerSearch:
         Args:
             theorem: The Lean 4 theorem statement to prove.
             budget:  Maximum number of director calls before giving up. Each
-                     unit is one LLM call (choose a state + propose k
-                     tactics) plus up to k Lean REPL calls.
+                     unit is one LLM call (choose a state + propose one
+                     tactic) plus one Lean REPL call.
 
         Returns:
             ProofResult with success=True and proof_trace if found,
@@ -170,8 +176,6 @@ class LedgerSearch:
             found to replace it).
         """
         start = time.perf_counter()
-        calls = 0
-
         initial_state = await self.executor.reset(theorem)
 
         if initial_state.is_error:
@@ -194,6 +198,8 @@ class LedgerSearch:
                 theorem=theorem,
             )
 
+        calls = 0
+
         ledger = Ledger()
         ledger.add_state(initial_state)
 
@@ -202,9 +208,7 @@ class LedgerSearch:
         while ledger.frontier and calls < budget:
             calls += 1
 
-            resp = await self.policy.get_next_action(
-                theorem, ledger, self.premises, k=self.k
-            )
+            resp = await self.policy.get_next_action(theorem, ledger, self.premises)
             # A state named as both chosen and abandoned in the same turn is
             # a self-contradictory response — choosing it is a clear signal
             # to keep it, so drop it from the abandon list rather than
@@ -222,48 +226,44 @@ class LedgerSearch:
 
             ledger.set_reasoning(resp.chosen_state_id, resp.reasoning)
 
-            candidates = [
-                c for c in resp.tactics if not _contains_banned_tactic(c.tactic)
-            ]
+            if _contains_banned_tactic(resp.tactic):
+                # Nothing legitimate to try this turn — try again next call.
+                continue
 
-            results = [
-                await self.executor.step(state, c.tactic)
-                for c in candidates
-            ]
+            result = await self.executor.step(state, resp.tactic)
 
-            for candidate, result in zip(candidates, results):
-                # Every genuinely-verified sub-step of a chained candidate
-                # (e.g. "intro n; simp; omega") becomes its own frontier
-                # state, not just the chain's final outcome — otherwise a
-                # multi-step candidate is all-or-nothing: if it succeeds,
-                # only the end state is reachable; if a later step fails,
-                # everything earlier that DID compile is silently thrown
-                # away. This gives the director real checkpoints to
-                # continue from instead of only ever re-authoring a whole
-                # new multi-step attempt from the last accepted state.
-                for checkpoint in result.intermediate_states:
-                    checkpoint_id = ledger.add_state(checkpoint)
-                    ledger.set_reasoning(checkpoint_id, resp.reasoning)
+            # Every genuinely-verified sub-step of a chained tactic (e.g.
+            # "intro n; simp; omega") becomes its own frontier state, not
+            # just the chain's final outcome — otherwise a multi-step
+            # tactic is all-or-nothing: if it succeeds, only the end state
+            # is reachable; if a later step fails, everything earlier that
+            # DID compile is silently thrown away. This gives the director
+            # real checkpoints to continue from instead of only ever
+            # re-authoring a whole new multi-step attempt from the last
+            # accepted state.
+            for checkpoint in result.intermediate_states:
+                checkpoint_id = ledger.add_state(checkpoint)
+                ledger.set_reasoning(checkpoint_id, resp.reasoning)
 
-                if result.proof_closed:
-                    return ProofResult(
-                        success=True,
-                        proof_trace=list(result.next_state.tactic_trace),
-                        nodes_visited=calls,
-                        elapsed_ms=(time.perf_counter() - start) * 1000,
-                        theorem=theorem,
-                    )
+            if result.proof_closed:
+                return ProofResult(
+                    success=True,
+                    proof_trace=list(result.next_state.tactic_trace),
+                    nodes_visited=calls,
+                    elapsed_ms=(time.perf_counter() - start) * 1000,
+                    theorem=theorem,
+                )
 
-                if result.success:
-                    new_id = ledger.add_state(result.next_state)
-                    ledger.set_reasoning(new_id, resp.reasoning)
-                else:
-                    err = result.next_state.error or ""
-                    category = _classify_tactic_error(err)
-                    tactic_errors[category] = tactic_errors.get(category, 0) + 1
-                    ledger.record_failure(
-                        resp.chosen_state_id, candidate.tactic, category, err
-                    )
+            if result.success:
+                new_id = ledger.add_state(result.next_state)
+                ledger.set_reasoning(new_id, resp.reasoning)
+            else:
+                err = result.next_state.error or ""
+                category = _classify_tactic_error(err)
+                tactic_errors[category] = tactic_errors.get(category, 0) + 1
+                ledger.record_failure(
+                    resp.chosen_state_id, resp.tactic, category, err
+                )
 
         failure_reason = "frontier_exhausted" if not ledger.frontier else "budget_exhausted"
         return ProofResult(

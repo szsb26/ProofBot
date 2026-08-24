@@ -24,8 +24,9 @@ class MockPolicy:
     def __init__(self, tactics: list[str] | None = None):
         """
         Args:
-            tactics: Fixed list of tactics to always return.
-                     Defaults to a set of common closing tactics.
+            tactics: Fixed list of tactics to cycle through, one per
+                     get_next_action() call. Defaults to a set of common
+                     closing tactics.
         """
         self._tactics = tactics or [
             "simp",
@@ -37,6 +38,7 @@ class MockPolicy:
             "norm_num",
             "linarith",
         ]
+        self._turn = 0
 
     async def get_tactics(
         self,
@@ -62,26 +64,25 @@ class MockPolicy:
         theorem: str,
         ledger: Ledger,
         premises: list[str],
-        k: int = 8,
     ) -> DirectorResponse:
         """
         Ignores theorem/premises. Always continues the most recently added
-        open state (insertion order) with the same fixed tactic list, and
-        never abandons anything. Picking the newest state — rather than the
-        first — lets a fixed-tactic search actually advance depth-first
-        instead of re-trying an already-succeeded tactic at the root forever,
-        since states are never auto-evicted from the frontier on success.
+        open state (insertion order), proposing one tactic per call, cycling
+        through the fixed tactic list turn over turn, and never abandons
+        anything. Picking the newest state — rather than the first — lets a
+        fixed-tactic search actually advance depth-first instead of
+        re-trying an already-succeeded tactic at the root forever, since
+        states are never auto-evicted from the frontier on success. Cycling
+        one tactic per turn (rather than proposing several at once) mirrors
+        how the real director now works: exactly one proposal per call.
         """
         chosen_id = next(reversed(ledger.frontier))
-        candidates = self._tactics[:k]
-        tactics = [
-            TacticCandidate(tactic=t, log_prob=float(-i))
-            for i, t in enumerate(candidates)
-        ]
+        tactic = self._tactics[self._turn % len(self._tactics)]
+        self._turn += 1
         return DirectorResponse(
             chosen_state_id=chosen_id,
             abandoned_state_ids=[],
-            tactics=tactics,
+            tactic=tactic,
         )
 
     async def close(self) -> None:

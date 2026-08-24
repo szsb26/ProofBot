@@ -69,7 +69,6 @@ async def run_eval(
     trace: bool = False,
     trace_successes: bool = False,
     traces_dir: str | Path = "traces",
-    candidates_per_turn: int = 8,
 ) -> EvalSummary:
     """
     Run every problem in *problems* through the prover and collect results.
@@ -100,13 +99,6 @@ async def run_eval(
     Both require *policy* to be a BaseLLMPolicy-compatible object (has
     _call_api); if not (e.g. MockPolicy), tracing is silently skipped since
     there's no real LLM call to capture.
-
-    candidates_per_turn: how many tactic candidates the director proposes
-    per call (LedgerSearch's k). Lower values mean a shorter response per
-    call — worth reducing on problems where candidates are unusually long
-    (e.g. deeply nested Finset/by_contra chains), since a long response can
-    exhaust director_max_tokens before the JSON's closing brace is ever
-    written, silently falling back to a blind "simp" guess for that turn.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results: list[ProblemResult] = []
@@ -139,18 +131,20 @@ async def run_eval(
             if can_trace:
                 traced_policies = [TracingPolicy(policy) for _ in executors]
                 searches = [
-                    LedgerSearch(policy=tp, executor=e, k=candidates_per_turn)
+                    LedgerSearch(policy=tp, executor=e)
                     for tp, e in zip(traced_policies, executors)
                 ]
             else:
                 traced_policies = []
                 searches = [
-                    LedgerSearch(policy=policy, executor=e, k=candidates_per_turn)
+                    LedgerSearch(policy=policy, executor=e)
                     for e in executors
                 ]
             result = await prove_parallel(
                 problem.statement, searches=searches, budget=budget
             )
+            trace_sources = traced_policies
+
             if result.success:
                 passes += 1
                 if not proof_trace:
@@ -158,7 +152,7 @@ async def run_eval(
 
                 if can_trace and trace_successes:
                     trial_traces_dir.mkdir(parents=True, exist_ok=True)
-                    for w, tp in enumerate(traced_policies, start=1):
+                    for w, tp in enumerate(trace_sources, start=1):
                         path = trial_traces_dir / f"{problem.name}_trial{t + 1}_worker{w}_success.txt"
                         path.write_text(tp.render())
                         success_trace_paths.append(str(path))
@@ -170,7 +164,7 @@ async def run_eval(
 
                 if can_trace and trace:
                     trial_traces_dir.mkdir(parents=True, exist_ok=True)
-                    for w, tp in enumerate(traced_policies, start=1):
+                    for w, tp in enumerate(trace_sources, start=1):
                         path = trial_traces_dir / f"{problem.name}_trial{t + 1}_worker{w}_failed.txt"
                         path.write_text(tp.render())
                         failed_trace_paths.append(str(path))

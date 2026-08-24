@@ -120,10 +120,10 @@ examples:
         metavar="N",
         help=(
             "max_tokens for director calls (default: 16000). A verbose "
-            "response (many long tactic candidates, or thinking) can "
-            "exhaust this before its JSON closing brace is ever written, "
-            "silently falling back to a blind \"simp\" guess for that turn — "
-            "raise this further if that's still happening often."
+            "response (long reasoning, or thinking) can exhaust this "
+            "before its JSON closing brace is ever written, silently "
+            "falling back to a blind \"simp\" guess for that turn — raise "
+            "this further if that's still happening often."
         ),
     )
     parser.add_argument(
@@ -132,19 +132,6 @@ examples:
         default=1,
         metavar="K",
         help="parallel searches per problem (default: 1)",
-    )
-    parser.add_argument(
-        "--candidates", "-c",
-        type=int,
-        default=8,
-        metavar="N",
-        help=(
-            "tactic candidates proposed per director call (default: 8). "
-            "Lower this on problems whose candidates run long — a verbose "
-            "response can exhaust director_max_tokens before its JSON "
-            "closing brace is written, silently falling back to a blind "
-            "\"simp\" guess for that turn."
-        ),
     )
     parser.add_argument(
         "--budget", "-b",
@@ -321,10 +308,9 @@ async def _run(args: argparse.Namespace) -> int:
     trials_str = f", trials={args.trials}" if args.trials > 1 else ""
     temp_str = f", temp={args.temperature}" if args.executor != "mock" else ""
     thinking_str = ", director_thinking=on" if args.director_thinking else ""
-    candidates_str = f", candidates={args.candidates}" if args.candidates != 8 else ""
     print(
         f"Evaluating {len(problems)} problem(s) — "
-        f"{workers_str}, budget={args.budget}{trials_str}{temp_str}{thinking_str}{candidates_str}, "
+        f"{workers_str}, budget={args.budget}{trials_str}{temp_str}{thinking_str}, "
         f"policy={policy_name} ({model_name})\n"
     )
 
@@ -340,7 +326,6 @@ async def _run(args: argparse.Namespace) -> int:
             trace=args.trace,
             trace_successes=args.trace_successes,
             traces_dir=TRACES_DIR,
-            candidates_per_turn=args.candidates,
         )
     finally:
         if use_real_lean:

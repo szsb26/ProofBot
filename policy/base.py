@@ -105,19 +105,23 @@ DIRECTOR_SYSTEM_PROMPT = (
     "Copy its id exactly as shown in the state's bracket label, e.g. for "
     "\"[state a1b2c3d4]\" use \"a1b2c3d4\" — do not include the word \"state\" "
     "or the brackets.\n"
-    "- Propose tactic candidates for the chosen state only, ordered from most "
-    "to least promising. Check the \"Tactics already tried here\" list for "
-    "your chosen state first — never propose a tactic that already appears "
-    "there verbatim, since it is guaranteed to fail the same way again. Each "
-    "failed tactic is shown with Lean's actual error message (marked with "
-    "\"→\") — read it before retrying a similar idea: it tells you the real "
-    "reason (wrong lemma name, wrong argument shape, type mismatch, etc.), "
-    "which is far more useful than guessing again blindly.\n"
-    "- Each tactic must be a single, syntactically valid Lean 4 tactic, with "
-    "no explanations, numbering, backticks, or code fences. You may chain "
-    "steps with ';' (e.g. \"intro n; simp\") — each step is run in sequence "
-    "and, if one fails, the error you see next turn will say exactly which "
-    "step of the chain it was, not just the chain as a whole.\n"
+    "- Propose exactly ONE tactic for the chosen state. Check the \"Tactics "
+    "already tried here\" list for your chosen state first — never propose a "
+    "tactic that already appears there verbatim, since it is guaranteed to "
+    "fail the same way again. Each failed tactic is shown with Lean's actual "
+    "error message (marked with \"→\") — read it before retrying a similar "
+    "idea: it tells you the real reason (wrong lemma name, wrong argument "
+    "shape, type mismatch, etc.), which is far more useful than guessing "
+    "again blindly.\n"
+    "- Your tactic must be syntactically valid Lean 4, with no explanations, "
+    "numbering, backticks, or code fences. You may chain multiple steps with "
+    "';' (e.g. \"intro n; simp\") to carry out one sequential plan — each "
+    "step is run in sequence and, if one fails, the error you see next turn "
+    "will say exactly which step of the chain it was, not just the chain as "
+    "a whole. If you genuinely want to hedge between distinct alternatives "
+    "rather than commit to one, use Lean's own `first | tac1 | tac2 | ...` "
+    "combinator inside your single tactic string, rather than describing "
+    "several separate plans — there is only one slot.\n"
     "- A state may hold SEVERAL goals (they are labelled in the state text). "
     "Every tactic applies to the FIRST goal only, so the goals are worked "
     "through in order.\n"
@@ -137,7 +141,7 @@ DIRECTOR_SYSTEM_PROMPT = (
     '{"reasoning": "<your natural-language plan for the chosen state>", '
     '"abandon": ["<state_id>", ...], "abandon_reason": "<brief reason, or '
     'empty string if abandon is empty>", "chosen_state": "<state_id>", '
-    '"tactics": ["<tactic 1>", "<tactic 2>", ...]}'
+    '"tactic": "<your single tactic, or ;-chained sequence>"}'
 )
 
 
@@ -145,8 +149,8 @@ DIRECTOR_SYSTEM_PROMPT = (
 class DirectorResponse:
     """
     The director's decision for one turn of ledger-guided search: which open
-    state to continue from (and which, if any, to give up on), plus tactic
-    candidates for the chosen state.
+    state to continue from (and which, if any, to give up on), plus the
+    single tactic to try there.
 
     Attributes:
         reasoning: The director's stated natural-language plan for the
@@ -154,10 +158,17 @@ class DirectorResponse:
                    back on future turns (see Ledger.set_reasoning), so the
                    model's own prior plan for a branch isn't lost between
                    calls the way its hidden reasoning tokens are.
+        tactic: The single tactic string to try (may itself be a ';'-chained
+                sequence, or use Lean's `first | ... | ...` to hedge). There
+                is deliberately no k-candidates-per-turn mechanism: proposing
+                several independent tactics per turn let the model encode a
+                sequential plan as if it were several parallel hedges, which
+                spawned one permanent frontier branch per proposal and caused
+                uncontrolled, untriaged branching ("tree poisoning").
     """
     chosen_state_id: str
     abandoned_state_ids: list[str]
-    tactics: list[TacticCandidate]
+    tactic: str
     reasoning: str = ""
 
 
@@ -202,7 +213,6 @@ def serialize_ledger(
     theorem: str,
     ledger: Ledger,
     premises: list[str],
-    k: int,
 ) -> str:
     """
     Render a Ledger into prompt text for the director call.
@@ -304,7 +314,7 @@ def serialize_ledger(
     parts.append(
         f"\n\n## Task\n\n"
         f"Choose exactly one open state to continue from, optionally abandon "
-        f"any you consider dead ends, and propose {k} tactic candidates for "
+        f"any you consider dead ends, and propose exactly one tactic for "
         f"your chosen state."
     )
     return "".join(parts)
@@ -380,6 +390,20 @@ def _extract_json_string_field(text: str, key: str) -> str | None:
     return None
 
 
+def _extract_complete_json_string_field(text: str, key: str) -> str | None:
+    """
+    Like _extract_json_string_field, but only accepts a value that reached
+    its closing quote — never a partial value salvaged from a mid-string
+    cutoff. Used for the tactic field: a tactic string truncated mid-write
+    is overwhelmingly likely to be invalid Lean syntax (unlike partial
+    reasoning prose, which is still useful even cut off), so there is
+    nothing worth salvaging — falling back to "simp" is strictly better
+    than handing the executor a guaranteed-broken tactic string.
+    """
+    m = re.search(rf'"{key}"\s*:\s*"({_JSON_STRING_BODY})"', text)
+    return _json_unescape(m.group(1)) if m else None
+
+
 def _extract_json_string_array_field(text: str, key: str) -> list[str] | None:
     """
     Regex-recover a string-array field's elements the same way — e.g. a
@@ -398,18 +422,17 @@ def _extract_json_string_array_field(text: str, key: str) -> list[str] | None:
     return [_json_unescape(g) for g in re.findall(rf'"({_JSON_STRING_BODY})"', body)]
 
 
-def parse_director_response(text: str, k: int, fallback_state_id: str) -> DirectorResponse:
+def parse_director_response(text: str, fallback_state_id: str) -> DirectorResponse:
     """
     Parse the director's JSON response.
 
     Tries a strict json.loads first. If that fails — most often because
     the response was cut off before its closing brace, or the model wrote
-    slightly malformed JSON around an otherwise-intact tactics array —
+    slightly malformed JSON around an otherwise-intact tactic string —
     falls back to regex-recovering each field independently, so a
-    truncated or garbled response doesn't discard reasoning and tactics
-    that actually came through intact. Only returns the fully-empty
-    ["simp"]-only fallback when nothing usable can be recovered at all.
-    Never raises.
+    truncated or garbled response doesn't discard reasoning and a tactic
+    that actually came through intact. Only returns the "simp" fallback
+    tactic when nothing usable can be recovered at all. Never raises.
     """
     data = None
     try:
@@ -419,7 +442,7 @@ def parse_director_response(text: str, k: int, fallback_state_id: str) -> Direct
     except (ValueError, json.JSONDecodeError):
         pass
 
-    chosen = abandoned = reasoning = raw_tactics = None
+    chosen = abandoned = reasoning = tactic = None
     if isinstance(data, dict):
         try:
             chosen = data.get("chosen_state")
@@ -428,37 +451,29 @@ def parse_director_response(text: str, k: int, fallback_state_id: str) -> Direct
             abandoned = [s for s in abandon_field if isinstance(s, str)] if isinstance(abandon_field, list) else None
             reasoning = data.get("reasoning")
             reasoning = reasoning if isinstance(reasoning, str) else None
-            tactics_field = data.get("tactics", [])
-            raw_tactics = (
-                [t for t in tactics_field if isinstance(t, str) and t.strip()]
-                if isinstance(tactics_field, list) else None
-            )
+            tactic_field = data.get("tactic")
+            tactic = tactic_field if isinstance(tactic_field, str) and tactic_field.strip() else None
         except (KeyError, TypeError):
             pass
     abandoned = abandoned or []
-    raw_tactics = raw_tactics or []
 
     if chosen is None:
         chosen = _extract_json_string_field(text, "chosen_state")
     if reasoning is None:
         reasoning = _extract_json_string_field(text, "reasoning")
-    if not raw_tactics:
-        recovered = _extract_json_string_array_field(text, "tactics")
-        if recovered:
-            raw_tactics = [t for t in recovered if t.strip()]
+    if not tactic:
+        recovered = _extract_complete_json_string_field(text, "tactic")
+        if recovered and recovered.strip():
+            tactic = recovered
     if not abandoned:
         recovered_abandon = _extract_json_string_array_field(text, "abandon")
         if recovered_abandon:
             abandoned = recovered_abandon
 
-    tactics = [
-        TacticCandidate(tactic=t, log_prob=float(-i))
-        for i, t in enumerate(raw_tactics[:k] if raw_tactics else ["simp"])
-    ]
     return DirectorResponse(
         chosen_state_id=chosen or fallback_state_id,
         abandoned_state_ids=abandoned,
-        tactics=tactics,
+        tactic=tactic or "simp",
         reasoning=reasoning or "",
     )
 
@@ -517,19 +532,18 @@ class BaseLLMPolicy:
         theorem: str,
         ledger: Ledger,
         premises: list[str],
-        k: int = 8,
     ) -> DirectorResponse:
         """
         Ask the LLM to choose which open state to continue from (or abandon),
-        and generate k tactic candidates for its choice.
+        and propose a single tactic for its choice.
 
         Never raises — falls back to continuing an arbitrary frontier state
-        with a single ["simp"] candidate on any error. Requires a non-empty
+        with a "simp" tactic on any error. Requires a non-empty
         ledger.frontier; callers are responsible for stopping the search once
         the frontier is empty.
         """
         fallback_id = next(iter(ledger.frontier))
-        user_prompt = serialize_ledger(theorem, ledger, premises, k)
+        user_prompt = serialize_ledger(theorem, ledger, premises)
         try:
             raw_text = await self._call_api(
                 user_prompt,
@@ -541,9 +555,9 @@ class BaseLLMPolicy:
             return DirectorResponse(
                 chosen_state_id=fallback_id,
                 abandoned_state_ids=[],
-                tactics=[TacticCandidate(tactic="simp", log_prob=0.0)],
+                tactic="simp",
             )
-        return parse_director_response(raw_text, k, fallback_id)
+        return parse_director_response(raw_text, fallback_id)
 
     async def _call_api(
         self,

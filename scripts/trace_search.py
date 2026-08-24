@@ -9,7 +9,7 @@ Traces are saved to traces/trace_<name>_<timestamp>.txt, mirroring how
 run_eval.py saves to results/eval_<timestamp>.json.
 
     python scripts/trace_search.py --problem sum_range_formula --budget 8
-    python scripts/trace_search.py --problem tournament_champion --budget 20 -k 4
+    python scripts/trace_search.py --problem tournament_champion --budget 20
     python scripts/trace_search.py --theorem "theorem foo : n + 0 = n := by" --budget 5
 """
 
@@ -49,7 +49,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--policy", choices=["deepseek", "anthropic"], default="deepseek",
     )
     parser.add_argument("--budget", "-b", type=int, default=8, metavar="N")
-    parser.add_argument("-k", type=int, default=6, metavar="K")
     parser.add_argument(
         "--output", "-o", default=None, metavar="PATH",
         help="Output file (default: traces/trace_<name>_<timestamp>.txt)",
@@ -78,7 +77,7 @@ async def _run(args: argparse.Namespace) -> Path:
     executor = SubprocessExecutor()
     inner_policy = DeepSeekPolicy() if args.policy == "deepseek" else AnthropicPolicy()
     policy = TracingPolicy(inner_policy, verbose=True)
-    search = LedgerSearch(policy=policy, executor=executor, k=args.k)
+    search = LedgerSearch(policy=policy, executor=executor)
 
     print("Starting Lean worker (loading Mathlib)...", flush=True)
     await executor.start()

@@ -714,7 +714,7 @@ class TestEndToEnd:
 
     async def test_anthropic_proves_simple_theorem(self, shared_lean):
         policy, executor = shared_lean
-        search = LedgerSearch(policy=policy, executor=executor, k=8)
+        search = LedgerSearch(policy=policy, executor=executor)
         result = await search.prove("theorem foo : ∀ n : Nat, n + 0 = n := by", budget=10)
         assert result.success
         assert len(result.proof_trace) > 0
@@ -728,7 +728,7 @@ class TestEndToEnd:
         await asyncio.gather(*[e.start() for e in executors])
         try:
             searches = [
-                LedgerSearch(policy=policy, executor=e, k=8)
+                LedgerSearch(policy=policy, executor=e)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -749,7 +749,7 @@ class TestEndToEnd:
         #
         # Expected proof: intro a b; ring
         policy, executor = shared_lean
-        search = LedgerSearch(policy=policy, executor=executor, k=12)
+        search = LedgerSearch(policy=policy, executor=executor)
         result = await search.prove(
             "theorem binomial_sq : ∀ a b : Int, (a + b)^2 = a^2 + 2*a*b + b^2 := by",
             budget=50,
@@ -764,7 +764,7 @@ class TestEndToEnd:
         #
         # Expected proof: intro p q hpq hnq hp; exact hnq (hpq hp)
         policy, executor = shared_lean
-        search = LedgerSearch(policy=policy, executor=executor, k=8)
+        search = LedgerSearch(policy=policy, executor=executor)
         result = await search.prove(
             "theorem contrapositive : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by",
             budget=20,
@@ -802,7 +802,7 @@ class TestDeepSeekEndToEnd:
 
     async def test_deepseek_proves_simple_theorem(self, shared_lean):
         policy, executor = shared_lean
-        search = LedgerSearch(policy=policy, executor=executor, k=8)
+        search = LedgerSearch(policy=policy, executor=executor)
         result = await search.prove("theorem foo : ∀ n : Nat, n + 0 = n := by", budget=10)
         assert result.success
         assert len(result.proof_trace) > 0
@@ -814,7 +814,7 @@ class TestDeepSeekEndToEnd:
         await asyncio.gather(*[e.start() for e in executors])
         try:
             searches = [
-                LedgerSearch(policy=policy, executor=e, k=8)
+                LedgerSearch(policy=policy, executor=e)
                 for e in executors
             ]
             result = await prove_parallel(
@@ -835,7 +835,7 @@ class TestDeepSeekEndToEnd:
         #
         # Expected proof: intro n m; omega
         policy, executor = shared_lean
-        search = LedgerSearch(policy=policy, executor=executor, k=8)
+        search = LedgerSearch(policy=policy, executor=executor)
         result = await search.prove(
             "theorem add_comm_nat : ∀ n m : Nat, n + m = m + n := by",
             budget=20,

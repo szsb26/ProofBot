@@ -61,11 +61,10 @@ class TracingPolicy:
         theorem: str,
         ledger: Ledger,
         premises: list[str],
-        k: int = 8,
     ) -> DirectorResponse:
         self._emit_system_prompt_once()
         self.turn += 1
-        prompt = serialize_ledger(theorem, ledger, premises, k)
+        prompt = serialize_ledger(theorem, ledger, premises)
         self._emit(f"\n{'=' * 80}\nTURN {self.turn} — PROMPT SENT TO LLM\n{'=' * 80}")
         self._emit(prompt)
 
@@ -79,12 +78,12 @@ class TracingPolicy:
         self._emit(f"\n{'-' * 80}\nTURN {self.turn} — RAW RESPONSE FROM LLM\n{'-' * 80}")
         self._emit(raw_text)
 
-        resp = parse_director_response(raw_text, k, fallback_id)
+        resp = parse_director_response(raw_text, fallback_id)
         self._emit(f"\n{'-' * 80}\nTURN {self.turn} — PARSED DECISION\n{'-' * 80}")
         self._emit(f"chosen_state: {resp.chosen_state_id}")
         self._emit(f"abandoned: {resp.abandoned_state_ids}")
         self._emit(f"reasoning: {resp.reasoning}")
-        self._emit(f"tactics: {[c.tactic for c in resp.tactics]}")
+        self._emit(f"tactic: {resp.tactic}")
         return resp
 
     async def close(self) -> None:

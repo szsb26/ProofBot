@@ -7,6 +7,12 @@ queue — serialize_ledger turns a Ledger into prompt text, parse_director_respo
 turns the LLM's JSON reply back into a DirectorResponse, and get_next_action
 wires the two together with the same never-raises fallback contract as
 get_tactics().
+
+There is deliberately no k-candidates-per-turn mechanism: the director
+proposes exactly one tactic per call (see search/ledger_search.py's module
+docstring for why — the k-candidates design let a single turn spawn several
+permanent frontier branches, and the model often used the slots to encode
+one sequential plan rather than genuinely independent alternatives).
 """
 
 from __future__ import annotations
@@ -36,14 +42,14 @@ class TestSerializeLedger:
     def test_includes_theorem(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n + 0 = n"]))
-        text = serialize_ledger("theorem foo : n + 0 = n := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo : n + 0 = n := by", ledger, [])
         assert "theorem foo : n + 0 = n := by" in text
 
     def test_lists_open_state_with_goal(self):
         ledger = Ledger()
         state = make_proof_state(["n + 0 = n"], [[("n", "ℕ")]])
         state_id = ledger.add_state(state)
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert state_id in text
         assert "n + 0 = n" in text
         assert "n : ℕ" in text
@@ -59,7 +65,7 @@ class TestSerializeLedger:
         for i in range(25):
             ledger.add_state(make_proof_state([f"goal number {i}"], depth=i))
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "showing 20 of 25" in text
         # Depths 5-24 (the 20 deepest) are kept...
         assert "goal number 24" in text
@@ -73,7 +79,7 @@ class TestSerializeLedger:
         for i in range(20):
             ledger.add_state(make_proof_state([f"goal number {i}"], depth=i))
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         open_states_section = text.split("## Currently Open States")[1].split("##")[0]
         assert "showing" not in open_states_section
         for i in range(20):
@@ -89,13 +95,13 @@ class TestSerializeLedger:
                 # into the prompt once the state itself is off-screen.
                 ledger.record_failure(state_id, "a_uniquely_named_failed_tactic", "tactic_failed")
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "a_uniquely_named_failed_tactic" not in text
 
     def test_root_state_shows_path_as_root(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n + 0 = n"]))
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "(root)" in text
 
     def test_non_root_state_shows_tactic_path(self):
@@ -106,7 +112,7 @@ class TestSerializeLedger:
             tactic_trace=("intro n", "simp"),
         )
         ledger.add_state(state)
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "intro n, simp" in text
 
     def test_summarizes_dead_branches_with_category_counts(self):
@@ -117,7 +123,7 @@ class TestSerializeLedger:
         ledger.record_failure(state_id, "bad2", "hallucinated_lemma")
         ledger.record_failure(state_id, "bad3", "type_mismatch")
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Exhausted Attempts" in text
         assert "hallucinated_lemma×2" in text
         assert "type_mismatch×1" in text
@@ -130,7 +136,7 @@ class TestSerializeLedger:
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         ledger.record_failure(state_id, "omega", "tactic_failed")
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Tactics already tried here" in text
         assert "omega" in text
 
@@ -141,7 +147,7 @@ class TestSerializeLedger:
             ledger.record_failure(state_id, "omega", "tactic_failed")
         ledger.record_failure(state_id, "ring_nf", "tactic_failed")
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert text.count("- omega") == 1
         assert "- ring_nf" in text
 
@@ -154,7 +160,7 @@ class TestSerializeLedger:
                 state_id, f"exact SomeVeryLongLemmaName.tactic_number_{i}", "tactic_failed"
             )
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "showing 15 of 20 unique" in text
         # Most recent ones should be the ones kept
         assert "tactic_number_19" in text
@@ -173,7 +179,7 @@ class TestSerializeLedger:
                 state_id, f"exact SomeVeryLongLemmaName.tactic_number_{i}", "tactic_failed"
             )
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "- omega" in text
         # Still evicts old long tactics to keep the long-tactic budget bounded
         assert "tactic_number_0" not in text
@@ -199,7 +205,7 @@ class TestSerializeLedger:
                 "tactic_failed",
             )
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         shown = text.count("\n  - ")
         assert shown == 16, f"expected only the 16 short tactics to show, got {shown} entries"
         assert "showing 16 of 66 unique" in text
@@ -210,14 +216,14 @@ class TestSerializeLedger:
         long_tactic = "induction n with\n| zero => simp\n| succ n ih => " + ("x" * 150)
         ledger.record_failure(state_id, long_tactic, "tactic_failed")
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "\n| zero" not in text  # flattened to one line
         assert "…" in text  # truncated
 
     def test_no_dead_branch_section_when_nothing_failed(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n = n"]))
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Exhausted Attempts" not in text
 
     def test_abandoned_state_failures_excluded_from_summary(self):
@@ -227,39 +233,39 @@ class TestSerializeLedger:
         ledger.record_failure(state_id, "bad", "hallucinated_lemma")
         ledger.abandon([state_id])
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Exhausted Attempts" not in text
         assert state_id not in text
 
     def test_includes_premises_when_present(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n = n"]))
-        text = serialize_ledger("theorem foo := by", ledger, ["Nat.add_zero"], 8)
+        text = serialize_ledger("theorem foo := by", ledger, ["Nat.add_zero"])
         assert "Nat.add_zero" in text
 
     def test_omits_premises_section_when_empty(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n = n"]))
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Potentially Relevant Lemmas" not in text
 
-    def test_task_section_mentions_k(self):
+    def test_task_section_asks_for_exactly_one_tactic(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n = n"]))
-        text = serialize_ledger("theorem foo := by", ledger, [], 5)
-        assert "5 tactic candidates" in text
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "exactly one tactic" in text
 
     def test_shows_persisted_reasoning_for_open_state(self):
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         ledger.set_reasoning(state_id, "Plan to close via induction on n.")
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Plan to close via induction on n." in text
 
     def test_no_plan_line_when_no_reasoning_recorded(self):
         ledger = Ledger()
         ledger.add_state(make_proof_state(["n = n"]))
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Last stated plan" not in text
 
     def test_shows_raw_error_under_failed_tactic(self):
@@ -275,7 +281,7 @@ class TestSerializeLedger:
             "Lean error:\ntype mismatch\n  hsub\nhas type\n  s ⊆ t\nbut is expected to have type\n  s ⊂ t",
         )
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "s ⊆ t" in text
         assert "s ⊂ t" in text
 
@@ -284,7 +290,7 @@ class TestSerializeLedger:
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         ledger.record_failure(state_id, "omega", "tactic_failed")
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "→" not in text
 
     def test_pathologically_long_error_is_capped(self):
@@ -297,7 +303,7 @@ class TestSerializeLedger:
         huge_error = "Try this: " + ("x" * 5000)
         ledger.record_failure(state_id, "exact?", "tactic_failed", huge_error)
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert "[truncated]" in text
         assert len(text) < len(huge_error) + 2000
 
@@ -314,7 +320,7 @@ class TestSerializeLedger:
             state_id, "omega", "tactic_failed", "unsolved goals\n⊢ False"
         )
 
-        text = serialize_ledger("theorem foo := by", ledger, [], 8)
+        text = serialize_ledger("theorem foo := by", ledger, [])
         assert text.count("- omega") == 1
         assert "unsolved goals" in text
 
@@ -352,6 +358,15 @@ class TestDirectorSystemPromptGuidance:
     def test_prompt_warns_that_inline_by_proofs_are_all_or_nothing(self):
         assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
 
+    def test_prompt_asks_for_exactly_one_tactic(self):
+        assert "exactly ONE tactic" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_explains_semicolon_chaining(self):
+        assert "';'" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_teaches_first_combinator_for_hedging(self):
+        assert "first | tac1 | tac2" in DIRECTOR_SYSTEM_PROMPT
+
 
 # ---------------------------------------------------------------------------
 # parse_director_response
@@ -364,94 +379,95 @@ class TestParseDirectorResponse:
             "abandon": [],
             "abandon_reason": "",
             "chosen_state": "a1b2c3d4",
-            "tactics": ["simp", "ring"],
+            "tactic": "simp",
         })
-        resp = parse_director_response(raw, k=8, fallback_state_id="fallback")
+        resp = parse_director_response(raw, fallback_state_id="fallback")
         assert resp.chosen_state_id == "a1b2c3d4"
         assert resp.abandoned_state_ids == []
-        assert [c.tactic for c in resp.tactics] == ["simp", "ring"]
+        assert resp.tactic == "simp"
 
     def test_extracts_json_from_surrounding_text(self):
         raw = (
             "Sure, here's my decision:\n```json\n"
-            + json.dumps({"chosen_state": "abc", "tactics": ["omega"]})
+            + json.dumps({"chosen_state": "abc", "tactic": "omega"})
             + "\n```\nHope that helps!"
         )
-        resp = parse_director_response(raw, k=8, fallback_state_id="fallback")
+        resp = parse_director_response(raw, fallback_state_id="fallback")
         assert resp.chosen_state_id == "abc"
-        assert [c.tactic for c in resp.tactics] == ["omega"]
+        assert resp.tactic == "omega"
 
     def test_parses_abandon_list_and_reason(self):
         raw = json.dumps({
             "abandon": ["dead1", "dead2"],
             "abandon_reason": "wrong approach",
             "chosen_state": "alive",
-            "tactics": ["tauto"],
+            "tactic": "tauto",
         })
-        resp = parse_director_response(raw, k=8, fallback_state_id="fallback")
+        resp = parse_director_response(raw, fallback_state_id="fallback")
         assert resp.abandoned_state_ids == ["dead1", "dead2"]
 
     def test_falls_back_on_malformed_json(self):
-        resp = parse_director_response("not json at all", k=8, fallback_state_id="fb")
+        resp = parse_director_response("not json at all", fallback_state_id="fb")
         assert resp.chosen_state_id == "fb"
         assert resp.abandoned_state_ids == []
-        assert [c.tactic for c in resp.tactics] == ["simp"]
+        assert resp.tactic == "simp"
 
     def test_falls_back_when_chosen_state_missing(self):
-        raw = json.dumps({"tactics": ["simp", "ring"]})
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        raw = json.dumps({"tactic": "simp"})
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.chosen_state_id == "fb"
 
-    def test_falls_back_tactics_to_simp_when_tactics_empty(self):
-        raw = json.dumps({"chosen_state": "abc", "tactics": []})
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
-        assert [c.tactic for c in resp.tactics] == ["simp"]
+    def test_falls_back_tactic_to_simp_when_tactic_missing(self):
+        raw = json.dumps({"chosen_state": "abc"})
+        resp = parse_director_response(raw, fallback_state_id="fb")
+        assert resp.tactic == "simp"
 
-    def test_truncates_tactics_to_k(self):
-        raw = json.dumps({
-            "chosen_state": "abc",
-            "tactics": ["t1", "t2", "t3", "t4", "t5"],
-        })
-        resp = parse_director_response(raw, k=3, fallback_state_id="fb")
-        assert len(resp.tactics) == 3
+    def test_falls_back_tactic_to_simp_when_tactic_blank(self):
+        raw = json.dumps({"chosen_state": "abc", "tactic": ""})
+        resp = parse_director_response(raw, fallback_state_id="fb")
+        assert resp.tactic == "simp"
+
+    def test_allows_semicolon_chained_tactic(self):
+        raw = json.dumps({"chosen_state": "abc", "tactic": "intro n; simp; ring"})
+        resp = parse_director_response(raw, fallback_state_id="fb")
+        assert resp.tactic == "intro n; simp; ring"
 
     def test_abandon_list_filters_non_strings(self):
         raw = json.dumps({
             "abandon": ["ok", 123, None],
             "chosen_state": "abc",
-            "tactics": ["simp"],
+            "tactic": "simp",
         })
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.abandoned_state_ids == ["ok"]
 
     def test_parses_reasoning_field(self):
         raw = json.dumps({
             "reasoning": "Try induction on n since the goal is universally quantified.",
             "chosen_state": "abc",
-            "tactics": ["induction n"],
+            "tactic": "induction n",
         })
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.reasoning == "Try induction on n since the goal is universally quantified."
 
     def test_reasoning_defaults_to_empty_string_when_missing(self):
-        raw = json.dumps({"chosen_state": "abc", "tactics": ["simp"]})
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        raw = json.dumps({"chosen_state": "abc", "tactic": "simp"})
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.reasoning == ""
 
     def test_reasoning_defaults_to_empty_string_when_not_a_string(self):
-        raw = json.dumps({"chosen_state": "abc", "tactics": ["simp"], "reasoning": 42})
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        raw = json.dumps({"chosen_state": "abc", "tactic": "simp", "reasoning": 42})
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.reasoning == ""
 
     def test_fallback_response_has_empty_reasoning(self):
-        resp = parse_director_response("not json at all", k=8, fallback_state_id="fb")
+        resp = parse_director_response("not json at all", fallback_state_id="fb")
         assert resp.reasoning == ""
 
-    def test_log_probs_are_descending(self):
-        raw = json.dumps({"chosen_state": "abc", "tactics": ["t1", "t2", "t3"]})
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
-        log_probs = [c.log_prob for c in resp.tactics]
-        assert log_probs == sorted(log_probs, reverse=True)
+    def test_tactic_field_not_a_string_falls_back_to_simp(self):
+        raw = json.dumps({"chosen_state": "abc", "tactic": ["simp", "ring"]})
+        resp = parse_director_response(raw, fallback_state_id="fb")
+        assert resp.tactic == "simp"
 
 
 # ---------------------------------------------------------------------------
@@ -460,11 +476,10 @@ class TestParseDirectorResponse:
 # A live eval run of imo1968_tetrahedron showed the director's raw response
 # comes back as broken JSON on a meaningful fraction of turns — sometimes a
 # genuine token-budget cutoff mid-reasoning, sometimes the model just
-# forgets the final '}', sometimes it tacks an extra element on after the
-# tactics array already closed. Before this recovery path existed, ANY of
-# these discarded the whole response (including correct, on-strategy
-# reasoning) down to an empty-reasoning, single-["simp"] default. These
-# tests pin the recovered behavior for each shape actually observed.
+# forgets the final '}'. Before this recovery path existed, ANY of these
+# discarded the whole response (including correct, on-strategy reasoning)
+# down to an empty-reasoning, "simp" default. These tests pin the recovered
+# behavior for each shape actually observed.
 # ---------------------------------------------------------------------------
 
 class TestParseDirectorResponseRecovery:
@@ -473,61 +488,66 @@ class TestParseDirectorResponseRecovery:
         raw = (
             '{"reasoning": "Use wlog on the maximal edge to force a '
             'contradiction.", "abandon": [], "abandon_reason": "", '
-            '"chosen_state": "36793c2b", "tactics": ["nlinarith", "aesop"]'
+            '"chosen_state": "36793c2b", "tactic": "nlinarith"'
         )
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.chosen_state_id == "36793c2b"
         assert resp.reasoning == "Use wlog on the maximal edge to force a contradiction."
-        assert [c.tactic for c in resp.tactics] == ["nlinarith", "aesop"]
+        assert resp.tactic == "nlinarith"
 
-    def test_recovers_tactics_array_containing_brackets(self):
+    def test_recovers_tactic_containing_brackets(self):
         # A tactic like "nlinarith [h1, h2]" has a ']' inside the string —
-        # a naive text.find("]") would stop there instead of at the array's
-        # real closing bracket.
+        # a naive text.find("]") would stop there instead of at the real
+        # end of the JSON value.
         raw = (
             '{"reasoning": "close it", "chosen_state": "s1", '
-            '"tactics": ["nlinarith [h1, h2]", "simp"]'
+            '"tactic": "nlinarith [h1, h2]"'
         )
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
-        assert [c.tactic for c in resp.tactics] == ["nlinarith [h1, h2]", "simp"]
+        resp = parse_director_response(raw, fallback_state_id="fb")
+        assert resp.tactic == "nlinarith [h1, h2]"
 
-    def test_recovers_when_extra_element_appended_after_array_closes(self):
+    def test_recovers_when_trailing_content_makes_json_invalid(self):
+        # A stray unquoted token after an otherwise-intact object breaks
+        # strict json.loads, but every real field before it is still
+        # recoverable via regex.
         raw = (
             '{"reasoning": "case split", "chosen_state": "c1", '
-            '"tactics": ["linarith", "omega"],"stray tactic outside the array"]}'
+            '"tactic": "linarith", "note": unquoted_text}'
         )
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.chosen_state_id == "c1"
         assert resp.reasoning == "case split"
-        assert [c.tactic for c in resp.tactics] == ["linarith", "omega"]
+        assert resp.tactic == "linarith"
 
     def test_recovers_partial_reasoning_when_cut_off_mid_string(self):
         raw = '{"reasoning": "The key insight is to use wlog on the maximal edge and then'
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
+        resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.reasoning == (
             "The key insight is to use wlog on the maximal edge and then"
         )
-        # No tactics ever came through — still falls back to simp for those.
-        assert [c.tactic for c in resp.tactics] == ["simp"]
+        # No tactic ever came through — still falls back to simp.
+        assert resp.tactic == "simp"
         assert resp.chosen_state_id == "fb"
 
-    def test_recovers_only_complete_tactics_when_array_cut_off_mid_element(self):
+    def test_recovers_tactic_cut_off_mid_string_falls_back_to_simp(self):
+        """A tactic string with no closing quote (cut off mid-write by the
+        token budget) has no complete value to recover — falls back to
+        simp rather than yielding a truncated, likely-invalid tactic."""
         raw = (
             '{"reasoning": "ok", "chosen_state": "s1", '
-            '"tactics": ["linarith", "have h : AB < AC + AD := by nlinari'
+            '"tactic": "have h : AB < AC + AD := by nlinari'
         )
-        resp = parse_director_response(raw, k=8, fallback_state_id="fb")
-        assert [c.tactic for c in resp.tactics] == ["linarith"]
+        resp = parse_director_response(raw, fallback_state_id="fb")
+        assert resp.tactic == "simp"
 
     def test_completely_unparseable_text_still_falls_back_cleanly(self):
         resp = parse_director_response(
             "The model wrote prose instead of JSON this time.",
-            k=8,
             fallback_state_id="fb",
         )
         assert resp.chosen_state_id == "fb"
         assert resp.reasoning == ""
-        assert [c.tactic for c in resp.tactics] == ["simp"]
+        assert resp.tactic == "simp"
 
 
 # ---------------------------------------------------------------------------
@@ -563,13 +583,13 @@ class TestGetNextAction:
     async def test_returns_parsed_director_response(self):
         policy, client, patcher = self._make_policy()
         try:
-            raw = json.dumps({"chosen_state": "will-be-overridden", "tactics": ["simp"]})
+            raw = json.dumps({"chosen_state": "will-be-overridden", "tactic": "simp"})
             client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
             ledger, state_id = self._ledger_with_one_state()
 
-            resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            resp = await policy.get_next_action("theorem foo := by", ledger, [])
             assert isinstance(resp, DirectorResponse)
-            assert [c.tactic for c in resp.tactics] == ["simp"]
+            assert resp.tactic == "simp"
         finally:
             patcher.stop()
 
@@ -579,12 +599,12 @@ class TestGetNextAction:
             raw = json.dumps({
                 "reasoning": "Close the reflexive goal directly.",
                 "chosen_state": "will-be-overridden",
-                "tactics": ["rfl"],
+                "tactic": "rfl",
             })
             client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
             ledger, state_id = self._ledger_with_one_state()
 
-            resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            resp = await policy.get_next_action("theorem foo := by", ledger, [])
             assert resp.reasoning == "Close the reflexive goal directly."
 
             # The caller (LedgerSearch) is responsible for persisting this into
@@ -597,11 +617,11 @@ class TestGetNextAction:
     async def test_uses_director_system_prompt(self):
         policy, client, patcher = self._make_policy()
         try:
-            raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+            raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
             client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
             ledger, _ = self._ledger_with_one_state()
 
-            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            await policy.get_next_action("theorem foo := by", ledger, [])
 
             _, kwargs = client.chat.completions.create.call_args
             assert kwargs["messages"][0]["content"] == DIRECTOR_SYSTEM_PROMPT
@@ -616,13 +636,13 @@ class TestGetNextAction:
         MockClient.return_value = mock_instance
         policy = DeepSeekPolicy(api_key="test-key", max_tokens=256, director_max_tokens=999)
         try:
-            raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+            raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
             mock_instance.chat.completions.create = AsyncMock(
                 return_value=_make_api_response(raw)
             )
             ledger, _ = self._ledger_with_one_state()
 
-            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            await policy.get_next_action("theorem foo := by", ledger, [])
 
             _, kwargs = mock_instance.chat.completions.create.call_args
             assert kwargs["max_tokens"] == 999
@@ -632,11 +652,11 @@ class TestGetNextAction:
     async def test_thinking_disabled_by_default_for_director_call(self):
         policy, client, patcher = self._make_policy()
         try:
-            raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+            raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
             client.chat.completions.create = AsyncMock(return_value=_make_api_response(raw))
             ledger, _ = self._ledger_with_one_state()
 
-            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            await policy.get_next_action("theorem foo := by", ledger, [])
 
             _, kwargs = client.chat.completions.create.call_args
             assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
@@ -649,10 +669,10 @@ class TestGetNextAction:
             client.chat.completions.create = AsyncMock(side_effect=Exception("network error"))
             ledger, state_id = self._ledger_with_one_state()
 
-            resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            resp = await policy.get_next_action("theorem foo := by", ledger, [])
 
             assert resp.chosen_state_id == state_id
             assert resp.abandoned_state_ids == []
-            assert [c.tactic for c in resp.tactics] == ["simp"]
+            assert resp.tactic == "simp"
         finally:
             patcher.stop()

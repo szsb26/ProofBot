@@ -44,23 +44,23 @@ def _ledger_with_one_state() -> tuple[Ledger, str]:
 class TestTracingPolicy:
 
     async def test_returns_parsed_director_response_unchanged(self):
-        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"], "reasoning": "close it"})
+        raw = json.dumps({"chosen_state": "x", "tactic": "simp", "reasoning": "close it"})
         inner = FakeBaseLLMPolicy([raw])
         policy = TracingPolicy(inner)
         ledger, state_id = _ledger_with_one_state()
 
-        resp = await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+        resp = await policy.get_next_action("theorem foo := by", ledger, [])
 
-        assert [c.tactic for c in resp.tactics] == ["simp"]
+        assert resp.tactic == "simp"
         assert resp.reasoning == "close it"
 
     async def test_render_includes_prompt_and_raw_response(self):
-        raw = json.dumps({"chosen_state": "x", "tactics": ["omega"]})
+        raw = json.dumps({"chosen_state": "x", "tactic": "omega"})
         inner = FakeBaseLLMPolicy([raw])
         policy = TracingPolicy(inner)
         ledger, state_id = _ledger_with_one_state()
 
-        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+        await policy.get_next_action("theorem foo := by", ledger, [])
         text = policy.render()
 
         assert "PROMPT SENT TO LLM" in text
@@ -71,42 +71,42 @@ class TestTracingPolicy:
         assert "omega" in text
 
     async def test_turn_counter_increments_across_calls(self):
-        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
         inner = FakeBaseLLMPolicy([raw, raw])
         policy = TracingPolicy(inner)
         ledger, state_id = _ledger_with_one_state()
 
-        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
-        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+        await policy.get_next_action("theorem foo := by", ledger, [])
+        await policy.get_next_action("theorem foo := by", ledger, [])
 
         assert policy.turn == 2
         assert "TURN 1" in policy.render()
         assert "TURN 2" in policy.render()
 
     async def test_close_delegates_to_inner_policy(self):
-        inner = FakeBaseLLMPolicy([json.dumps({"chosen_state": "x", "tactics": ["simp"]})])
+        inner = FakeBaseLLMPolicy([json.dumps({"chosen_state": "x", "tactic": "simp"})])
         policy = TracingPolicy(inner)
         await policy.close()
         assert inner.closed
 
     async def test_verbose_mode_prints_live(self, capsys):
-        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
         inner = FakeBaseLLMPolicy([raw])
         policy = TracingPolicy(inner, verbose=True)
         ledger, state_id = _ledger_with_one_state()
 
-        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+        await policy.get_next_action("theorem foo := by", ledger, [])
 
         captured = capsys.readouterr()
         assert "PROMPT SENT TO LLM" in captured.out
 
     async def test_non_verbose_mode_does_not_print(self, capsys):
-        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
         inner = FakeBaseLLMPolicy([raw])
         policy = TracingPolicy(inner, verbose=False)
         ledger, state_id = _ledger_with_one_state()
 
-        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+        await policy.get_next_action("theorem foo := by", ledger, [])
 
         captured = capsys.readouterr()
         assert captured.out == ""
@@ -129,33 +129,33 @@ class TestTracingPolicyRecordsSystemPrompt:
     async def test_system_prompt_appears_in_the_trace(self):
         from policy.base import DIRECTOR_SYSTEM_PROMPT
 
-        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
         policy = TracingPolicy(FakeBaseLLMPolicy([raw]))
         ledger, _ = _ledger_with_one_state()
 
-        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+        await policy.get_next_action("theorem foo := by", ledger, [])
 
         assert DIRECTOR_SYSTEM_PROMPT in policy.render()
 
     async def test_system_prompt_emitted_once_not_per_turn(self):
         """It is identical every turn; emitting it 150 times would bloat the
         trace for no information gain."""
-        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
         policy = TracingPolicy(FakeBaseLLMPolicy([raw, raw, raw]))
         ledger, _ = _ledger_with_one_state()
 
         for _ in range(3):
-            await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+            await policy.get_next_action("theorem foo := by", ledger, [])
 
         assert policy.render().count("SYSTEM PROMPT (identical for every turn below)") == 1
         assert policy.turn == 3
 
     async def test_system_prompt_precedes_the_first_turn(self):
-        raw = json.dumps({"chosen_state": "x", "tactics": ["simp"]})
+        raw = json.dumps({"chosen_state": "x", "tactic": "simp"})
         policy = TracingPolicy(FakeBaseLLMPolicy([raw]))
         ledger, _ = _ledger_with_one_state()
 
-        await policy.get_next_action("theorem foo := by", ledger, [], k=4)
+        await policy.get_next_action("theorem foo := by", ledger, [])
 
         text = policy.render()
         assert text.index("SYSTEM PROMPT") < text.index("TURN 1 — PROMPT SENT TO LLM")

@@ -55,9 +55,14 @@ class AnthropicPolicy(BaseLLMPolicy):
         max_tokens: int | None = None,
         enable_thinking: bool = False,
     ) -> str:
-        # enable_thinking is not yet wired up for Claude (would use the
-        # `thinking` extended-thinking param) — accepted for interface
-        # parity with DeepSeekPolicy, currently a no-op here.
+        # The newest Claude models (e.g. Sonnet 5) think by default even
+        # when `thinking` is omitted entirely — omitting it is NOT the same
+        # as disabling it. Without an explicit `disabled`, a call with a
+        # modest max_tokens budget can have the whole thing consumed by
+        # invisible thinking, leaving zero tokens for the actual text and
+        # returning "" (confirmed live against a real call). `disabled`/
+        # `adaptive` are both confirmed accepted by the API for this model
+        # family — pass one explicitly rather than omitting.
         #
         # system_prompt is identical on every single director call — every
         # turn, every trial, every problem — so it's marked cacheable. The
@@ -77,12 +82,11 @@ class AnthropicPolicy(BaseLLMPolicy):
                 },
             ],
             messages=[{"role": "user", "content": user_prompt}],
+            thinking={"type": "adaptive"} if enable_thinking else {"type": "disabled"},
         )
-        # Some models (e.g. the newest Claude generation) think by default
-        # regardless of the `thinking` param, so content[0] is often a
-        # ThinkingBlock, not text — content[0].text then raises
-        # AttributeError. Find the actual text block(s) instead of
-        # assuming position 0.
+        # Even with thinking disabled, find text block(s) by type rather
+        # than assuming content[0] — cheap insurance against relying on
+        # positional assumptions that already broke once.
         return "".join(block.text for block in message.content if block.type == "text")
 
     async def close(self) -> None:
