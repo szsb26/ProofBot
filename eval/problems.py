@@ -219,12 +219,22 @@ PROBLEMS: list[EvalProblem] = [
     # Every score leader in a tournament is a champion (king): for every player p
     # that beats c, there exists a player q that c beat and q beat p.
     # The proof uses a pigeonhole argument on win-set cardinalities.
+    #
+    # hirr (irreflexivity) is REQUIRED, not decorative: htour only constrains
+    # distinct pairs (a ≠ b), so without hirr nothing rules out `beats x x` and
+    # the statement is actually FALSE. Lean-verified counterexample via `decide`:
+    # α := Bool, beats a b := (b = false), c := false, p := true — htour and hmax
+    # both hold (every win-set is {false}, so all cardinalities are equal), yet no
+    # q satisfies `beats c q ∧ beats q p`. Three separate search runs burned their
+    # full budget rediscovering this hole (repeatedly deriving `beats c c` and
+    # failing to contradict it) before it was tracked down.
     EvalProblem(
         name="tournament_champion",
         statement=(
             "theorem eval_tournament_champion "
             "{α : Type*} [Fintype α] [DecidableEq α] "
             "(beats : α → α → Prop) [DecidableRel beats] "
+            "(hirr : ∀ a : α, ¬ beats a a) "
             "(htour : ∀ a b : α, a ≠ b → (beats a b ↔ ¬ beats b a)) "
             "(c : α) "
             "(hmax : ∀ x : α, (Finset.univ.filter (fun y => beats x y)).card ≤ "
