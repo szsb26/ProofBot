@@ -30,7 +30,7 @@ import json
 import os
 import shutil
 
-from policy.base import BaseLLMPolicy, SYSTEM_PROMPT
+from policy.base import BaseLLMPolicy, DIRECTOR_SYSTEM_PROMPT
 
 # Every built-in tool, disabled: we want a plain completion, not an agent
 # loop that might decide to go read files. Also the biggest single lever on
@@ -116,7 +116,7 @@ class ClaudeCLIPolicy(BaseLLMPolicy):
     async def _call_api(
         self,
         user_prompt: str,
-        system_prompt: str = SYSTEM_PROMPT,
+        system_prompt: str = DIRECTOR_SYSTEM_PROMPT,
         max_tokens: int | None = None,
         enable_thinking: bool = False,
     ) -> str:

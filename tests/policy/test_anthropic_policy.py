@@ -14,97 +14,16 @@ Run including integration:
 
 from __future__ import annotations
 
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from core.policy import TacticCandidate
-from core.proof_state import make_proof_state, ProofState
+from core.ledger import Ledger
+from core.proof_state import make_proof_state
 from policy.anthropic import AnthropicPolicy
-from policy.base import parse_tactics as _parse_tactics, build_user_prompt as _build_user_prompt
-
-
-# ---------------------------------------------------------------------------
-# _parse_tactics (pure function, no mocking needed)
-# ---------------------------------------------------------------------------
-
-class TestParseTactics:
-
-    def test_plain_lines_returned_as_is(self):
-        """Clean tactic lines should come back unchanged."""
-        text = "simp\nring\nomega"
-        assert _parse_tactics(text, 3) == ["simp", "ring", "omega"]
-
-    def test_numbered_prefix_stripped(self):
-        """'1. tactic' and '2) tactic' prefixes should be removed."""
-        text = "1. simp\n2) ring\n3. omega"
-        result = _parse_tactics(text, 3)
-        assert result == ["simp", "ring", "omega"]
-
-    def test_bullet_prefix_stripped(self):
-        """'- tactic' bullet prefix should be removed."""
-        text = "- simp\n- ring"
-        assert _parse_tactics(text, 2) == ["simp", "ring"]
-
-    def test_backtick_stripped(self):
-        """`simp` with surrounding backticks should be cleaned."""
-        text = "`simp`\n`ring`"
-        assert _parse_tactics(text, 2) == ["simp", "ring"]
-
-    def test_blank_lines_skipped(self):
-        text = "simp\n\n\nring"
-        assert _parse_tactics(text, 2) == ["simp", "ring"]
-
-    def test_duplicates_removed_preserving_order(self):
-        """If Claude repeats a tactic, keep only the first occurrence."""
-        text = "simp\nring\nsimp\nomega"
-        result = _parse_tactics(text, 4)
-        assert result == ["simp", "ring", "omega"]
-
-    def test_truncated_to_k(self):
-        text = "simp\nring\nomega\nlinarith\ndecide"
-        result = _parse_tactics(text, 3)
-        assert len(result) == 3
-        assert result == ["simp", "ring", "omega"]
-
-    def test_empty_text_falls_back_to_simp(self):
-        assert _parse_tactics("", 4) == ["simp"]
-
-    def test_whitespace_only_falls_back_to_simp(self):
-        assert _parse_tactics("   \n   ", 4) == ["simp"]
-
-    def test_intro_with_variable_name(self):
-        text = "intro n\nsimp"
-        assert _parse_tactics(text, 2) == ["intro n", "simp"]
-
-
-# ---------------------------------------------------------------------------
-# _build_user_prompt (pure function)
-# ---------------------------------------------------------------------------
-
-class TestBuildUserPrompt:
-
-    def test_contains_serialized_state(self):
-        state = make_proof_state(["n + 0 = n"])
-        prompt = _build_user_prompt(state, [], k=4)
-        assert "n + 0 = n" in prompt
-
-    def test_contains_premises_when_provided(self):
-        state = make_proof_state(["n + 0 = n"])
-        prompt = _build_user_prompt(state, ["Nat.add_zero", "Nat.add_comm"], k=4)
-        assert "Nat.add_zero" in prompt
-        assert "Nat.add_comm" in prompt
-
-    def test_no_premises_section_when_empty(self):
-        state = make_proof_state(["n + 0 = n"])
-        prompt = _build_user_prompt(state, [], k=4)
-        assert "Relevant Lemmas" not in prompt
-
-    def test_k_mentioned_in_prompt(self):
-        state = make_proof_state(["P"])
-        prompt = _build_user_prompt(state, [], k=6)
-        assert "6" in prompt
+from policy.base import DIRECTOR_SYSTEM_PROMPT, DirectorResponse
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +82,16 @@ def _make_thinking_then_text_response(thinking: str, text: str) -> MagicMock:
     return response
 
 
+def _director_json(tactic: str = "simp", chosen: str = "x") -> str:
+    return json.dumps({"chosen_state": chosen, "tactic": tactic, "reasoning": "because"})
+
+
+def _ledger_with_one_state() -> tuple[Ledger, str]:
+    ledger = Ledger()
+    state_id = ledger.add_state(make_proof_state(["n + 0 = n"]))
+    return ledger, state_id
+
+
 @pytest.fixture
 def mock_policy():
     """AnthropicPolicy with the AsyncAnthropic client replaced by a mock."""
@@ -180,21 +109,20 @@ def mock_policy():
         yield policy, mock_instance
 
 
-class TestAnthropicPolicyGetTactics:
+class TestAnthropicPolicyGetNextAction:
 
-    async def test_returns_tactic_candidates(self, mock_policy):
-        """Normal response should be parsed into TacticCandidate objects."""
+    async def test_returns_parsed_director_response(self, mock_policy):
         policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp\nring\nomega"))
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_api_response(_director_json(tactic="intro n"))
+        )
+        ledger, _ = _ledger_with_one_state()
 
-        state = make_proof_state(["n + 0 = n"])
-        results = await policy.get_tactics(state, [], k=3)
+        resp = await policy.get_next_action("theorem foo := by", ledger, [])
 
-        assert len(results) == 3
-        assert all(isinstance(r, TacticCandidate) for r in results)
-        assert results[0].tactic == "simp"
-        assert results[1].tactic == "ring"
-        assert results[2].tactic == "omega"
+        assert isinstance(resp, DirectorResponse)
+        assert resp.tactic == "intro n"
+        assert resp.reasoning == "because"
 
     async def test_thinking_block_before_text_is_skipped_not_crashed_on(self, mock_policy):
         """Regression test: the newest Claude generation thinks by default
@@ -203,45 +131,27 @@ class TestAnthropicPolicyGetTactics:
         raises AttributeError. The real answer must still be found in a
         later text block instead of crashing."""
         policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_thinking_then_text_response(
-            thinking="Let me work through this proof step by step...",
-            text="simp\nring\nomega",
-        ))
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_thinking_then_text_response(
+                thinking="Let me work through this proof step by step...",
+                text=_director_json(tactic="omega"),
+            )
+        )
+        ledger, _ = _ledger_with_one_state()
 
-        state = make_proof_state(["n + 0 = n"])
-        results = await policy.get_tactics(state, [], k=3)
-
-        assert len(results) == 3
-        assert results[0].tactic == "simp"
-
-    async def test_log_probs_are_descending(self, mock_policy):
-        """First candidate should have the highest log_prob (closest to 0)."""
-        policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp\nring\nomega"))
-
-        state = make_proof_state(["n + 0 = n"])
-        results = await policy.get_tactics(state, [], k=3)
-
-        log_probs = [r.log_prob for r in results]
-        assert log_probs == sorted(log_probs, reverse=True)
-
-    async def test_respects_k_limit(self, mock_policy):
-        """Should return at most k candidates even if Claude outputs more."""
-        policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_api_response(
-            "simp\nring\nomega\nlinarith\ndecide\nrfl\nnorm_num\ntauto"
-        ))
-        state = make_proof_state(["P"])
-        results = await policy.get_tactics(state, [], k=4)
-        assert len(results) == 4
+        resp = await policy.get_next_action("theorem foo := by", ledger, [])
+        assert resp.tactic == "omega"
 
     async def test_premises_passed_to_api(self, mock_policy):
-        """Premises should appear in the message sent to the API."""
         policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp"))
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_api_response(_director_json())
+        )
+        ledger, _ = _ledger_with_one_state()
 
-        state = make_proof_state(["n + 0 = n"])
-        await policy.get_tactics(state, ["Nat.add_zero", "Nat.add_comm"], k=1)
+        await policy.get_next_action(
+            "theorem foo := by", ledger, ["Nat.add_zero", "Nat.add_comm"]
+        )
 
         _, kwargs = client.messages.stream.call_args
         user_content = kwargs["messages"][0]["content"]
@@ -255,53 +165,69 @@ class TestAnthropicPolicyGetTactics:
         after the first pay the cheaper cache-read rate for it instead of
         full input price."""
         policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp"))
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_api_response(_director_json())
+        )
+        ledger, _ = _ledger_with_one_state()
 
-        state = make_proof_state(["n + 0 = n"])
-        await policy.get_tactics(state, [], k=1)
+        await policy.get_next_action("theorem foo := by", ledger, [])
 
         _, kwargs = client.messages.stream.call_args
         system = kwargs["system"]
         assert isinstance(system, list)
         assert system[0]["cache_control"] == {"type": "ephemeral"}
-        assert system[0]["text"]  # the actual prompt text is still present
+        assert system[0]["text"] == DIRECTOR_SYSTEM_PROMPT
 
-    async def test_api_failure_returns_simp_fallback(self, mock_policy):
-        """If the API raises, the policy should return [simp] rather than crashing."""
+    async def test_thinking_is_explicitly_disabled_by_default(self, mock_policy):
+        """Omitting the `thinking` param is NOT the same as disabling it on
+        the newest Claude models — they think by default, and a modest
+        max_tokens can then be consumed entirely by hidden reasoning,
+        returning empty text (confirmed live). So it must be passed
+        explicitly."""
+        policy, client = mock_policy
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_api_response(_director_json())
+        )
+        ledger, _ = _ledger_with_one_state()
+
+        await policy.get_next_action("theorem foo := by", ledger, [])
+
+        _, kwargs = client.messages.stream.call_args
+        assert kwargs["thinking"] == {"type": "disabled"}
+
+    async def test_thinking_enabled_uses_adaptive(self, mock_policy):
+        policy, client = mock_policy
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_api_response(_director_json())
+        )
+        await policy._call_api("prompt", enable_thinking=True)
+
+        _, kwargs = client.messages.stream.call_args
+        assert kwargs["thinking"] == {"type": "adaptive"}
+
+    async def test_api_failure_falls_back_instead_of_raising(self, mock_policy):
+        """A single bad turn must not end the search."""
         policy, client = mock_policy
         client.messages.stream.side_effect = Exception("network error")
+        ledger, state_id = _ledger_with_one_state()
 
-        state = make_proof_state(["n + 0 = n"])
-        results = await policy.get_tactics(state, [], k=4)
+        resp = await policy.get_next_action("theorem foo := by", ledger, [])
 
-        assert len(results) == 1
-        assert results[0].tactic == "simp"
+        assert resp.chosen_state_id == state_id
+        assert resp.tactic == "simp"
+        assert resp.abandoned_state_ids == []
 
     async def test_empty_response_falls_back_to_simp(self, mock_policy):
-        """An empty API response should not crash — fall back to simp."""
         policy, client = mock_policy
         client.messages.stream.return_value = _FakeStreamManager(_make_api_response(""))
+        ledger, state_id = _ledger_with_one_state()
 
-        state = make_proof_state(["P"])
-        results = await policy.get_tactics(state, [], k=4)
+        resp = await policy.get_next_action("theorem foo := by", ledger, [])
 
-        assert results[0].tactic == "simp"
-
-    async def test_numbered_response_parsed_correctly(self, mock_policy):
-        """Claude sometimes numbers its output — numbering should be stripped."""
-        policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_api_response(
-            "1. intro n\n2. simp\n3. omega"
-        ))
-        state = make_proof_state(["∀ n : ℕ, n + 0 = n"])
-        results = await policy.get_tactics(state, [], k=3)
-
-        assert results[0].tactic == "intro n"
-        assert results[1].tactic == "simp"
-        assert results[2].tactic == "omega"
+        assert resp.chosen_state_id == state_id
+        assert resp.tactic == "simp"
 
     async def test_close_delegates_to_client(self, mock_policy):
-        """close() should call the underlying client's close method."""
         policy, client = mock_policy
         await policy.close()
         client.close.assert_called_once()
@@ -323,17 +249,18 @@ class TestAnthropicPolicyGetTactics:
 )
 class TestAnthropicPolicyIntegration:
 
-    async def test_real_api_call_returns_tactics(self):
+    async def test_real_api_call_returns_a_usable_decision(self):
         """Makes a real API call and verifies the response is parseable."""
-
         # claude haiku is one of the cheaper models - we dont need a powerful model for these
         # integration tests.
         policy = AnthropicPolicy(model="claude-haiku-4-5-20251001")
-        state = make_proof_state(["n + 0 = n"], [[("n", "ℕ")]])
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n + 0 = n"], [[("n", "ℕ")]]))
 
-        results = await policy.get_tactics(state, premises=["Nat.add_zero"], k=4)
+        resp = await policy.get_next_action(
+            "theorem foo (n : ℕ) : n + 0 = n := by", ledger, ["Nat.add_zero"]
+        )
 
-        assert len(results) >= 1
-        assert all(isinstance(r, TacticCandidate) for r in results)
-        assert all(isinstance(r.tactic, str) and r.tactic for r in results)
+        assert isinstance(resp, DirectorResponse)
+        assert isinstance(resp.tactic, str) and resp.tactic
         await policy.close()

@@ -2,40 +2,13 @@
 Unit tests for core/policy.py
 """
 
-import pytest
 import asyncio
-from core.policy import TacticCandidate, PolicyModel
+
+from core.ledger import Ledger
+from core.policy import PolicyModel
+from core.proof_state import make_proof_state
+from policy.base import DirectorResponse
 from policy.mock import MockPolicy
-
-
-class TestTacticCandidate:
-
-    def test_basic_construction(self):
-        t = TacticCandidate(tactic="simp", log_prob=-0.5)
-        assert t.tactic == "simp"
-        assert t.log_prob == -0.5
-
-    def test_default_log_prob(self):
-        t = TacticCandidate(tactic="ring")
-        assert t.log_prob == 0.0
-
-    def test_prob_property(self):
-        import math
-        t = TacticCandidate(tactic="simp", log_prob=0.0)
-        assert abs(t.prob - 1.0) < 1e-9
-
-        t2 = TacticCandidate(tactic="simp", log_prob=-1.0)
-        assert abs(t2.prob - math.exp(-1.0)) < 1e-9
-
-    def test_immutable(self):
-        t = TacticCandidate(tactic="simp")
-        with pytest.raises(Exception):
-            t.tactic = "ring"
-
-    def test_repr(self):
-        t = TacticCandidate(tactic="simp", log_prob=-1.5)
-        assert "simp" in repr(t)
-        assert "log_prob" in repr(t)
 
 
 class TestMockPolicy:
@@ -44,38 +17,54 @@ class TestMockPolicy:
         policy = MockPolicy()
         assert isinstance(policy, PolicyModel)
 
-    def test_returns_candidates(self):
+    def test_returns_a_director_response(self):
         policy = MockPolicy()
-        from core.proof_state import make_proof_state
-        state = make_proof_state(["n + 0 = n"])
-        candidates = asyncio.run(policy.get_tactics(state, premises=[], k=4))
-        assert len(candidates) == 4
-        assert all(isinstance(c, TacticCandidate) for c in candidates)
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n + 0 = n"]))
 
-    def test_respects_k(self):
+        resp = asyncio.run(policy.get_next_action("theorem foo := by", ledger, []))
+
+        assert isinstance(resp, DirectorResponse)
+        assert resp.chosen_state_id == state_id
+        assert resp.tactic
+        assert resp.abandoned_state_ids == []
+
+    def test_cycles_through_tactics_one_per_call(self):
+        """One tactic per turn, so the list is consumed across calls rather
+        than returned all at once."""
+        policy = MockPolicy(tactics=["intro n", "simp", "ring"])
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n + 0 = n"]))
+
+        seen = [
+            asyncio.run(policy.get_next_action("theorem foo := by", ledger, [])).tactic
+            for _ in range(3)
+        ]
+        assert seen == ["intro n", "simp", "ring"]
+
+    def test_wraps_around_when_the_list_is_exhausted(self):
+        policy = MockPolicy(tactics=["simp", "ring"])
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n + 0 = n"]))
+
+        seen = [
+            asyncio.run(policy.get_next_action("theorem foo := by", ledger, [])).tactic
+            for _ in range(4)
+        ]
+        assert seen == ["simp", "ring", "simp", "ring"]
+
+    def test_chooses_the_most_recently_added_state(self):
+        """Picking the newest state — rather than the first — lets a
+        fixed-tactic search advance depth-first instead of re-trying an
+        already-succeeded tactic at the root forever, since states are never
+        auto-evicted from the frontier on success."""
         policy = MockPolicy()
-        from core.proof_state import make_proof_state
-        state = make_proof_state(["n + 0 = n"])
-        for k in [1, 3, 5]:
-            candidates = asyncio.run(policy.get_tactics(state, premises=[], k=k))
-            assert len(candidates) == k
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["first goal"]))
+        newest = ledger.add_state(make_proof_state(["second goal"]))
 
-    def test_sorted_by_log_prob_descending(self):
-        policy = MockPolicy()
-        from core.proof_state import make_proof_state
-        state = make_proof_state(["n + 0 = n"])
-        candidates = asyncio.run(policy.get_tactics(state, premises=[], k=4))
-        probs = [c.log_prob for c in candidates]
-        assert probs == sorted(probs, reverse=True)
-
-    def test_custom_tactics(self):
-        policy = MockPolicy(tactics=["exact h", "assumption"])
-        from core.proof_state import make_proof_state
-        state = make_proof_state(["n + 0 = n"])
-        candidates = asyncio.run(policy.get_tactics(state, premises=[], k=2))
-        tactics = [c.tactic for c in candidates]
-        assert "exact h" in tactics
-        assert "assumption" in tactics
+        resp = asyncio.run(policy.get_next_action("theorem foo := by", ledger, []))
+        assert resp.chosen_state_id == newest
 
     def test_close_is_noop(self):
         policy = MockPolicy()

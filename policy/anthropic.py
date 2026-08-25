@@ -1,11 +1,11 @@
 """
 Anthropic-backed tactic policy for Lean 4 proof search.
 
-Calls Claude with the serialized proof state and returns ranked tactic candidates.
+Calls Claude with the serialized ledger and returns the director's decision.
 
 Usage:
     policy = AnthropicPolicy()  # reads ANTHROPIC_API_KEY from env
-    candidates = await policy.get_tactics(state, premises, k=8)
+    resp = await policy.get_next_action(theorem, ledger, premises)
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import os
 import httpx
 from anthropic import AsyncAnthropic
 
-from policy.base import BaseLLMPolicy, SYSTEM_PROMPT
+from policy.base import BaseLLMPolicy, DIRECTOR_SYSTEM_PROMPT
 
 # The SDK's own default read timeout (600s) is measured between bytes
 # received, but a *non-streaming* call gives httpx nothing to measure until
@@ -64,7 +64,7 @@ class AnthropicPolicy(BaseLLMPolicy):
     async def _call_api(
         self,
         user_prompt: str,
-        system_prompt: str = SYSTEM_PROMPT,
+        system_prompt: str = DIRECTOR_SYSTEM_PROMPT,
         max_tokens: int | None = None,
         enable_thinking: bool = False,
     ) -> str:

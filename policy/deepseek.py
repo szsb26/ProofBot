@@ -6,7 +6,7 @@ and returns ranked tactic candidates.
 
 Usage:
     policy = DeepSeekPolicy()  # reads DEEPSEEK_API_KEY from env
-    candidates = await policy.get_tactics(state, premises, k=8)
+    resp = await policy.get_next_action(theorem, ledger, premises)
 
 Available models:
     deepseek-v4-flash  — fast, cheap, good for most theorems
@@ -19,7 +19,7 @@ import os
 
 from openai import AsyncOpenAI
 
-from policy.base import BaseLLMPolicy, SYSTEM_PROMPT
+from policy.base import BaseLLMPolicy, DIRECTOR_SYSTEM_PROMPT
 
 
 class DeepSeekPolicy(BaseLLMPolicy):
@@ -60,7 +60,7 @@ class DeepSeekPolicy(BaseLLMPolicy):
     async def _call_api(
         self,
         user_prompt: str,
-        system_prompt: str = SYSTEM_PROMPT,
+        system_prompt: str = DIRECTOR_SYSTEM_PROMPT,
         max_tokens: int | None = None,
         enable_thinking: bool = False,
     ) -> str:

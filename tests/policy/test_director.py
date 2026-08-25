@@ -5,8 +5,9 @@ serialize_ledger, parse_director_response, and BaseLLMPolicy.get_next_action.
 These are the pieces search/ledger_search.py relies on instead of a priority
 queue — serialize_ledger turns a Ledger into prompt text, parse_director_response
 turns the LLM's JSON reply back into a DirectorResponse, and get_next_action
-wires the two together with the same never-raises fallback contract as
-get_tactics().
+wires the two together with a never-raises fallback contract: on any API
+or parse failure it continues an arbitrary frontier state rather than
+propagating the error, so one bad turn cannot end the search.
 
 There is deliberately no k-candidates-per-turn mechanism: the director
 proposes exactly one tactic per call (see search/ledger_search.py's module
@@ -411,6 +412,22 @@ class TestDirectorSystemPromptGuidance:
 
     def test_prompt_teaches_first_combinator_for_hedging(self):
         assert "first | tac1 | tac2" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_does_not_claim_tactics_only_ever_hit_the_first_goal(self):
+        """The prompt used to assert "Every tactic applies to the FIRST goal
+        only", which our own code contradicts: lean/repl.py has a dedicated
+        branch protecting `<;>` from the chain splitter, commented "apply to
+        every resulting goal". Telling the model a combinator we support
+        doesn't exist is a factual error about our own mechanism."""
+        assert "<;>" in DIRECTOR_SYSTEM_PROMPT
+        assert "Every tactic applies to the FIRST goal only" not in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_does_not_promise_the_full_frontier_is_shown(self):
+        """serialize_ledger caps the displayed frontier at
+        _MAX_OPEN_STATES_SHOWN, so "you will be shown every currently open
+        proof state" was false whenever the frontier exceeded it — which
+        happened for 24 turns of one real tournament_champion run."""
+        assert "every currently open proof state" not in DIRECTOR_SYSTEM_PROMPT
 
     def test_prompt_does_not_recommend_specific_solver_tactics(self):
         """The prompt describes how THIS system works and leaves choosing a

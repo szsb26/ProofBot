@@ -1,90 +1,70 @@
 """
-Abstract interface for the policy model (tactic generator).
+Abstract interface for the policy model (the search's director).
 
-The PolicyModel protocol defines the contract that every tactic generator
-must satisfy. The search algorithm talks exclusively to this interface —
-it never imports from policy/, lean/, or any specific implementation.
+The PolicyModel protocol defines the contract that every director must
+satisfy. The search algorithm talks exclusively to this interface — it
+never imports from policy/, lean/, or any specific implementation.
 
-policy.py is used when MCTS selects a node to expand and needs to query the LLM for candidate tactics. 
-The search loop calls get_tactics() with the current proof state and relevant premises, 
-and the policy returns a list of TacticCandidate with associated log probabilities.
-Each candidate tactic will then use executor object to send to Lean.
+Each turn, LedgerSearch hands the whole Ledger to get_next_action() and
+gets back a DirectorResponse: which open state to continue from, which
+states to abandon, and the single tactic to try there. That tactic is then
+sent to Lean via the executor.
 
 This is the most important abstraction boundary in the codebase.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from core.proof_state import ProofState
+if TYPE_CHECKING:
+    # Imported for typing only: policy/base.py imports from core/, so a
+    # real import here would invert the layering and cycle.
+    from core.ledger import Ledger
+    from policy.base import DirectorResponse
 
-# @dataclass  auto-generates init, repr, eq, and other methods based on the class fields.
-@dataclass(frozen=True)
-class TacticCandidate:
-    """
-    A single tactic proposed by the policy, with an associated log probability.
-    This class is a named container for what the LLM returns for each candidate tactic.
-    For ex., the tactic can be "simp", "apply Nat.add_zero", etc... Log probabilities are used
-    due to the way LLMs output probabilities, and they are more convenient for numerical stability
-    when computing UCB scores.
 
-    Attributes:
-        tactic:   The tactic string to send to Lean, e.g. "simp" or "apply h".
-        log_prob: Log probability assigned by the model. Higher = more confident.
-                  Used as the prior P(s, a) in the UCB formula.
-                  Set to 0.0 when log probs are unavailable (e.g. some APIs).
-    """
-    tactic: str
-    log_prob: float = 0.0
-
-    @property
-    def prob(self) -> float:
-        """Probability in [0, 1]. Convenience accessor for UCB computation."""
-        import math
-        return math.exp(self.log_prob)
-
-    def __repr__(self) -> str:
-        # !r is equivalent to repr(self.tactic)
-        return f"TacticCandidate({self.tactic!r}, log_prob={self.log_prob:.3f})"
-
-# @runtime_checkable allows us to use isinstance() to check if an object satisfies the PolicyModel protocol, 
+# @runtime_checkable allows us to use isinstance() to check if an object satisfies the PolicyModel protocol,
 # even though it's not a concrete class. This is useful for testing and for ensuring that our policy implementations
 # conform to the expected interface.
 @runtime_checkable
 class PolicyModel(Protocol):
     """
-    Protocol that every tactic generator (for ex., LLM model) must satisfy.
+    Protocol that every director (for ex., LLM model) must satisfy.
 
     Implementations:
-        policy/anthropic.py  -> AnthropicPolicy   (Phase 1-2, API-backed)
-        policy/openai.py     -> OpenAIPolicy       (comparison baseline)
-        policy/vllm.py       -> VLLMPolicy         (Phase 3+, local model)
-        policy/mock.py       -> MockPolicy         (testing, no API calls)
+        policy/anthropic.py   -> AnthropicPolicy   (API-backed)
+        policy/deepseek.py    -> DeepSeekPolicy    (API-backed)
+        policy/claude_cli.py  -> ClaudeCLIPolicy   (shells out to the claude CLI)
+        policy/mock.py        -> MockPolicy        (testing, no API calls)
+        core/trace.py         -> TracingPolicy     (wraps any of the above)
 
-    The search algorithm only ever calls get_tactics(). Everything else
-    is an implementation detail hidden behind this interface.
+    The search algorithm only ever calls get_next_action() and close().
+    Everything else is an implementation detail hidden behind this interface.
     """
 
-    async def get_tactics(
+    async def get_next_action(
         self,
-        state: ProofState,
+        theorem: str,
+        ledger: "Ledger",
         premises: list[str],
-        k: int = 8,
-    ) -> list[TacticCandidate]:
+    ) -> "DirectorResponse":
         """
-        Generate k tactic candidates for the given proof state.
+        Choose where to continue the search and what single tactic to try.
 
         Args:
-            state:    The current proof state. Contains open goals + hypotheses.
-            premises: Relevant mathlib lemma names from the retriever.
-                      e.g. ["Nat.add_zero", "Nat.add_comm"]
-            k:        Number of candidates to return. Caller may receive fewer
-                      if the model cannot generate k distinct tactics.
+            theorem:  The Lean 4 theorem statement being proved, for context.
+            ledger:   Every open proof state plus the full record of what has
+                      already been tried against each one.
+            premises: Relevant Mathlib lemma names from the retriever,
+                      e.g. ["Nat.add_zero", "Nat.add_comm"].
 
         Returns:
-            List of TacticCandidate, sorted by log_prob descending.
-            Never returns an empty list — at minimum returns [TacticCandidate("simp")].
+            A DirectorResponse naming the chosen state, any states to
+            abandon, one tactic, and the reasoning behind the choice.
+
+        Must never raise: on any API or parse failure, fall back to
+        continuing an arbitrary frontier state rather than propagating the
+        error, so a single bad turn cannot end the search.
         """
         ...
 
