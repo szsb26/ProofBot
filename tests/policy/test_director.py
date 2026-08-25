@@ -129,6 +129,24 @@ class TestSerializeLedger:
         assert "hallucinated_lemma×2" in text
         assert "type_mismatch×1" in text
 
+    def test_failure_summary_and_tactic_list_are_on_separate_lines(self):
+        """The summary line had no trailing newline, so every failed state
+        in every prompt rendered as
+        "...tactic_failed×1Tactics already tried here — do not repeat"."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "omega", "tactic_failed")
+
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "tactic_failed×1Tactics" not in text
+        assert "tactic_failed×1\nTactics already tried here" in text
+
+    def test_failure_count_is_singular_for_one_tactic(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "omega", "tactic_failed")
+        assert "1 tactic tried" in serialize_ledger("theorem foo := by", ledger, [])
+
     def test_lists_specific_failed_tactics_to_prevent_verbatim_repeats(self):
         """The model must be able to see exactly which tactics already
         failed at a state, not just aggregate counts — otherwise it can't
@@ -403,6 +421,27 @@ class TestDirectorSystemPromptGuidance:
 
     def test_prompt_warns_that_inline_by_proofs_are_all_or_nothing(self):
         assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_does_not_deny_the_combinator_our_splitter_supports(self):
+        """lean/repl.py has a dedicated branch keeping `<;>` intact through
+        the chain splitter, commented "apply to every resulting goal". The
+        prompt used to flatly assert "Every tactic applies to the FIRST goal
+        only", i.e. tell the model a combinator we deliberately support does
+        not exist. Additive correction only — the first-goal default it
+        already described is still stated."""
+        assert "<;>" in DIRECTOR_SYSTEM_PROMPT
+        assert "FIRST goal only" in DIRECTOR_SYSTEM_PROMPT   # default still stated
+        assert "Every tactic applies to the FIRST goal only" not in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_does_not_promise_an_uncapped_frontier(self):
+        """serialize_ledger caps the displayed frontier at
+        _MAX_OPEN_STATES_SHOWN, and the rendered header truthfully says
+        "showing 20 of 22" — but the system prompt claimed every open state
+        was shown, contradicting it. Real cost: 24 turns of one
+        tournament_champion run had states hidden while the prompt promised
+        otherwise."""
+        assert "every currently open proof state" not in DIRECTOR_SYSTEM_PROMPT
+        assert "more than you can see" in DIRECTOR_SYSTEM_PROMPT
 
     def test_prompt_asks_for_exactly_one_tactic(self):
         assert "exactly ONE tactic" in DIRECTOR_SYSTEM_PROMPT
