@@ -411,18 +411,44 @@ One caveat worth knowing when interpreting results: on a hard problem, a thinkin
 
 ## Evaluation
 
-`run_eval.py` runs a curated problem set (tiers: `easy`, `medium`, `hard`, `stretch`) and writes results to `results/eval_<timestamp>.json`.
+`run_eval.py` runs a curated problem set (tiers: `easy`, `medium`, `hard`, `stretch`, `imo`) and writes results to `results/eval_<timestamp>.json`.
 
 ```bash
 python run_eval.py                                    # all problems
-python run_eval.py --problems stretch --budget 100    # one tier
+python run_eval.py --problems imo --budget 50         # one tier
 python run_eval.py --problems imo1968_tetrahedron     # one problem by name
-python run_eval.py --problems stretch --trials 5 --trace   # pass@k + save traces of failures
+python run_eval.py --problems imo --trials 3 --trace  # pass@k + save traces of failures
 ```
+
+The `imo` tier is 22 real competition problems lifted from Mathlib's `Archive/Imo`. Each ships a `reference_proof` that was replayed in this harness and required to close to zero goals, so provability is established rather than assumed — `scripts/verify_problem_set.py` re-checks them all in one command. Mathlib's helper lemmas are used for that verification but never shown to the prover: they are sub-lemmas, the decomposition a solver has to invent, and discovering them is the capability under test.
 
 `--trace` saves the director's verbatim prompt and raw response for every turn of a failed trial to `traces/eval_<timestamp>/`. This is the primary debugging tool — at temperature 1.0 you cannot reproduce a specific failed attempt by re-running it. `scripts/trace_search.py` does the same for a single ad-hoc theorem.
 
 > **Adding a problem?** Prove it in Lean first. A problem sat in this eval set for weeks that was *provably false* — its hypotheses constrained a relation only on distinct pairs, so nothing ruled out `beats x x`, and the theorem had a two-element counterexample. Several full-budget search runs were spent on it before anyone checked, and the failures were initially misread as model limitations. Watch specifically for conditions an informal name implies but the formal statement never states (irreflexivity, non-emptiness, strictness).
+
+### Where the prover currently stands
+
+**The prover solves real IMO problems.** Given only the bare theorem statement
+— no helper lemmas, no hints — it finds and verifies complete Lean proofs of
+competition problems from the International Mathematical Olympiad.
+
+Measured 2026-08-25, budget 50, temperature 1.0:
+
+| Problem | DeepSeek v4 Pro | Claude Sonnet 5 |
+|---|---|---|
+| `imo1959_q1` — gcd / coprimality | ✓ 3/3, 14 nodes | ✓ 1/1, 11 nodes |
+| `imo1964_q1a` — modular arithmetic | ✓ 3/3, 41 nodes | ✓ 2/2, **6 nodes** |
+| `imo1963_q5` — trigonometric identity | ~ 1/3, 47 nodes | ✓ 1/1, 23 nodes |
+| `imo2005_q3` — algebraic inequality | ✗ 0/3 | ✓ 2/2, 27 nodes |
+| `imo2011_q3` — functional equation | ✗ 0/3 | ✗ 0/1 |
+
+Sonnet 5 solves 4 of the 5 and is consistently cheaper where both succeed.
+
+This is a **small sample** — 5 of the 22 problems in the `imo` tier, and 5 of
+45 in the repo overall — chosen to span domains rather than to be
+representative, and with uneven trial counts between the two columns. Read
+solved/not-solved and node counts as the signal, not the rates. Run
+`--problems imo` for the full tier.
 
 ---
 
