@@ -748,6 +748,51 @@ class TestGetNextAction:
         finally:
             patcher.stop()
 
+    async def test_persistent_api_failure_raises_instead_of_burning_the_budget(self):
+        """An isolated failure is absorbed, but a condition that fails every
+        call — spent credits, revoked key, wrong model — must stop the run.
+        Otherwise the "simp" fallback quietly converts the remaining budget
+        into meaningless turns that still cost wall-clock time, with nothing
+        in the output saying why."""
+        policy, client, patcher = self._make_policy()
+        try:
+            client.chat.completions.create = AsyncMock(
+                side_effect=Exception("credit balance is too low")
+            )
+            ledger, _ = self._ledger_with_one_state()
+
+            # First failures are absorbed...
+            for _ in range(2):
+                resp = await policy.get_next_action("theorem foo := by", ledger, [])
+                assert resp.tactic == "simp"
+            # ...the third in a row stops the run.
+            with pytest.raises(Exception, match="credit balance"):
+                await policy.get_next_action("theorem foo := by", ledger, [])
+        finally:
+            patcher.stop()
+
+    async def test_failure_counter_resets_after_a_success(self):
+        """Two blips separated by a good call must not add up to an abort."""
+        policy, client, patcher = self._make_policy()
+        try:
+            ledger, _ = self._ledger_with_one_state()
+            ok = _make_api_response(json.dumps({"chosen_state": "x", "tactic": "simp"}))
+
+            client.chat.completions.create = AsyncMock(side_effect=Exception("blip"))
+            await policy.get_next_action("theorem foo := by", ledger, [])
+            await policy.get_next_action("theorem foo := by", ledger, [])
+
+            client.chat.completions.create = AsyncMock(return_value=ok)
+            await policy.get_next_action("theorem foo := by", ledger, [])
+
+            # Counter reset, so two more failures are still absorbed.
+            client.chat.completions.create = AsyncMock(side_effect=Exception("blip"))
+            for _ in range(2):
+                resp = await policy.get_next_action("theorem foo := by", ledger, [])
+                assert resp.tactic == "simp"
+        finally:
+            patcher.stop()
+
     async def test_falls_back_gracefully_on_api_failure(self):
         policy, client, patcher = self._make_policy()
         try:

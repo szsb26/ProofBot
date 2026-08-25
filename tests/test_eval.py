@@ -378,6 +378,61 @@ _TRACE_TEST_PROBLEM = EvalProblem(
 )
 
 
+class TestRunEvalIncrementalSave:
+    """A long run can be cut short from outside the harness — an exhausted
+    credit balance, a killed process. Traces are already written per trial;
+    the summary must be durable too, or work that was already paid for is
+    lost."""
+
+    @pytest.mark.asyncio
+    async def test_results_are_saved_after_each_problem(self, tmp_path):
+        from lean.mock_executor import MockExecutor
+        from policy.mock import MockPolicy
+
+        saved = []
+
+        real_save = EvalSummary.save
+
+        def spy(self, results_dir):
+            saved.append(len(self.results))
+            return real_save(self, results_dir)
+
+        EvalSummary.save = spy
+        try:
+            await run_eval(
+                problems=_TWO_PROBLEMS,
+                policy=MockPolicy(tactics=["simp"]),
+                executors=[MockExecutor()],
+                budget=5,
+                policy_name="mock",
+                model_name="mock",
+                results_dir=str(tmp_path),
+            )
+        finally:
+            EvalSummary.save = real_save
+
+        # One save per problem, each with the results accumulated so far.
+        assert saved == [1, 2]
+        assert list(tmp_path.glob("eval_*.json"))
+
+    @pytest.mark.asyncio
+    async def test_no_saving_when_results_dir_is_omitted(self, tmp_path):
+        """Callers that only want the returned summary (the tests above, the
+        library API) must not have files written underneath them."""
+        from lean.mock_executor import MockExecutor
+        from policy.mock import MockPolicy
+
+        await run_eval(
+            problems=_TWO_PROBLEMS,
+            policy=MockPolicy(tactics=["simp"]),
+            executors=[MockExecutor()],
+            budget=5,
+            policy_name="mock",
+            model_name="mock",
+        )
+        assert not list(tmp_path.glob("eval_*.json"))
+
+
 class TestRunEvalTracing:
 
     @pytest.fixture

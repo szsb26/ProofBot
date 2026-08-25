@@ -11,10 +11,23 @@ LLM backend.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 
 from core.ledger import Ledger
+
+logger = logging.getLogger(__name__)
+
+# A single failed director call is worth absorbing — one dropped connection
+# should not end a search that is otherwise going fine. A *run* of them is a
+# different thing: an exhausted credit balance, a revoked key or a wrong model
+# name fails identically on every call, and the "simp" fallback then quietly
+# turns the rest of the budget into meaningless turns while still costing
+# wall-clock time and producing a trace full of noise. After this many
+# consecutive failures the error is raised instead, so the run stops with the
+# real reason visible.
+_MAX_CONSECUTIVE_API_FAILURES = 3
 
 
 DIRECTOR_SYSTEM_PROMPT = (
@@ -475,6 +488,7 @@ class BaseLLMPolicy:
         # mechanism itself is validated — see get_next_action.
         self._director_max_tokens = director_max_tokens
         self._director_thinking = director_thinking
+        self._consecutive_api_failures = 0
 
     async def get_next_action(
         self,
@@ -486,10 +500,17 @@ class BaseLLMPolicy:
         Ask the LLM to choose which open state to continue from (or abandon),
         and propose a single tactic for its choice.
 
-        Never raises — falls back to continuing an arbitrary frontier state
-        with a "simp" tactic on any error. Requires a non-empty
-        ledger.frontier; callers are responsible for stopping the search once
-        the frontier is empty.
+        Absorbs an isolated API failure — falls back to continuing an
+        arbitrary frontier state with a "simp" tactic — so one dropped
+        connection cannot end an otherwise healthy search. But it does NOT
+        absorb a persistent one: after _MAX_CONSECUTIVE_API_FAILURES failures
+        in a row the exception is re-raised, because a condition that fails
+        every call (spent credits, bad key, wrong model) would otherwise turn
+        the rest of the budget into "simp" turns that cost time and teach
+        nothing, with no indication in the output of what went wrong.
+
+        Requires a non-empty ledger.frontier; callers are responsible for
+        stopping the search once the frontier is empty.
         """
         fallback_id = next(iter(ledger.frontier))
         user_prompt = serialize_ledger(theorem, ledger, premises)
@@ -500,12 +521,20 @@ class BaseLLMPolicy:
                 max_tokens=self._director_max_tokens,
                 enable_thinking=self._director_thinking,
             )
-        except Exception:
+        except Exception as e:
+            self._consecutive_api_failures += 1
+            logger.warning(
+                "director API call failed (%d in a row): %s: %s",
+                self._consecutive_api_failures, type(e).__name__, e,
+            )
+            if self._consecutive_api_failures >= _MAX_CONSECUTIVE_API_FAILURES:
+                raise
             return DirectorResponse(
                 chosen_state_id=fallback_id,
                 abandoned_state_ids=[],
                 tactic="simp",
             )
+        self._consecutive_api_failures = 0
         return parse_director_response(raw_text, fallback_id)
 
     async def _call_api(

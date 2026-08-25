@@ -326,6 +326,7 @@ async def _run(args: argparse.Namespace) -> int:
             trace=args.trace,
             trace_successes=args.trace_successes,
             traces_dir=TRACES_DIR,
+            results_dir=RESULTS_DIR,
         )
     finally:
         if use_real_lean:

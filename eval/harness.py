@@ -58,6 +58,48 @@ class EvalSummary:
         return path
 
 
+def _build_summary(
+    results: list[ProblemResult], *, timestamp: str, policy_name: str,
+    model_name: str, workers: int, budget: int, trials: int,
+) -> EvalSummary:
+    """Aggregate whatever results exist so far into an EvalSummary.
+
+    Split out of run_eval so a partial summary can be written after each
+    problem — see the incremental save there.
+    """
+    total = len(results)
+    passed = sum(r.success for r in results)
+    mean_pass_rate = sum(r.passes / r.trials for r in results) / total if total else 0.0
+
+    by_difficulty: dict[str, dict] = {}
+    for tier in DIFFICULTIES:
+        tier_results = [r for r in results if r.difficulty == tier]
+        if tier_results:
+            tier_passed = sum(r.success for r in tier_results)
+            tier_mean = sum(r.passes / r.trials for r in tier_results) / len(tier_results)
+            by_difficulty[tier] = {
+                "total": len(tier_results),
+                "passed": tier_passed,
+                "pass_rate": round(tier_passed / len(tier_results), 3),
+                "mean_pass_rate": round(tier_mean, 3),
+            }
+
+    return EvalSummary(
+        timestamp=timestamp,
+        policy=policy_name,
+        model=model_name,
+        workers=workers,
+        budget=budget,
+        trials=trials,
+        total=total,
+        passed=passed,
+        pass_rate=round(passed / total, 3) if total else 0.0,
+        mean_pass_rate=round(mean_pass_rate, 3),
+        by_difficulty=by_difficulty,
+        results=results,
+    )
+
+
 async def run_eval(
     problems: list[EvalProblem],
     policy,
@@ -69,6 +111,7 @@ async def run_eval(
     trace: bool = False,
     trace_successes: bool = False,
     traces_dir: str | Path = "traces",
+    results_dir: str | Path | None = None,
 ) -> EvalSummary:
     """
     Run every problem in *problems* through the prover and collect results.
@@ -225,34 +268,21 @@ async def run_eval(
             )
         )
 
-    total = len(results)
-    passed = sum(r.success for r in results)
-    mean_pass_rate = sum(r.passes / r.trials for r in results) / total if total else 0.0
+        # Save after every problem, not just at the end. A long run can be
+        # cut short by something outside the harness — an exhausted credit
+        # balance, a killed process — and without this the whole run's
+        # results are lost even though the work was already paid for. Traces
+        # are already written per trial; this brings the summary in line.
+        if results_dir is not None:
+            partial = _build_summary(
+                results, timestamp=timestamp, policy_name=policy_name,
+                model_name=model_name, workers=len(executors), budget=budget,
+                trials=trials,
+            )
+            partial.save(results_dir)
 
-    by_difficulty: dict[str, dict] = {}
-    for tier in DIFFICULTIES:
-        tier_results = [r for r in results if r.difficulty == tier]
-        if tier_results:
-            tier_passed = sum(r.success for r in tier_results)
-            tier_mean = sum(r.passes / r.trials for r in tier_results) / len(tier_results)
-            by_difficulty[tier] = {
-                "total": len(tier_results),
-                "passed": tier_passed,
-                "pass_rate": round(tier_passed / len(tier_results), 3),
-                "mean_pass_rate": round(tier_mean, 3),
-            }
-
-    return EvalSummary(
-        timestamp=timestamp,
-        policy=policy_name,
-        model=model_name,
-        workers=len(executors),
-        budget=budget,
+    return _build_summary(
+        results, timestamp=timestamp, policy_name=policy_name,
+        model_name=model_name, workers=len(executors), budget=budget,
         trials=trials,
-        total=total,
-        passed=passed,
-        pass_rate=round(passed / total, 3) if total else 0.0,
-        mean_pass_rate=round(mean_pass_rate, 3),
-        by_difficulty=by_difficulty,
-        results=results,
     )
