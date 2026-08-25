@@ -105,14 +105,18 @@ DIRECTOR_SYSTEM_PROMPT = (
     "Copy its id exactly as shown in the state's bracket label, e.g. for "
     "\"[state a1b2c3d4]\" use \"a1b2c3d4\" — do not include the word \"state\" "
     "or the brackets.\n"
-    "- Propose exactly ONE tactic for the chosen state. Check the \"Tactics "
-    "already tried here\" list for your chosen state first — never propose a "
-    "tactic that already appears there verbatim, since it is guaranteed to "
+    "- Propose exactly ONE tactic for the chosen state. Check BOTH lists "
+    "shown for your chosen state first. Never propose a tactic that appears "
+    "verbatim in \"Tactics already tried here\" — those failed, and will "
     "fail the same way again. Each failed tactic is shown with Lean's actual "
     "error message (marked with \"→\") — read it before retrying a similar "
     "idea: it tells you the real reason (wrong lemma name, wrong argument "
     "shape, type mismatch, etc.), which is far more useful than guessing "
-    "again blindly.\n"
+    "again blindly. Likewise never re-propose a tactic listed under "
+    "\"Tactics already APPLIED SUCCESSFULLY here\": a state stays open after "
+    "being expanded so you can come back to it, so re-running a tactic that "
+    "already worked just re-derives the exact same state and wastes the "
+    "turn — to build on that work, choose the resulting state instead.\n"
     "- Your tactic must be syntactically valid Lean 4, with no explanations, "
     "numbering, backticks, or code fences. You may chain multiple steps with "
     "';' (e.g. \"intro n; simp\") to carry out one sequential plan — each "
@@ -243,12 +247,41 @@ def serialize_ledger(
         parts.append("\n## Currently Open States\n")
 
     shown_state_ids = {state_id for state_id, _ in shown_open}
+
+    # Successful expansions, keyed by the state they were applied to. A
+    # state stays in the frontier after being expanded (so it can be
+    # backtracked to), and re-applying a tactic that already worked lands
+    # on the identical child id — so without showing this, the director
+    # has no way to tell it already tried that tactic here and can loop
+    # re-deriving the same step until the budget runs out.
+    done_by_parent: dict[str, list] = {}
+    for entry in ledger.entries:
+        if entry.outcome == "success" and entry.parent_id in shown_state_ids:
+            done_by_parent.setdefault(entry.parent_id, []).append(entry)
+
     for state_id, state in shown_open:
         path = ", ".join(state.tactic_trace) if state.tactic_trace else "(root)"
         parts.append(f"\n[state {state_id}] (path: {path})\n{state.serialize()}\n")
         plan = ledger.reasoning.get(state_id)
         if plan:
             parts.append(f"Last stated plan for this state: {plan}\n")
+        applied = done_by_parent.get(state_id)
+        if applied:
+            seen_applied: list[tuple[str, str]] = []
+            for e in applied:
+                key = (e.tactic, e.child_id or "")
+                if key not in seen_applied:
+                    seen_applied.append(key)
+            lines = "\n".join(
+                f"  - {_format_tactic_for_display(t)} → produced state {cid}"
+                for t, cid in seen_applied[-_MAX_TRIED_TACTICS_SHOWN:]
+            )
+            parts.append(
+                "Tactics already APPLIED SUCCESSFULLY here — re-running one "
+                "just re-derives the same state, so continue from the "
+                "resulting state instead:\n"
+                f"{lines}\n"
+            )
 
     dead_by_parent: dict[str, list] = {}
     for entry in ledger.entries:

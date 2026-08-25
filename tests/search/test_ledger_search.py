@@ -363,6 +363,79 @@ class TestLedgerSearchDirectorBehavior:
         assert len(second_ledger.failures_for(state_id)) == 1
         assert second_ledger.failures_for(state_id)[0].tactic == "nope"
 
+    def test_successful_tactics_are_recorded_in_ledger(self):
+        """Regression test for a real budget-burning loop: a state is never
+        evicted from the frontier after a successful expansion (so the
+        director can backtrack to it), and stable_hash is goals-only, so
+        re-applying a tactic that already worked lands on the identical
+        child id — the frontier doesn't even change size. If successes go
+        unrecorded, the director sees that state still open with no
+        evidence it ever touched it and can re-derive the same step until
+        the budget runs out. Observed live on a DeepSeek imo1968 run: one
+        nlinarith that succeeded every time was re-proposed 5 times,
+        burning 10% of the budget."""
+
+        calls: list[Ledger] = []
+
+        class RecordingPolicy:
+            async def get_next_action(self, theorem, ledger, premises):
+                calls.append(ledger)
+                chosen = next(iter(ledger.frontier))
+                # "intro n" advances but does NOT close the ∀ goal, so the
+                # parent stays open alongside its new child — exactly the
+                # shape that produced the live loop.
+                if len(calls) == 1:
+                    return DirectorResponse(chosen, [], "intro n")
+                return DirectorResponse(next(reversed(ledger.frontier)), [], "simp")
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=RecordingPolicy(), executor=MockExecutor())
+        result = asyncio.run(search.prove(
+            "theorem foo : ∀ n : ℕ, n + 0 = n := by", budget=5
+        ))
+
+        assert result.success
+        second_ledger = calls[1]
+        root_id = next(iter(second_ledger.frontier))
+        successes = [
+            e for e in second_ledger.entries
+            if e.outcome == "success" and e.parent_id == root_id
+        ]
+        assert len(successes) == 1
+        assert successes[0].tactic == "intro n"
+        # The child id must be recorded too — that's what tells the director
+        # where to continue instead of re-running the same tactic.
+        assert successes[0].child_id is not None
+        assert successes[0].child_id in second_ledger.frontier
+
+    def test_repeating_a_successful_tactic_is_visible_to_the_next_call(self):
+        """End-to-end: after a tactic succeeds at a state, the NEXT
+        director call's serialized prompt must say so, so the model can
+        tell it already did that here."""
+        from policy.base import serialize_ledger
+
+        calls: list[Ledger] = []
+
+        class RecordingPolicy:
+            async def get_next_action(self, theorem, ledger, premises):
+                calls.append(ledger)
+                chosen = next(iter(ledger.frontier))
+                if len(calls) == 1:
+                    return DirectorResponse(chosen, [], "intro n")
+                return DirectorResponse(next(reversed(ledger.frontier)), [], "simp")
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=RecordingPolicy(), executor=MockExecutor())
+        asyncio.run(search.prove("theorem foo : ∀ n : ℕ, n + 0 = n := by", budget=5))
+
+        prompt = serialize_ledger("theorem foo := by", calls[1], [])
+        assert "APPLIED SUCCESSFULLY" in prompt
+        assert "intro n" in prompt
+
     def test_reasoning_persists_into_ledger_across_turns(self):
         """The director's stated plan for a state should be visible on the
         ledger passed into the NEXT call, not just returned and discarded."""

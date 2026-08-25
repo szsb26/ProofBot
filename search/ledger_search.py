@@ -257,6 +257,17 @@ class LedgerSearch:
             if result.success:
                 new_id = ledger.add_state(result.next_state)
                 ledger.set_reasoning(new_id, resp.reasoning)
+                # Record the success, not just failures. A state is never
+                # evicted from the frontier after being expanded (so the
+                # director can backtrack to it), and stable_hash is
+                # goals-only, so re-applying a tactic that already worked
+                # lands on the identical child id — the frontier doesn't
+                # even change size. Without a record, the director sees
+                # that state still open with no evidence it ever touched
+                # it, and can re-derive the same successful step forever.
+                # Observed live: a DeepSeek run burned 10% of its budget
+                # re-running one nlinarith that succeeded every time.
+                ledger.record_success(resp.chosen_state_id, resp.tactic, new_id)
             else:
                 err = result.next_state.error or ""
                 category = _classify_tactic_error(err)

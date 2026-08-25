@@ -255,6 +255,51 @@ class TestSerializeLedger:
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "exactly one tactic" in text
 
+    def test_shows_tactics_already_applied_successfully(self):
+        """A state stays in the frontier after being expanded (so it can be
+        backtracked to), and stable_hash is goals-only, so re-applying a
+        tactic that already worked lands on the identical child id — the
+        frontier doesn't even change size. Without surfacing successes the
+        director sees the state still open with no evidence it touched it,
+        and loops re-deriving the same step. Observed live: a DeepSeek run
+        burned 10% of its budget re-running one nlinarith that succeeded
+        every time."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_success(state_id, "nlinarith [ha, hb]", "child123")
+
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "APPLIED SUCCESSFULLY" in text
+        assert "nlinarith [ha, hb]" in text
+        # The resulting state id must be shown, so the director knows where
+        # to continue instead of re-running the tactic.
+        assert "child123" in text
+
+    def test_no_applied_section_when_nothing_succeeded_yet(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n = n"]))
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "APPLIED SUCCESSFULLY" not in text
+
+    def test_applied_successfully_deduplicates_repeats(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        for _ in range(4):
+            ledger.record_success(state_id, "simp", "child123")
+
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert text.count("- simp → produced state child123") == 1
+
+    def test_applied_successes_of_other_states_not_shown(self):
+        """Successes are attributed per-state; a success recorded against a
+        state that isn't displayed must not leak into the prompt."""
+        ledger = Ledger()
+        shown_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_success("some-other-state", "a_uniquely_named_tactic", "x")
+
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "a_uniquely_named_tactic" not in text
+
     def test_shows_persisted_reasoning_for_open_state(self):
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
