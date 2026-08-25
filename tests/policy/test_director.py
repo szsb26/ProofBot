@@ -412,6 +412,33 @@ class TestDirectorSystemPromptGuidance:
     def test_prompt_teaches_first_combinator_for_hedging(self):
         assert "first | tac1 | tac2" in DIRECTOR_SYSTEM_PROMPT
 
+    def test_prompt_does_not_recommend_specific_solver_tactics(self):
+        """The prompt describes how THIS system works and leaves choosing a
+        tactic to the model. It used to name a preferred set of
+        general-purpose solvers, and that list was miscalibrated: it
+        offered `omega` (integers/naturals only, inapplicable to a
+        real-valued goal) and `nlinarith` (the nonlinear extension) while
+        omitting `linarith`, the complete decision procedure for the
+        linear-real goals that showed up in practice. Measured on
+        imo1968_tetrahedron: the failing DeepSeek run leaned on the
+        suggested tactics (nlinarith 21x, simp 10x) and used linarith only
+        6x, while Sonnet's successful proof used none of the suggested
+        tactics and closed every branch with linarith.
+
+        Hand-coded tactic preferences are also the same class of mistake as
+        the retired value function — a human heuristic that cannot read the
+        goal, placed where the model's judgment belongs. Keep search-tactic
+        guidance (apply?/exact?), which is about not hallucinating lemma
+        names, and leave solver choice alone."""
+        for banned in ("`aesop`", "`omega`", "`nlinarith`", "`simp`"):
+            assert banned not in DIRECTOR_SYSTEM_PROMPT, (
+                f"{banned} is recommended in the director prompt; solver "
+                "choice should be left to the model"
+            )
+        # The genuinely useful part — don't guess lemma names — stays.
+        assert "apply?" in DIRECTOR_SYSTEM_PROMPT
+        assert "exact?" in DIRECTOR_SYSTEM_PROMPT
+
 
 # ---------------------------------------------------------------------------
 # parse_director_response
