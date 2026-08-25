@@ -32,6 +32,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--policy", choices=["anthropic", "deepseek"], default="anthropic")
     parser.add_argument("--model", default=None, metavar="MODEL")
     parser.add_argument("--max-fixes", type=int, default=3, metavar="N")
+    parser.add_argument(
+        "--no-thinking", action="store_true", default=False,
+        help=(
+            "disable extended thinking. A weaker, less representative "
+            "baseline (real users leave thinking on), but guarantees the "
+            "model writes an actual attempt within budget instead of "
+            "possibly spending it all on hidden reasoning and never "
+            "producing output (seen live on imo1968_tetrahedron up to "
+            "60K tokens with thinking on)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -52,7 +63,10 @@ async def _run(args: argparse.Namespace) -> int:
     await executor.start()
     print("ready.\n")
 
-    prover = OneShotProve(policy=policy, executor=executor, max_fixes=args.max_fixes)
+    prover = OneShotProve(
+        policy=policy, executor=executor, max_fixes=args.max_fixes,
+        enable_thinking=not args.no_thinking,
+    )
 
     try:
         for name in names:
