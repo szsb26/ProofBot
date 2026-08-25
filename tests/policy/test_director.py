@@ -473,6 +473,28 @@ class TestDirectorSystemPromptGuidance:
         assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
         assert "Respond with JSON only" in DIRECTOR_SYSTEM_PROMPT
 
+    def test_prompt_requires_reasoning_in_plain_language_before_a_tactic(self):
+        """This is a PROCESS rule, not proof advice, and it is easy to
+        mistake for the latter — it was briefly trimmed as such.
+
+        Drafting the argument in prose before formalizing is the single
+        behavior this project has the most evidence for: the whole
+        Draft-Sketch-Prove line of work came from the observation that
+        models find the correct mathematical argument reliably in natural
+        language and lose it in translation to Lean. Every real trace shows
+        the right strategy in turn-1 reasoning. Without this rule nothing
+        stops the director from skipping straight to guessing tactics.
+
+        What does NOT belong here is a menu of which arguments to reach for
+        (case split, key inequality, WLOG reduction, ...) — that biases
+        which proof gets found and was removed."""
+        assert "First" in DIRECTOR_SYSTEM_PROMPT
+        assert "in plain language" in DIRECTOR_SYSTEM_PROMPT
+        assert "before deciding on a tactic" in DIRECTOR_SYSTEM_PROMPT
+        # ...but not the strategy menu.
+        for menu_item in ("case split", "key inequality", "WLOG"):
+            assert menu_item not in DIRECTOR_SYSTEM_PROMPT
+
 # ---------------------------------------------------------------------------
 # parse_director_response
 # ---------------------------------------------------------------------------
