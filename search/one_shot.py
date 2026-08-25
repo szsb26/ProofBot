@@ -77,6 +77,17 @@ class OneShotProve:
 
     max_fixes=3 matches the project's own bar: search only earns its keep
     if it beats one-shot plus a small, human-scale number of fix attempts.
+
+    max_tokens=32000: confirmed live against a genuinely hard problem
+    (imo1968_tetrahedron) that a hard proof can burn through 8K, 20K, even
+    60K tokens of adaptive thinking without ever finishing — the model
+    hits max_tokens mid-thought and never reaches the point of writing any
+    proof text at all (stop_reason="max_tokens", thinking content present
+    per usage.output_tokens but its exposed text is empty by default). This
+    is not a bug to raise the budget past — it can be a genuine, meaningful
+    result: some problems may need more single-call "thinking room" than
+    any practical budget provides, which is exactly the kind of limitation
+    the search-vs-one-shot comparison is meant to surface.
     """
 
     def __init__(
@@ -84,7 +95,7 @@ class OneShotProve:
         policy: BaseLLMPolicy,
         executor: LeanExecutor,
         max_fixes: int = 3,
-        max_tokens: int = 8000,
+        max_tokens: int = 32000,
         enable_thinking: bool = True,
     ):
         self.policy = policy
