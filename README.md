@@ -6,7 +6,7 @@ Naive LLM theorem provers ask the model to prove a theorem in one shot. Because 
 
 An earlier design ranked states with a hand-coded heuristic (goal count + depth) driving a priority queue. An eval across the hard/stretch problem tiers showed the ledger-driven design matches or exceeds it (pass@1 76%→86%, pass@5 80%→100%) while removing an entire component, so it was retired.
 
-The baseline this has to beat is one-shot prompting, so it ships as a first-class comparison rather than a claim — see [Baseline: one-shot proving](#baseline-one-shot-proving).
+The baseline this has to beat is one-shot prompting, so it ships as a first-class comparison rather than a claim (`search/one_shot.py`, `scripts/one_shot_baseline.py`).
 
 The policy (LLM backend) is pluggable. Anthropic's Claude and DeepSeek are supported out of the box; adding a new provider requires implementing one method.
 
@@ -194,7 +194,7 @@ prove_parallel(theorem, searches=[...], budget=100)
 async def get_next_action(theorem: str, ledger: Ledger, premises: list[str]) -> DirectorResponse
 ```
 
-`DirectorResponse` carries which open state to continue from, any states to abandon, and exactly one tactic for the chosen state (see [One tactic per turn](#one-tactic-per-turn)). `AnthropicPolicy` and `DeepSeekPolicy` both extend `BaseLLMPolicy` (`policy/base.py`), which handles ledger serialization, response parsing, and error fallback. Adding a new provider means subclassing `BaseLLMPolicy` and implementing `_call_api(user_prompt, system_prompt, max_tokens, enable_thinking) -> str`.
+`DirectorResponse` carries which open state to continue from, any states to abandon, and exactly one tactic for the chosen state — it may be `;`-chained, or use Lean's `first | tac1 | tac2` to hedge. `AnthropicPolicy` and `DeepSeekPolicy` both extend `BaseLLMPolicy` (`policy/base.py`), which handles ledger serialization, response parsing, and error fallback. Adding a new provider means subclassing `BaseLLMPolicy` and implementing `_call_api(user_prompt, system_prompt, max_tokens, enable_thinking) -> str`.
 
 ---
 
@@ -369,45 +369,6 @@ All LLM policies extend `BaseLLMPolicy` (`policy/base.py`). To add a new provide
 
 ---
 
-## Ledger-guided search
-
-There is no value function and no priority queue. `LedgerSearch` maintains a `Ledger` (`core/ledger.py`) — every open proof state (the "frontier") plus a record of every tactic attempted and its outcome, successes and failures alike. Each turn, one LLM call (`PolicyModel.get_next_action`) reads the full ledger and returns a `DirectorResponse`: which open state to continue from, any states to abandon as dead ends, and one tactic for its chosen state. Deciding what's "promising" is entirely the LLM's judgment, informed by the actual proof history — not a formula over goal count and depth.
-
-A state is **not** evicted from the frontier once expanded, so the director can always backtrack to it. That makes the per-state history the director sees on each turn load-bearing in both directions: failed tactics are listed with Lean's verbatim error, and successful ones are listed with the state id they produced (re-running a tactic that already worked just re-derives the same state, since `stable_hash` is computed over goals only).
-
-This replaced an earlier design (`BestFirstSearch` + `HeuristicValue`) that ranked states by `exp(-(1.0 × num_goals + 0.05 × depth))` and picked the highest-scoring state off a priority queue at each step. An eval across the hard/stretch problem tiers (same model, budget, and trial count) showed the ledger design matches or exceeds it:
-
-| Metric | Priority queue + heuristic | Ledger-guided |
-|---|---|---|
-| pass@5 (any pass) | 80% | **100%** |
-| pass@1 (mean rate) | 76% | **86%** |
-| stretch tier mean | 52% | **72%** |
-
-The heuristic couldn't read Lean semantics — it only counted open goals, so it had no way to tell "closer to a real proof" from "closer to a dead end that merely looks tidier," and it discarded failed-tactic error messages instead of feeding them back. The ledger design fixes both: navigation uses full proof context, and failures are recorded and summarized back to the LLM on the next turn.
-
-### One tactic per turn
-
-The director proposes exactly one tactic per turn. An earlier version let it propose up to `k = 8` independent candidates, and every candidate that succeeded became its own permanent frontier entry.
-
-That was removed. In practice the model used the `k` slots to encode fragments of a single sequential plan rather than genuinely independent alternatives, so one turn could fan out into several sibling branches at once — frontier growth outpacing the one-state-per-turn triage that's supposed to keep it in check. Nothing expressive was lost:
-
-- **Multi-step plans** — chain with `;` (`intro n; simp; omega`). Every verified sub-step still becomes its own frontier checkpoint, so a chain that fails partway keeps the progress it made.
-- **Hedging between alternatives** — use Lean's own `first | tac1 | tac2 | ...` inside the single tactic string. Lean picks the first that works and reports one atomic outcome, so hedging costs no extra frontier nodes.
-
----
-
-## Baseline: one-shot proving
-
-Search only earns its keep if it beats simply asking the model for a proof and fixing it a couple of times — so that baseline is implemented (`search/one_shot.py`) rather than assumed. It asks for a complete Lean proof in one call, runs it, and on failure feeds Lean's actual error back for a bounded number of retries (default 3), with no ledger and no frontier.
-
-```bash
-python scripts/one_shot_baseline.py --problems imo1968_tetrahedron,tournament_champion
-python scripts/one_shot_baseline.py --problems tournament_champion --max-fixes 2
-```
-
-One caveat worth knowing when interpreting results: on a hard problem, a thinking-enabled model can spend its entire `max_tokens` budget reasoning and return **no text at all** (`stop_reason: max_tokens`, real thinking tokens billed, empty response). This was observed on `imo1968_tetrahedron` at 8K, 20K, and 60K tokens. That's a genuine limitation of one-shot on hard problems, not a bug to paper over — see the note in `search/one_shot.py`.
-
----
 
 ## Evaluation
 
@@ -452,27 +413,3 @@ solved/not-solved and node counts as the signal, not the rates. Run
 
 ---
 
-## Key modules
-
-| Module | Purpose |
-|---|---|
-| `core/proof_state.py` | `ProofState`, `Goal`, `Hypothesis` data types |
-| `core/executor.py` | `LeanExecutor` protocol + `StepResult` |
-| `core/policy.py` | `PolicyModel` protocol + `TacticCandidate` |
-| `core/ledger.py` | `Ledger`, `LedgerEntry` — the search state `LedgerSearch` operates over |
-| `core/trace.py` | `TracingPolicy` — wraps a policy to capture every prompt/response verbatim |
-| `lean/repl.py` | `LeanWorker` (REPL subprocess) + `SubprocessExecutor` |
-| `lean/mock_executor.py` | `MockExecutor` for testing without Lean |
-| `policy/base.py` | `BaseLLMPolicy` — shared ledger serialization, prompt/parse logic, `DirectorResponse` |
-| `policy/anthropic.py` | `AnthropicPolicy` — calls Claude API |
-| `policy/deepseek.py` | `DeepSeekPolicy` — calls DeepSeek API (OpenAI-compatible) |
-| `policy/claude_cli.py` | `ClaudeCLIPolicy` — shells out to the `claude` CLI (bills a subscription, not API credits) |
-| `policy/mock.py` | `MockPolicy` — fixed tactics, no API calls |
-| `search/ledger_search.py` | `LedgerSearch` + `prove_parallel` |
-| `search/one_shot.py` | `OneShotProve` — the no-search baseline the whole project has to beat |
-| `eval/problems.py` | The curated eval problem set |
-| `eval/harness.py` | `run_eval` — runs problems, aggregates pass rates, writes traces |
-| `run.py` | CLI entrypoint for mathematicians |
-| `run_eval.py` | CLI entrypoint for the eval harness |
-| `scripts/trace_search.py` | Turn-by-turn trace of a single search run |
-| `scripts/one_shot_baseline.py` | Runs the one-shot baseline against eval problems |
