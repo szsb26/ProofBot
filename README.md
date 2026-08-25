@@ -32,6 +32,8 @@ The prover uses an LLM to generate proof steps. Choose a provider:
 
 ### 2. One-time setup
 
+Requires Python 3.11 and Lean 4.
+
 ```bash
 # Clone the repo
 git clone <repo-url>
@@ -147,30 +149,11 @@ python run.py "theorem foo : ∀ (p q : Prop), (p → q) → ¬q → ¬p := by"
 python run.py "theorem my_lemma : ∀ n : Nat, n * 2 = n + n := by"
 ```
 
-### 6. When the search fails
+For the full set of options — `--budget`, `--workers`, `--model`, `--policy`,
+`--interactive` — run `python run.py --help`. On a hard theorem, raising
+`--budget` and switching to a stronger model are the two levers that matter
+most.
 
-If the prover returns `✗ No proof found`, try:
-
-```bash
-# Give it more search budget (default is 100 nodes)
-python run.py "theorem foo : ..." --budget 300
-
-# Run multiple independent searches in parallel
-python run.py "theorem foo : ..." --workers 4
-
-# Both together for harder theorems
-python run.py "theorem foo : ..." --workers 4 --budget 200
-
-# Switch to a more powerful model
-python run.py "theorem foo : ..." --model claude-sonnet-5                    # Anthropic
-python run.py "theorem foo : ..." --policy deepseek --model deepseek-v4-pro  # DeepSeek
-```
-
-Model choice matters most on hard problems. On the two `stretch`-tier eval problems, `claude-sonnet-5` solved both, while `deepseek-v4-pro` solved one and exhausted its budget on the other.
-
-**Cost**: the default models (`claude-haiku-4-5`, `deepseek-v4-flash`) cost roughly $0.001 per proof attempt.
-
----
 
 ## Architecture
 
@@ -198,45 +181,6 @@ async def get_next_action(theorem: str, ledger: Ledger, premises: list[str]) -> 
 
 ---
 
-## Prerequisites
-
-- Python 3.11
-- Lean 4 / Mathlib (built via `lake build` inside `lean_project/`)
-
-## Setup
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-## Quick start
-
-```bash
-# Anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-python run.py "theorem foo : ∀ n : Nat, n + 0 = n := by"
-
-# DeepSeek
-export DEEPSEEK_API_KEY=sk-...
-python run.py "theorem foo : ∀ n : Nat, n + 0 = n := by" --policy deepseek
-```
-
-**Options:**
-
-```
-python run.py "theorem ..." --policy anthropic    # use Claude (default)
-python run.py "theorem ..." --policy deepseek     # use DeepSeek
-python run.py "theorem ..." --workers 4           # run 4 parallel searches
-python run.py "theorem ..." --budget 200          # expand up to 200 nodes per search
-python run.py "theorem ..." --model deepseek-v4-pro   # override the model
-python run.py "theorem ..." --api-key sk-...      # pass key directly
-python run.py --interactive                        # interactive session (load Mathlib once)
-python run.py -i --policy deepseek --workers 2    # interactive with options
-```
-
----
 
 ## Running tests
 
@@ -254,108 +198,6 @@ ANTHROPIC_API_KEY=sk-ant-... DEEPSEEK_API_KEY=sk-... pytest tests/ -q
 
 `LEAN_SKIP_MATHLIB=1` skips the `import LeanProject` step so REPL workers start in ~1s instead of ~300s. Use it when running infrastructure tests that don't exercise Mathlib tactics (`ring`, `linarith`, etc.).
 
-### Test suite overview
-
-| Class | Lean | API | What it tests |
-|---|---|---|---|
-| `TestParseGoalString` | No | No | Goal string parser |
-| `TestParseTactics` | No | No | LLM response parser |
-| `TestBuildUserPrompt` | No | No | Prompt builder |
-| `TestAnthropicPolicyGetTactics` | No | No (mocked) | AnthropicPolicy unit tests |
-| `TestDeepSeekPolicyGetTactics` | No | No (mocked) | DeepSeekPolicy unit tests |
-| `TestSerializeLedger` | No | No | Ledger → prompt rendering (incl. tried/applied lists, caps) |
-| `TestParseDirectorResponse` | No | No | Director JSON parsing |
-| `TestParseDirectorResponseRecovery` | No | No | Recovery from truncated/malformed director JSON |
-| `TestGetNextAction` | No | No (mocked) | Director call wiring + fallback contract |
-| `TestLedgerSearchProving` | No | No | Core search loop |
-| `TestLedgerSearchDirectorBehavior` | No | No | Abandonment, bogus ids, banned tactics, success recording |
-| `TestLedgerSearchIntermediateStates` | No | No | `;`-chain sub-step checkpointing |
-| `TestOneShotProve` | No | No | One-shot baseline + error-feedback retries |
-| `TestTracingPolicy` | No | No | Verbatim prompt/response capture |
-| `TestRunEval` / `TestEvalCLI` | No | No | Eval harness + CLI |
-| `TestSubprocessExecutor` | Yes | No | Lean REPL executor |
-| `TestProveParallelIntegration` | Yes | No (mock policy) | k parallel searches |
-| `TestCLIWithMock` | No | No | CLI arg parsing + mock stack |
-| `TestCLIInteractive` | No | No | Interactive mode (mock stack) |
-| `TestCLIIntegration` | Yes | No (mock policy) | CLI with real Lean |
-| `TestEndToEnd` | Yes | Anthropic | Full stack: Claude + Lean (simple + add_comm + contrapositive) |
-| `TestDeepSeekEndToEnd` | Yes | DeepSeek | Full stack: DeepSeek + Lean (simple + parallel + add_comm) |
-| `TestCLIEndToEnd` | Yes | Anthropic | Full stack via CLI |
-| `TestCLIDeepSeekEndToEnd` | Yes | DeepSeek | Full stack via CLI + DeepSeek |
-
----
-
-## API Usage
-
-### Single search (1 worker)
-
-```python
-import asyncio
-from policy.anthropic import AnthropicPolicy   # or: from policy.deepseek import DeepSeekPolicy
-from lean.repl import SubprocessExecutor
-from search.ledger_search import LedgerSearch
-
-async def main():
-    policy = AnthropicPolicy()       # reads ANTHROPIC_API_KEY from env
-    executor = SubprocessExecutor()
-
-    await executor.start()
-    search = LedgerSearch(policy=policy, executor=executor)
-
-    result = await search.prove(
-        "theorem foo : ∀ n : ℕ, n + 0 = n := by",
-        budget=100,
-    )
-
-    if result.success:
-        print(result.proof_trace)    # e.g. ["intro n", "simp"]
-
-    await executor.close()
-    await policy.close()
-
-asyncio.run(main())
-```
-
-### Parallel search (k workers)
-
-```python
-import asyncio
-from policy.deepseek import DeepSeekPolicy     # or AnthropicPolicy
-from lean.repl import SubprocessExecutor
-from search.ledger_search import LedgerSearch, prove_parallel
-
-async def main():
-    k = 4
-    policy = DeepSeekPolicy()        # reads DEEPSEEK_API_KEY from env
-
-    executors = [SubprocessExecutor() for _ in range(k)]
-    await asyncio.gather(*[e.start() for e in executors])
-
-    searches = [
-        LedgerSearch(policy=policy, executor=e)
-        for e in executors
-    ]
-
-    result = await prove_parallel(
-        "theorem foo : ∀ n : ℕ, n + 0 = n := by",
-        searches=searches,
-        budget=100,
-    )
-
-    print(result.success, result.proof_trace)
-
-    for e in executors:
-        await e.close()
-    await policy.close()
-
-asyncio.run(main())
-```
-
-Each component is swappable:
-- Replace `AnthropicPolicy`/`DeepSeekPolicy` with `MockPolicy` to test without API calls
-- Replace `SubprocessExecutor` with `MockExecutor` to test without Lean
-
----
 
 ## Supported policies
 
