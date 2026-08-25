@@ -397,11 +397,13 @@ class TestDirectorSystemPromptGuidance:
     def test_prompt_explains_tactics_apply_to_the_first_goal(self):
         assert "FIRST goal" in DIRECTOR_SYSTEM_PROMPT
 
-    def test_prompt_teaches_bare_have_to_open_a_subgoal(self):
+    def test_prompt_states_how_the_two_have_forms_behave(self):
+        """Mechanism, not preference: the model cannot infer from Lean alone
+        that our executor verifies `:= by ...` atomically while a bare
+        `have` is checkpointed per step. State both behaviors and let the
+        model choose."""
         assert "have name : statement" in DIRECTOR_SYSTEM_PROMPT
-        assert "NO `:= by ...` proof" in DIRECTOR_SYSTEM_PROMPT
-
-    def test_prompt_warns_that_inline_by_proofs_are_all_or_nothing(self):
+        assert "NO `:= by ...` attached" in DIRECTOR_SYSTEM_PROMPT
         assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
 
     def test_prompt_asks_for_exactly_one_tactic(self):
@@ -429,33 +431,47 @@ class TestDirectorSystemPromptGuidance:
         happened for 24 turns of one real tournament_champion run."""
         assert "every currently open proof state" not in DIRECTOR_SYSTEM_PROMPT
 
-    def test_prompt_does_not_recommend_specific_solver_tactics(self):
-        """The prompt describes how THIS system works and leaves choosing a
-        tactic to the model. It used to name a preferred set of
-        general-purpose solvers, and that list was miscalibrated: it
-        offered `omega` (integers/naturals only, inapplicable to a
+    def test_prompt_encodes_rules_not_proof_advice(self):
+        """The prompt states the rules of THIS system — the response schema,
+        what happens to an abandoned state, how `;` vs `<;>` behave, how the
+        two `have` forms are verified, what is persisted between turns — and
+        leaves every question of how to actually prove something to the
+        model.
+
+        Two suggestion sets were removed after measuring them. (1) A list of
+        preferred solvers (aesop/simp/omega/nlinarith) that was itself
+        miscalibrated: it offered `omega` (integers only, inapplicable to a
         real-valued goal) and `nlinarith` (the nonlinear extension) while
         omitting `linarith`, the complete decision procedure for the
-        linear-real goals that showed up in practice. Measured on
-        imo1968_tetrahedron: the failing DeepSeek run leaned on the
-        suggested tactics (nlinarith 21x, simp 10x) and used linarith only
-        6x, while Sonnet's successful proof used none of the suggested
-        tactics and closed every branch with linarith.
+        linear-real goals that actually appeared. On imo1968_tetrahedron the
+        failing DeepSeek run leaned on the suggested tactics (nlinarith 21x,
+        simp 10x) and used linarith only 6x, while Sonnet's winning proof
+        used none of them and closed every branch with linarith. (2) A
+        recommendation to reach for `apply?`/`exact?` when unsure of a lemma
+        name: across all 8 valid winning proofs those tactics appear zero
+        times, while every failed run used them 1-5 times.
 
-        Hand-coded tactic preferences are also the same class of mistake as
-        the retired value function — a human heuristic that cannot read the
-        goal, placed where the model's judgment belongs. Keep search-tactic
-        guidance (apply?/exact?), which is about not hallucinating lemma
-        names, and leave solver choice alone."""
-        for banned in ("`aesop`", "`omega`", "`nlinarith`", "`simp`"):
+        This is the same class of mistake as the retired value function — a
+        human heuristic that cannot read the goal, placed where the model's
+        judgment belongs."""
+        for banned in ("`aesop`", "`omega`", "`nlinarith`", "`simp`", "apply?", "exact?"):
             assert banned not in DIRECTOR_SYSTEM_PROMPT, (
-                f"{banned} is recommended in the director prompt; solver "
-                "choice should be left to the model"
+                f"{banned} is suggested in the director prompt; how to prove "
+                "the goal is the model's call, not ours"
             )
-        # The genuinely useful part — don't guess lemma names — stays.
-        assert "apply?" in DIRECTOR_SYSTEM_PROMPT
-        assert "exact?" in DIRECTOR_SYSTEM_PROMPT
+        for hedge in ("Strongly prefer", "prefer a search tactic", "Do not abandon a state just because"):
+            assert hedge not in DIRECTOR_SYSTEM_PROMPT, (
+                f"{hedge!r} is proof advice, not a rule of this system"
+            )
 
+    def test_prompt_still_states_the_mechanisms_the_model_cannot_infer(self):
+        """Removing advice must not remove the environment's actual rules."""
+        assert "abandon" in DIRECTOR_SYSTEM_PROMPT          # what abandoning does
+        assert "shown back to you on later turns" in DIRECTOR_SYSTEM_PROMPT  # reasoning is persisted
+        assert "exactly ONE tactic" in DIRECTOR_SYSTEM_PROMPT
+        assert "<;>" in DIRECTOR_SYSTEM_PROMPT
+        assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
+        assert "Respond with JSON only" in DIRECTOR_SYSTEM_PROMPT
 
 # ---------------------------------------------------------------------------
 # parse_director_response
