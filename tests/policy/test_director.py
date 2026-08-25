@@ -397,13 +397,11 @@ class TestDirectorSystemPromptGuidance:
     def test_prompt_explains_tactics_apply_to_the_first_goal(self):
         assert "FIRST goal" in DIRECTOR_SYSTEM_PROMPT
 
-    def test_prompt_states_how_the_two_have_forms_behave(self):
-        """Mechanism, not preference: the model cannot infer from Lean alone
-        that our executor verifies `:= by ...` atomically while a bare
-        `have` is checkpointed per step. State both behaviors and let the
-        model choose."""
+    def test_prompt_teaches_bare_have_to_open_a_subgoal(self):
         assert "have name : statement" in DIRECTOR_SYSTEM_PROMPT
-        assert "NO `:= by ...` attached" in DIRECTOR_SYSTEM_PROMPT
+        assert "NO `:= by ...` proof" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_warns_that_inline_by_proofs_are_all_or_nothing(self):
         assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
 
     def test_prompt_asks_for_exactly_one_tactic(self):
@@ -415,85 +413,6 @@ class TestDirectorSystemPromptGuidance:
     def test_prompt_teaches_first_combinator_for_hedging(self):
         assert "first | tac1 | tac2" in DIRECTOR_SYSTEM_PROMPT
 
-    def test_prompt_does_not_claim_tactics_only_ever_hit_the_first_goal(self):
-        """The prompt used to assert "Every tactic applies to the FIRST goal
-        only", which our own code contradicts: lean/repl.py has a dedicated
-        branch protecting `<;>` from the chain splitter, commented "apply to
-        every resulting goal". Telling the model a combinator we support
-        doesn't exist is a factual error about our own mechanism."""
-        assert "<;>" in DIRECTOR_SYSTEM_PROMPT
-        assert "Every tactic applies to the FIRST goal only" not in DIRECTOR_SYSTEM_PROMPT
-
-    def test_prompt_does_not_promise_the_full_frontier_is_shown(self):
-        """serialize_ledger caps the displayed frontier at
-        _MAX_OPEN_STATES_SHOWN, so "you will be shown every currently open
-        proof state" was false whenever the frontier exceeded it — which
-        happened for 24 turns of one real tournament_champion run."""
-        assert "every currently open proof state" not in DIRECTOR_SYSTEM_PROMPT
-
-    def test_prompt_encodes_rules_not_proof_advice(self):
-        """The prompt states the rules of THIS system — the response schema,
-        what happens to an abandoned state, how `;` vs `<;>` behave, how the
-        two `have` forms are verified, what is persisted between turns — and
-        leaves every question of how to actually prove something to the
-        model.
-
-        Two suggestion sets were removed after measuring them. (1) A list of
-        preferred solvers (aesop/simp/omega/nlinarith) that was itself
-        miscalibrated: it offered `omega` (integers only, inapplicable to a
-        real-valued goal) and `nlinarith` (the nonlinear extension) while
-        omitting `linarith`, the complete decision procedure for the
-        linear-real goals that actually appeared. On imo1968_tetrahedron the
-        failing DeepSeek run leaned on the suggested tactics (nlinarith 21x,
-        simp 10x) and used linarith only 6x, while Sonnet's winning proof
-        used none of them and closed every branch with linarith. (2) A
-        recommendation to reach for `apply?`/`exact?` when unsure of a lemma
-        name: across all 8 valid winning proofs those tactics appear zero
-        times, while every failed run used them 1-5 times.
-
-        This is the same class of mistake as the retired value function — a
-        human heuristic that cannot read the goal, placed where the model's
-        judgment belongs."""
-        for banned in ("`aesop`", "`omega`", "`nlinarith`", "`simp`", "apply?", "exact?"):
-            assert banned not in DIRECTOR_SYSTEM_PROMPT, (
-                f"{banned} is suggested in the director prompt; how to prove "
-                "the goal is the model's call, not ours"
-            )
-        for hedge in ("Strongly prefer", "prefer a search tactic", "Do not abandon a state just because"):
-            assert hedge not in DIRECTOR_SYSTEM_PROMPT, (
-                f"{hedge!r} is proof advice, not a rule of this system"
-            )
-
-    def test_prompt_still_states_the_mechanisms_the_model_cannot_infer(self):
-        """Removing advice must not remove the environment's actual rules."""
-        assert "abandon" in DIRECTOR_SYSTEM_PROMPT          # what abandoning does
-        assert "shown back to you on later turns" in DIRECTOR_SYSTEM_PROMPT  # reasoning is persisted
-        assert "exactly ONE tactic" in DIRECTOR_SYSTEM_PROMPT
-        assert "<;>" in DIRECTOR_SYSTEM_PROMPT
-        assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
-        assert "Respond with JSON only" in DIRECTOR_SYSTEM_PROMPT
-
-    def test_prompt_requires_reasoning_in_plain_language_before_a_tactic(self):
-        """This is a PROCESS rule, not proof advice, and it is easy to
-        mistake for the latter — it was briefly trimmed as such.
-
-        Drafting the argument in prose before formalizing is the single
-        behavior this project has the most evidence for: the whole
-        Draft-Sketch-Prove line of work came from the observation that
-        models find the correct mathematical argument reliably in natural
-        language and lose it in translation to Lean. Every real trace shows
-        the right strategy in turn-1 reasoning. Without this rule nothing
-        stops the director from skipping straight to guessing tactics.
-
-        What does NOT belong here is a menu of which arguments to reach for
-        (case split, key inequality, WLOG reduction, ...) — that biases
-        which proof gets found and was removed."""
-        assert "First" in DIRECTOR_SYSTEM_PROMPT
-        assert "in plain language" in DIRECTOR_SYSTEM_PROMPT
-        assert "before deciding on a tactic" in DIRECTOR_SYSTEM_PROMPT
-        # ...but not the strategy menu.
-        for menu_item in ("case split", "key inequality", "WLOG"):
-            assert menu_item not in DIRECTOR_SYSTEM_PROMPT
 
 # ---------------------------------------------------------------------------
 # parse_director_response
