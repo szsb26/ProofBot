@@ -121,6 +121,28 @@ def _make_api_response(text: str) -> MagicMock:
     return response
 
 
+class _FakeStreamManager:
+    """
+    Fake for the object returned by client.messages.stream(...) -- an async
+    context manager whose get_final_message() yields the complete Message,
+    mirroring how AnthropicPolicy._call_api actually consumes it (see
+    policy/anthropic.py: streaming, not a single buffered create() call, so
+    a stalled response fails on the read timeout instead of hanging).
+    """
+
+    def __init__(self, final_message):
+        self._final_message = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def get_final_message(self):
+        return self._final_message
+
+
 def _make_thinking_then_text_response(thinking: str, text: str) -> MagicMock:
     """
     Build a fake response shaped like the newest Claude generation, which
@@ -145,9 +167,12 @@ def _make_thinking_then_text_response(thinking: str, text: str) -> MagicMock:
 def mock_policy():
     """AnthropicPolicy with the AsyncAnthropic client replaced by a mock."""
     with patch("policy.anthropic.AsyncAnthropic") as MockClient:
-        # messages.create is awaited, so it must be an AsyncMock
+        # messages.stream(...) itself is a plain (sync) call that returns an
+        # async context manager -- MagicMock, not AsyncMock. The awaiting
+        # happens inside the `async with` / get_final_message(), which
+        # _FakeStreamManager provides.
         mock_instance = MagicMock()
-        mock_instance.messages.create = AsyncMock()
+        mock_instance.messages.stream = MagicMock()
         mock_instance.close = AsyncMock()
         MockClient.return_value = mock_instance
 
@@ -160,7 +185,7 @@ class TestAnthropicPolicyGetTactics:
     async def test_returns_tactic_candidates(self, mock_policy):
         """Normal response should be parsed into TacticCandidate objects."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_api_response("simp\nring\nomega")
+        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp\nring\nomega"))
 
         state = make_proof_state(["n + 0 = n"])
         results = await policy.get_tactics(state, [], k=3)
@@ -178,10 +203,10 @@ class TestAnthropicPolicyGetTactics:
         raises AttributeError. The real answer must still be found in a
         later text block instead of crashing."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_thinking_then_text_response(
+        client.messages.stream.return_value = _FakeStreamManager(_make_thinking_then_text_response(
             thinking="Let me work through this proof step by step...",
             text="simp\nring\nomega",
-        )
+        ))
 
         state = make_proof_state(["n + 0 = n"])
         results = await policy.get_tactics(state, [], k=3)
@@ -192,7 +217,7 @@ class TestAnthropicPolicyGetTactics:
     async def test_log_probs_are_descending(self, mock_policy):
         """First candidate should have the highest log_prob (closest to 0)."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_api_response("simp\nring\nomega")
+        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp\nring\nomega"))
 
         state = make_proof_state(["n + 0 = n"])
         results = await policy.get_tactics(state, [], k=3)
@@ -203,9 +228,9 @@ class TestAnthropicPolicyGetTactics:
     async def test_respects_k_limit(self, mock_policy):
         """Should return at most k candidates even if Claude outputs more."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_api_response(
+        client.messages.stream.return_value = _FakeStreamManager(_make_api_response(
             "simp\nring\nomega\nlinarith\ndecide\nrfl\nnorm_num\ntauto"
-        )
+        ))
         state = make_proof_state(["P"])
         results = await policy.get_tactics(state, [], k=4)
         assert len(results) == 4
@@ -213,12 +238,12 @@ class TestAnthropicPolicyGetTactics:
     async def test_premises_passed_to_api(self, mock_policy):
         """Premises should appear in the message sent to the API."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_api_response("simp")
+        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp"))
 
         state = make_proof_state(["n + 0 = n"])
         await policy.get_tactics(state, ["Nat.add_zero", "Nat.add_comm"], k=1)
 
-        _, kwargs = client.messages.create.call_args
+        _, kwargs = client.messages.stream.call_args
         user_content = kwargs["messages"][0]["content"]
         assert "Nat.add_zero" in user_content
         assert "Nat.add_comm" in user_content
@@ -230,12 +255,12 @@ class TestAnthropicPolicyGetTactics:
         after the first pay the cheaper cache-read rate for it instead of
         full input price."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_api_response("simp")
+        client.messages.stream.return_value = _FakeStreamManager(_make_api_response("simp"))
 
         state = make_proof_state(["n + 0 = n"])
         await policy.get_tactics(state, [], k=1)
 
-        _, kwargs = client.messages.create.call_args
+        _, kwargs = client.messages.stream.call_args
         system = kwargs["system"]
         assert isinstance(system, list)
         assert system[0]["cache_control"] == {"type": "ephemeral"}
@@ -244,7 +269,7 @@ class TestAnthropicPolicyGetTactics:
     async def test_api_failure_returns_simp_fallback(self, mock_policy):
         """If the API raises, the policy should return [simp] rather than crashing."""
         policy, client = mock_policy
-        client.messages.create.side_effect = Exception("network error")
+        client.messages.stream.side_effect = Exception("network error")
 
         state = make_proof_state(["n + 0 = n"])
         results = await policy.get_tactics(state, [], k=4)
@@ -255,7 +280,7 @@ class TestAnthropicPolicyGetTactics:
     async def test_empty_response_falls_back_to_simp(self, mock_policy):
         """An empty API response should not crash — fall back to simp."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_api_response("")
+        client.messages.stream.return_value = _FakeStreamManager(_make_api_response(""))
 
         state = make_proof_state(["P"])
         results = await policy.get_tactics(state, [], k=4)
@@ -265,9 +290,9 @@ class TestAnthropicPolicyGetTactics:
     async def test_numbered_response_parsed_correctly(self, mock_policy):
         """Claude sometimes numbers its output — numbering should be stripped."""
         policy, client = mock_policy
-        client.messages.create.return_value = _make_api_response(
+        client.messages.stream.return_value = _FakeStreamManager(_make_api_response(
             "1. intro n\n2. simp\n3. omega"
-        )
+        ))
         state = make_proof_state(["∀ n : ℕ, n + 0 = n"])
         results = await policy.get_tactics(state, [], k=3)
 
