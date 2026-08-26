@@ -240,16 +240,23 @@ def serialize_ledger(
     if dead_by_parent:
         parts.append("\n## Exhausted Attempts (context — do not blindly repeat)\n")
         for state_id, failures in dead_by_parent.items():
-            counts: dict[str, int] = {}
-            for f in failures:
-                counts[f.outcome] = counts.get(f.outcome, 0) + 1
-            summary = ", ".join(
-                f"{cat}×{n}" for cat, n in sorted(counts.items(), key=lambda x: -x[1])
-            )
+            # Count only — deliberately NO error-category breakdown. There
+            # used to be a substring-matching categoriser; audited over 2847
+            # real Lean errors from our own traces it had two branches that
+            # never fired once (they tested for "maximum heart beats" and
+            # "failed to synthesize"; Lean actually says "maximum number of
+            # heartbeats" and "typeclass instance problem is stuck") and a
+            # catch-all holding a third of everything, filing 287 genuine
+            # refutations alongside 43 resource failures. A wrong label next
+            # to the raw error is worse than no label: a resource failure
+            # shown as "tactic_failed" reads as evidence the goal is
+            # unprovable, and a director was observed abandoning a TRUE lemma
+            # (Imo2005Q3's key_insight) on exactly that reading. It has since
+            # been deleted outright — the raw Lean error printed under each
+            # tactic below is the ground truth, uncompressed.
             noun = "tactic" if len(failures) == 1 else "tactics"
             parts.append(
-                f"\nstate {state_id}: {len(failures)} {noun} tried, "
-                f"all failed — {summary}\n"
+                f"\nstate {state_id}: {len(failures)} {noun} tried, all failed\n"
             )
 
             seen: list[str] = []

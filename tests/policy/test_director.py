@@ -94,7 +94,7 @@ class TestSerializeLedger:
                 # A shallow state (guaranteed to be evicted) with a
                 # recorded failure — its failure history must not leak
                 # into the prompt once the state itself is off-screen.
-                ledger.record_failure(state_id, "a_uniquely_named_failed_tactic", "tactic_failed")
+                ledger.record_failure(state_id, "a_uniquely_named_failed_tactic")
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "a_uniquely_named_failed_tactic" not in text
@@ -116,35 +116,79 @@ class TestSerializeLedger:
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "intro n, simp" in text
 
-    def test_summarizes_dead_branches_with_category_counts(self):
+    def test_summarizes_dead_branches_by_count_without_category_labels(self):
+        """Dead branches are summarised by COUNT plus the raw Lean error —
+        never by an error category.
+
+        Categorising Lean errors by hand-written substring was audited over
+        2847 real errors from our own traces and found unreliable enough to
+        be worse than useless: two of the nine categories matched strings
+        Lean never emits (`max_heartbeats` tested "maximum heart beats" while
+        Lean says "maximum number of heartbeats"; `typeclass_failure` tested
+        "failed to synthesize" while Lean says "typeclass instance problem is
+        stuck") so neither ever fired once, and the `tactic_failed` catch-all
+        held a third of everything — 287 genuine linarith refutations
+        labelled identically to 43 resource failures.
+
+        A wrong label is worse than none, because it sits directly above the
+        raw error and contradicts it: a resource failure rendered as
+        "tactic_failed" reads as evidence the goal is unprovable. A director
+        was observed abandoning a TRUE lemma (Imo2005Q3's key_insight — the
+        one a successful run went on to prove) after a tactic died on it,
+        reasoning that the lemma "appears false".
+
+        The categoriser has since been deleted outright, so this guards the
+        rendering against anyone reintroducing one.
+        """
         ledger = Ledger()
         state = make_proof_state(["n = n"])
         state_id = ledger.add_state(state)
-        ledger.record_failure(state_id, "bad1", "hallucinated_lemma")
-        ledger.record_failure(state_id, "bad2", "hallucinated_lemma")
-        ledger.record_failure(state_id, "bad3", "type_mismatch")
+        ledger.record_failure(state_id, "bad1", "unsolved goals\n⊢ n = n")
+        ledger.record_failure(state_id, "bad2", "Unknown identifier `nope`")
+        ledger.record_failure(state_id, "bad3", "internal exception #5")
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Exhausted Attempts" in text
-        assert "hallucinated_lemma×2" in text
-        assert "type_mismatch×1" in text
+        assert "3 tactics tried, all failed" in text
+        # every raw error survives verbatim...
+        assert "unsolved goals" in text
+        assert "Unknown identifier `nope`" in text
+        assert "internal exception #5" in text
+        # ...and no category tally is rendered.
+        assert "×" not in text
+        for category in ("hallucinated_lemma", "type_mismatch", "tactic_failed"):
+            assert category not in text
+
+    def test_ledger_records_only_success_or_failed_not_a_category(self):
+        """LedgerEntry.outcome is a two-valued discriminator. Three call
+        sites depend on `outcome != "success"` to separate failures from
+        successes; none has ever read a category value out of it."""
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "bad1", "Unknown identifier `nope`")
+
+        entry = ledger.entries[-1]
+        assert entry.outcome == "failed"
+        assert entry.error == "Unknown identifier `nope`"
 
     def test_failure_summary_and_tactic_list_are_on_separate_lines(self):
         """The summary line had no trailing newline, so every failed state
-        in every prompt rendered as
-        "...tactic_failed×1Tactics already tried here — do not repeat"."""
+        in every prompt ran the two together on one line, as
+        "...1 tactic tried, all failedTactics already tried here — ...".
+        (Pre-dates the removal of category labels, which is why the original
+        bug report showed "tactic_failed×1Tactics".)"""
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
-        ledger.record_failure(state_id, "omega", "tactic_failed")
+        ledger.record_failure(state_id, "omega")
 
         text = serialize_ledger("theorem foo := by", ledger, [])
-        assert "tactic_failed×1Tactics" not in text
-        assert "tactic_failed×1\nTactics already tried here" in text
+        assert "all failedTactics" not in text
+        assert "all failed\nTactics already tried here" in text
 
     def test_failure_count_is_singular_for_one_tactic(self):
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
-        ledger.record_failure(state_id, "omega", "tactic_failed")
+        ledger.record_failure(state_id, "omega")
         assert "1 tactic tried" in serialize_ledger("theorem foo := by", ledger, [])
 
     def test_lists_specific_failed_tactics_to_prevent_verbatim_repeats(self):
@@ -153,7 +197,7 @@ class TestSerializeLedger:
         tell it's about to repeat a verbatim failure."""
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
-        ledger.record_failure(state_id, "omega", "tactic_failed")
+        ledger.record_failure(state_id, "omega")
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Tactics already tried here" in text
@@ -163,8 +207,8 @@ class TestSerializeLedger:
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         for _ in range(4):
-            ledger.record_failure(state_id, "omega", "tactic_failed")
-        ledger.record_failure(state_id, "ring_nf", "tactic_failed")
+            ledger.record_failure(state_id, "omega")
+        ledger.record_failure(state_id, "ring_nf")
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert text.count("- omega") == 1
@@ -192,7 +236,7 @@ class TestSerializeLedger:
         propose again."""
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
-        ledger.record_failure(state_id, "omega", "tactic_failed")
+        ledger.record_failure(state_id, "omega")
         for i in range(20):
             ledger.record_failure(
                 state_id, f"exact SomeVeryLongLemmaName.tactic_number_{i}", "tactic_failed"
@@ -216,12 +260,11 @@ class TestSerializeLedger:
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         for i in range(16):
-            ledger.record_failure(state_id, f"omega{i}", "tactic_failed")
+            ledger.record_failure(state_id, f"omega{i}")
         for i in range(50):
             ledger.record_failure(
                 state_id,
                 f"have h{i} : some_long_proposition_{i} := by some_long_proof_term_{i}",
-                "tactic_failed",
             )
 
         text = serialize_ledger("theorem foo := by", ledger, [])
@@ -233,7 +276,7 @@ class TestSerializeLedger:
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         long_tactic = "induction n with\n| zero => simp\n| succ n ih => " + ("x" * 150)
-        ledger.record_failure(state_id, long_tactic, "tactic_failed")
+        ledger.record_failure(state_id, long_tactic)
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "\n| zero" not in text  # flattened to one line
@@ -249,7 +292,7 @@ class TestSerializeLedger:
         ledger = Ledger()
         state = make_proof_state(["n = n"])
         state_id = ledger.add_state(state)
-        ledger.record_failure(state_id, "bad", "hallucinated_lemma")
+        ledger.record_failure(state_id, "bad")
         ledger.abandon([state_id])
 
         text = serialize_ledger("theorem foo := by", ledger, [])
@@ -341,8 +384,7 @@ class TestSerializeLedger:
         ledger.record_failure(
             state_id,
             "exact Finset.card_lt_card hsub",
-            "type_mismatch",
-            "Lean error:\ntype mismatch\n  hsub\nhas type\n  s ⊆ t\nbut is expected to have type\n  s ⊂ t",
+                        "Lean error:\ntype mismatch\n  hsub\nhas type\n  s ⊆ t\nbut is expected to have type\n  s ⊂ t",
         )
 
         text = serialize_ledger("theorem foo := by", ledger, [])
@@ -352,7 +394,7 @@ class TestSerializeLedger:
     def test_no_error_line_when_error_is_blank(self):
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
-        ledger.record_failure(state_id, "omega", "tactic_failed")
+        ledger.record_failure(state_id, "omega")
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "→" not in text
@@ -365,7 +407,7 @@ class TestSerializeLedger:
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         huge_error = "Try this: " + ("x" * 5000)
-        ledger.record_failure(state_id, "exact?", "tactic_failed", huge_error)
+        ledger.record_failure(state_id, "exact?", huge_error)
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "[truncated]" in text
@@ -378,10 +420,10 @@ class TestSerializeLedger:
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
         ledger.record_failure(
-            state_id, "omega", "tactic_failed", "unsolved goals\n⊢ False"
+            state_id, "omega", "unsolved goals\n⊢ False"
         )
         ledger.record_failure(
-            state_id, "omega", "tactic_failed", "unsolved goals\n⊢ False"
+            state_id, "omega", "unsolved goals\n⊢ False"
         )
 
         text = serialize_ledger("theorem foo := by", ledger, [])

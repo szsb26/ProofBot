@@ -227,7 +227,10 @@ class TestOneShotProve:
         assert not result.result.success
         assert result.result.failure_reason == "draft_failed"
 
-    def test_tactic_errors_are_aggregated(self):
+    def test_every_attempt_is_used_before_giving_up(self):
+        """Replaces an old test that counted error CATEGORIES; the
+        categoriser was removed as unreliable, so assert on the observable
+        behaviour instead — both attempts run, then it reports exhaustion."""
         executor = ScriptedExecutor(outcomes={"bad1": "type mismatch", "bad2": "unknown identifier"})
         policy = FakeOneShotPolicy(["bad1", "bad2"])
         prover = OneShotProve(policy=policy, executor=executor, max_fixes=1)
@@ -235,7 +238,8 @@ class TestOneShotProve:
         result = asyncio.run(prover.prove("theorem foo : n + 0 = n := by"))
 
         assert not result.result.success
-        assert sum(result.result.tactic_errors.values()) == 2
+        assert result.attempts_used == 2
+        assert result.result.failure_reason == "fixes_exhausted"
 
     def test_uses_one_shot_system_prompt(self):
         from search.one_shot import ONE_SHOT_SYSTEM_PROMPT

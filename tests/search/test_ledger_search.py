@@ -17,24 +17,7 @@ from core.proof_state import ProofState, make_goal, make_proof_state
 from lean.mock_executor import MockExecutor
 from policy.base import DirectorResponse
 from policy.mock import MockPolicy
-from search.ledger_search import LedgerSearch, ProofResult, _classify_tactic_error, prove_parallel
-
-
-class TestClassifyTacticError:
-
-    def test_expected_end_of_input_is_syntax_error(self):
-        """Regression coverage: the REPL's tactic-stepping endpoint only
-        parses one atomic tactic per call, so an unsplit ';'-chain used to
-        fail with "expected end of input" and land in the generic
-        tactic_failed bucket rather than being flagged as a syntax issue.
-        Chaining is now split before it reaches Lean, but this stays as a
-        safety net for any remaining unsplit case."""
-        error = "Lean error:\n<input>:1:11: expected end of input"
-        assert _classify_tactic_error(error) == "syntax_error"
-
-    def test_unexpected_end_of_input_still_syntax_error(self):
-        error = "Lean error:\nunexpected end of input"
-        assert _classify_tactic_error(error) == "syntax_error"
+from search.ledger_search import LedgerSearch, ProofResult, prove_parallel
 
 
 class ErroringExecutor:
@@ -257,11 +240,17 @@ class TestLedgerSearchDirectorBehavior:
         # actually closes it.
         assert result.proof_trace == ["simp"]
 
-    def test_frontier_exhausted_when_only_state_is_abandoned(self):
-        """If the director abandons the only open state — targeting a
-        different chosen_state, so this isn't the self-referential case
-        below — the search fails with frontier_exhausted rather than
-        looping forever."""
+    def test_abandoning_the_only_state_is_refused_so_the_search_continues(self):
+        """An abandonment that would empty the frontier is NOT honoured.
+
+        The loop terminates on `not ledger.frontier`, so honouring such a
+        request ends the entire search — which is never what the director
+        means by pruning. Observed live on imo2011_q3: turn 25 abandoned 11
+        states at once and the run reported frontier_exhausted having spent
+        only 25 of its 50 calls. Deciding when to stop is the budget's job.
+
+        The search must therefore run to budget here (and still terminate —
+        the original point of this test was that it must not loop forever)."""
 
         class AbandonOnlyStatePolicy:
             def __init__(self):
@@ -283,8 +272,10 @@ class TestLedgerSearchDirectorBehavior:
         search = LedgerSearch(policy=AbandonOnlyStatePolicy(), executor=MockExecutor())
         result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=10))
         assert not result.success
-        assert result.failure_reason == "frontier_exhausted"
-        assert result.nodes_visited == 2
+        # The refused abandon keeps the frontier alive, so the run now uses
+        # the budget it was given instead of dying on turn 2.
+        assert result.failure_reason == "budget_exhausted"
+        assert result.nodes_visited == 10
 
     def test_self_abandon_of_chosen_state_is_ignored(self):
         """A director response that both chooses and abandons the same
@@ -649,3 +640,88 @@ class TestLedgerSearchProveParallel:
         ))
         assert result.success
         assert "intro n" in result.proof_trace
+
+
+class TestAbandonmentIsRecoverable:
+    """
+    Two defects found by inspecting the raw REPL log of a real imo2011_q3
+    run: the director abandoned a state on turn 24, asked for it back on
+    turn 25, and the search both discarded that turn AND terminated with
+    half its budget unspent.
+    """
+
+    def test_choosing_a_previously_abandoned_state_restores_it(self):
+        """The exact imo2011_q3 sequence: a state is abandoned on one turn
+        and explicitly chosen on a later one. Before restore() the turn was
+        silently discarded — the executor was never called at all.
+
+        Turn 1 expands the root so a second state exists (an abandon that
+        would empty the frontier is refused, which would mask this).
+        Turn 2 works on the child and abandons the root.
+        Turn 3 asks for the root back; the executor MUST be asked to step it.
+        """
+        stepped: list[str] = []
+
+        class CountingExecutor(MockExecutor):
+            async def step(self, state, tactic):
+                stepped.append(tactic)
+                return await super().step(state, tactic)
+
+        class AbandonThenReselect:
+            def __init__(self):
+                self.turn = 0
+                self.root = None
+
+            async def get_next_action(self, theorem, ledger, premises):
+                self.turn += 1
+                ids = list(ledger.frontier)
+                if self.turn == 1:
+                    self.root = ids[0]
+                    return DirectorResponse(self.root, [], "intro n")
+                if self.turn == 2:
+                    child = [i for i in ids if i != self.root]
+                    return DirectorResponse(
+                        child[0] if child else ids[0],
+                        [self.root] if child else [],
+                        "nope",
+                    )
+                # Turn 3+: ask for the abandoned root back.
+                return DirectorResponse(self.root, [], "reselected-tactic")
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=AbandonThenReselect(), executor=CountingExecutor())
+        asyncio.run(search.prove("theorem foo : ∀ n : ℕ, n + 0 = n := by", budget=3))
+
+        assert "reselected-tactic" in stepped, (
+            "turn 3 chose a previously abandoned state and was discarded "
+            "instead of restoring it"
+        )
+
+    def test_abandon_that_would_empty_the_frontier_is_ignored(self):
+        """Directly exercises the refusal: the policy tries to abandon every
+        open state every turn, and the search must still run to budget."""
+
+        class AbandonEverything:
+            async def get_next_action(self, theorem, ledger, premises):
+                every = list(ledger.frontier)
+                return DirectorResponse("nonexistent-id", every, "simp")
+
+        search = LedgerSearch(policy=AbandonEverything(), executor=MockExecutor())
+        result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=6))
+        assert result.failure_reason == "budget_exhausted"
+        assert result.nodes_visited == 6
+
+    def test_partial_abandon_is_still_honoured(self):
+        """The refusal must be narrow — pruning that leaves something open
+        still works, or the director loses the ability to prune at all."""
+        from core.ledger import Ledger as _L
+        from core.proof_state import make_proof_state as _mps
+
+        ledger = _L()
+        a = ledger.add_state(_mps(["goal a"]))
+        b = ledger.add_state(_mps(["goal b"]))
+        ledger.abandon([a])
+        assert a not in ledger.frontier
+        assert b in ledger.frontier

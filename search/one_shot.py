@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from core.executor import LeanExecutor
 from policy.base import BaseLLMPolicy
-from search.ledger_search import ProofResult, _classify_tactic_error, _contains_banned_tactic
+from search.ledger_search import ProofResult, _contains_banned_tactic
 
 ONE_SHOT_SYSTEM_PROMPT = (
     "You are an expert Lean 4 theorem prover. Given a theorem statement "
@@ -128,7 +128,6 @@ class OneShotProve:
                 attempts_used=0,
             )
 
-        tactic_errors: dict[str, int] = {}
         previous_proof = ""
         previous_error = ""
 
@@ -153,7 +152,6 @@ class OneShotProve:
                         success=False, proof_trace=[], nodes_visited=attempt,
                         elapsed_ms=(time.perf_counter() - start) * 1000,
                         theorem=theorem, error=str(e), failure_reason="draft_failed",
-                        tactic_errors=tactic_errors,
                     ),
                     attempts_used=attempt,
                 )
@@ -178,14 +176,11 @@ class OneShotProve:
                         nodes_visited=attempt + 1,
                         elapsed_ms=(time.perf_counter() - start) * 1000,
                         theorem=theorem,
-                        tactic_errors=tactic_errors,
                     ),
                     attempts_used=attempt + 1,
                 )
 
             err = result.next_state.error or "unsolved goals"
-            category = _classify_tactic_error(err)
-            tactic_errors[category] = tactic_errors.get(category, 0) + 1
             previous_proof = proof_code
             previous_error = err
 
@@ -194,7 +189,6 @@ class OneShotProve:
                 success=False, proof_trace=[], nodes_visited=self.max_fixes + 1,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
                 theorem=theorem, failure_reason="fixes_exhausted",
-                tactic_errors=tactic_errors,
             ),
             attempts_used=self.max_fixes + 1,
         )

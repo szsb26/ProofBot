@@ -29,7 +29,6 @@ class ProblemResult:
     elapsed_ms: float    # total elapsed across all trials
     proof_trace: list[str]  # from first successful trial (empty if none)
     failure_modes: dict = field(default_factory=dict)   # search-level: {reason: count}
-    tactic_errors: dict = field(default_factory=dict)   # tactic-level: {category: count}
     failed_trial_traces: list[str] = field(default_factory=list)  # paths, only when --trace is on
     successful_trial_traces: list[str] = field(default_factory=list)  # paths, only when --trace-successes is on
 
@@ -154,6 +153,21 @@ async def run_eval(
         )
     trial_traces_dir = Path(traces_dir) / f"eval_{timestamp}"
 
+    # Raw Lean logging is deliberately gated on --trace/--trace-successes but
+    # NOT on can_trace: it hooks the REPL, not the policy, so it works for
+    # every policy including mock, and captures the whole run rather than only
+    # the trials that happen to fail. One file per executor, since each owns
+    # its own REPL subprocess and they run concurrently.
+    loggable = [
+        (i, ex) for i, ex in enumerate(executors, start=1)
+        if hasattr(ex, "set_raw_log_path")
+    ]
+    if (trace or trace_successes) and loggable:
+        lean_log_dir = trial_traces_dir / "lean"
+        lean_log_dir.mkdir(parents=True, exist_ok=True)
+        for i, ex in loggable:
+            ex.set_raw_log_path(lean_log_dir / f"worker{i}.jsonl")
+
     for problem in problems:
         print(
             f"  [{problem.difficulty:7s}] {problem.name:<30s}",
@@ -166,7 +180,6 @@ async def run_eval(
         total_ms = 0.0
         proof_trace: list[str] = []
         failure_modes: dict[str, int] = {}
-        tactic_errors: dict[str, int] = {}
         failed_trace_paths: list[str] = []
         success_trace_paths: list[str] = []
 
@@ -202,8 +215,6 @@ async def run_eval(
             else:
                 reason = result.failure_reason or "unknown"
                 failure_modes[reason] = failure_modes.get(reason, 0) + 1
-                for cat, cnt in result.tactic_errors.items():
-                    tactic_errors[cat] = tactic_errors.get(cat, 0) + cnt
 
                 if can_trace and trace:
                     trial_traces_dir.mkdir(parents=True, exist_ok=True)
@@ -236,16 +247,16 @@ async def run_eval(
                 f"  {passes}/{trials}  ({pct:4.0%})  "
                 f"{avg_nodes:4d} nodes avg  {total_ms / 1000:6.1f}s total"
             )
-        if failures > 0 and (failure_modes or tactic_errors):
+        if failures > 0 and failure_modes:
+            # Search-level reasons only (budget_exhausted / frontier_exhausted /
+            # parse_error). Tactic-level error CATEGORIES used to be summarised
+            # here too; they were removed because the categoriser was measurably
+            # unreliable and nothing consumed the numbers. Run with --trace for
+            # the raw Lean errors, which are the ground truth.
             fm_str = ", ".join(
                 f"{k}×{v}" for k, v in sorted(failure_modes.items(), key=lambda x: -x[1])
             )
-            te_str = ", ".join(
-                f"{k}×{v}" for k, v in sorted(tactic_errors.items(), key=lambda x: -x[1])
-            )
             print(f"              ↳ search: {fm_str}")
-            if te_str:
-                print(f"              ↳ errors: {te_str}")
         if failed_trace_paths or success_trace_paths:
             print(f"              ↳ traces: {trial_traces_dir}/")
 
@@ -262,7 +273,6 @@ async def run_eval(
                 elapsed_ms=total_ms,
                 proof_trace=proof_trace,
                 failure_modes=failure_modes,
-                tactic_errors=tactic_errors,
                 failed_trial_traces=failed_trace_paths,
                 successful_trial_traces=success_trace_paths,
             )

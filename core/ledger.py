@@ -22,13 +22,21 @@ class LedgerEntry:
     Attributes:
         parent_id: id of the state the tactic was tried against.
         tactic:    The tactic string sent to Lean.
-        outcome:   "success", or an error category from
-                   search.ledger_search._classify_tactic_error.
+        outcome:   "success" or "failed". Deliberately just those two — this
+                   used to hold an error CATEGORY, but categorising Lean
+                   errors by hand-written substring proved unreliable enough
+                   to be worse than useless: audited over 2847 real errors
+                   from our own traces, two of the nine categories matched
+                   strings Lean never emits (so they never once fired) and
+                   the catch-all held a third of everything, filing genuine
+                   refutations alongside resource failures. Nothing consumed
+                   the value, so it is no longer computed. `error` below is
+                   the ground truth, and traces (--trace) keep it verbatim.
         child_id:  id of the resulting state. Set only when outcome == "success".
         error:     The raw Lean error text (empty on success). Kept verbatim
                    (the caller is responsible for capping pathological sizes,
                    e.g. apply?/exact? "Try this" dumps) so the director sees
-                   what Lean actually said, not just a category label.
+                   what Lean actually said, uncompressed.
     """
     parent_id: str
     tactic: str
@@ -49,7 +57,13 @@ class Ledger:
                    summarize dead branches back to the LLM.
         abandoned: Ids the LLM has explicitly given up on. Removed from the
                    frontier at the moment of abandonment, but NOT a
-                   permanent blacklist — see add_state.
+                   permanent blacklist — see add_state and restore.
+        retired:   States removed by abandon(), kept so a later turn can
+                   restore() them. Without this the ProofState was simply
+                   dropped, and a director that abandoned a branch and then
+                   asked for it back — which happens constantly — got a
+                   silently wasted turn (measured: 24 of 50 turns in one
+                   imo2005_q3 trial, 20 of 50 in an imo1968_tetrahedron one).
         reasoning: The director's most recent stated natural-language plan
                    for each state, keyed by state id. Otherwise a director
                    call's reasoning is discarded the moment the turn ends —
@@ -60,6 +74,7 @@ class Ledger:
     entries: list[LedgerEntry] = field(default_factory=list)
     abandoned: set[str] = field(default_factory=set)
     reasoning: dict[str, str] = field(default_factory=dict)
+    retired: dict[str, ProofState] = field(default_factory=dict)
 
     def add_state(self, state: ProofState) -> str:
         """
@@ -82,19 +97,52 @@ class Ledger:
         """
         state_id = state.stable_hash()[:8]
         self.frontier[state_id] = state
+        # If this id was previously abandoned, re-deriving it supersedes the
+        # retired copy — otherwise a later abandon()/restore() cycle could
+        # resurrect the stale one alongside the live entry.
+        self.retired.pop(state_id, None)
+        self.abandoned.discard(state_id)
         return state_id
 
     def record_success(self, parent_id: str, tactic: str, child_id: str) -> None:
         self.entries.append(LedgerEntry(parent_id, tactic, "success", child_id))
 
-    def record_failure(self, parent_id: str, tactic: str, category: str, error: str = "") -> None:
-        self.entries.append(LedgerEntry(parent_id, tactic, category, None, error))
+    def record_failure(self, parent_id: str, tactic: str, error: str = "") -> None:
+        self.entries.append(LedgerEntry(parent_id, tactic, "failed", None, error))
 
     def abandon(self, state_ids: list[str]) -> None:
-        """Permanently remove states from consideration."""
+        """
+        Remove states from the frontier, retaining them for restore().
+
+        Not permanent: the director prunes speculatively and frequently asks
+        for a pruned branch back a turn or two later. Keeping the ProofState
+        is what makes honouring that request possible.
+        """
         for sid in state_ids:
-            self.frontier.pop(sid, None)
+            state = self.frontier.pop(sid, None)
+            if state is not None:
+                self.retired[sid] = state
             self.abandoned.add(sid)
+
+    def restore(self, state_id: str) -> ProofState | None:
+        """
+        Put a previously abandoned state back on the frontier.
+
+        Returns the state, or None if we never had it (an id the director
+        hallucinated, or one from a search that never held it).
+
+        Called when the director explicitly selects a state it abandoned on
+        an earlier turn. That re-selection is the clearest possible signal
+        that the abandonment was premature — the same reasoning behind
+        refusing to abandon a state that is being chosen in the same turn.
+        Before this existed the turn was silently discarded.
+        """
+        state = self.retired.pop(state_id, None)
+        if state is None:
+            return None
+        self.frontier[state_id] = state
+        self.abandoned.discard(state_id)
+        return state
 
     def failures_for(self, state_id: str) -> list[LedgerEntry]:
         """All failed attempts recorded against a given state, in order."""

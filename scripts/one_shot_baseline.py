@@ -82,11 +82,8 @@ async def _run(args: argparse.Namespace) -> int:
             )
             if r.success:
                 print(f"              ↳ proof: {' | '.join(r.proof_trace)[:300]}")
-            elif r.tactic_errors:
-                te_str = ", ".join(
-                    f"{k}×{v}" for k, v in sorted(r.tactic_errors.items(), key=lambda x: -x[1])
-                )
-                print(f"              ↳ errors: {te_str}")
+            elif r.failure_reason:
+                print(f"              ↳ {r.failure_reason}")
     finally:
         await executor.close()
         await policy.close()

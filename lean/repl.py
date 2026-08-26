@@ -201,13 +201,68 @@ class LeanWorker:
     without blocking on any single REPL interaction.
     """
 
-    def __init__(self, lean_project_dir: Path, load_mathlib: bool = True):
+    def __init__(
+        self,
+        lean_project_dir: Path,
+        load_mathlib: bool = True,
+        raw_log_path: Optional[Path] = None,
+    ):
         self._dir = lean_project_dir
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._proof_state_cache: dict[str, int] = {}
         self._load_mathlib = load_mathlib
         # env number returned by "import LeanProject"; 0 if not loaded
         self._base_env: int = 0
+        # Optional JSONL log of every REPL exchange (see _log_exchange).
+        self._raw_log_path = raw_log_path
+        self._raw_log_seq = 0
+
+    def _log_exchange(
+        self,
+        payload: dict,
+        response: dict | None,
+        elapsed_ms: float,
+        error: str | None = None,
+    ) -> None:
+        """
+        Append one REPL exchange to the raw JSONL log, if one is configured.
+
+        This is the ONLY place the unabridged Lean conversation is recorded.
+        Everything downstream is lossy in ways that matter when diagnosing a
+        failed run:
+
+          - repl.py surfaces `msg_errors[0]` and drops any further errors in
+            the same response;
+          - the Ledger keeps one error string per attempt, not the response;
+          - traces/ record `serialize_ledger` output, i.e. the *prompt*, which
+            caps tactic lists at 15 per state (measured: 2807 lists capped
+            across our traces, one hiding 672 attempts) and errors at 2000
+            chars.
+
+        So a question like "what did Lean actually say" was previously
+        unanswerable after the fact. Written per exchange and flushed rather
+        than buffered to the end of the trial, so a run that dies partway —
+        crash, timeout, exhausted API credits — keeps everything up to the
+        failure.
+        """
+        if not self._raw_log_path:
+            return
+        self._raw_log_seq += 1
+        record = {
+            "seq": self._raw_log_seq,
+            "ts": time.time(),
+            "elapsed_ms": round(elapsed_ms, 2),
+            "request": payload,
+            "response": response,
+        }
+        if error is not None:
+            record["error"] = error
+        try:
+            with open(self._raw_log_path, "a") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            # Logging must never take down a search.
+            logger.warning("failed to append to raw Lean log", exc_info=True)
 
     async def start(self) -> None:
         """Launch the lake exe repl subprocess.
@@ -317,6 +372,8 @@ class LeanWorker:
         if not self._proc or self._proc.returncode is not None:
             raise LeanREPLError("Lean worker process is not running")
 
+        _send_started = time.perf_counter()
+
         # .encode() converts the string to bytes, which is what the subprocess stdin expects. json.dumps() converts the payload dictionary
         # to a JSON-formatted string. We add the blank line terminator "\n\n" as required by the REPL protocol.
         msg = (json.dumps(payload) + "\n\n").encode()
@@ -353,6 +410,14 @@ class LeanWorker:
                     except Exception:
                         pass
                     self._proof_state_cache.clear()
+                # Log the timeout itself: a tactic that never returned is
+                # invisible everywhere downstream (no Ledger entry, no prompt
+                # text), so without this the raw log would silently skip it.
+                self._log_exchange(
+                    payload, None,
+                    (time.perf_counter() - _send_started) * 1000,
+                    error="timeout",
+                )
                 raise LeanREPLError(
                     f"Lean REPL timed out waiting for response to: {payload}"
                 )
@@ -361,10 +426,22 @@ class LeanWorker:
                 break
             lines.append(decoded)
 
+        elapsed_ms = (time.perf_counter() - _send_started) * 1000
+
         if not lines:
+            self._log_exchange(payload, None, elapsed_ms, error="empty_response")
             raise LeanREPLError("Lean REPL returned empty response")
 
-        result = json.loads("".join(lines))
+        raw = "".join(lines)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            self._log_exchange(
+                payload, {"_unparsed_stdout": raw[:8000]}, elapsed_ms,
+                error="json_decode_error",
+            )
+            raise
+        self._log_exchange(payload, result, elapsed_ms)
         return result
 
     async def reset(self, theorem: str) -> tuple[ProofState, int]:
@@ -544,6 +621,22 @@ class LeanWorker:
             # The REPL can also report errors via a "messages" list even when it
             # returns goals:[] — e.g. `exact bad_term` closes the goal syntactically
             # but reports "Unknown identifier" in messages. Treat those as failures.
+            #
+            # OPEN QUESTION — "internal exception #5". That is Lean's
+            # `abortTactic` (index 5 of Lean.internalExceptionsRef, read out of
+            # a live REPL). Lean throws it *after* logging the real error, so it
+            # normally means "unsolved goals" and the useful text should be
+            # alongside it. It showed up in older traces but did NOT occur once
+            # in the first fully instrumented run, and four attempts to
+            # reproduce it synthetically failed — it is neither the heartbeat
+            # limit nor maxRecDepth, which both emit their own distinct
+            # messages. If you see it again, do not theorise: read the whole
+            # response body out of the raw log (traces/eval_*/lean/*.jsonl,
+            # written under --trace) and check whether `messages` carries the
+            # real error. It matters because a director was seen abandoning a
+            # TRUE lemma after a tactic died on it; every other observed
+            # failure mode reaches the model with the complete error verbatim,
+            # so this is the one remaining candidate for a real gap.
             msg_errors = [
                 m for m in response.get("messages", [])
                 if m.get("severity") == "error"
@@ -689,19 +782,40 @@ class SubprocessExecutor:
         self,
         lean_project_dir: Path = LEAN_PROJECT_DIR,
         load_mathlib: bool = True,
+        raw_log_path: Optional[Path] = None,
     ):
         self._dir = lean_project_dir
         self._load_mathlib = load_mathlib
         self._worker: Optional[LeanWorker] = None
         self._lock = asyncio.Lock()
         self._started = False
+        # When set, every REPL exchange is appended to this JSONL file.
+        self._raw_log_path = raw_log_path
 
     async def start(self) -> None:
         """Start the Lean worker process. Must be called before use."""
-        self._worker = LeanWorker(self._dir, load_mathlib=self._load_mathlib)
+        self._worker = LeanWorker(
+            self._dir,
+            load_mathlib=self._load_mathlib,
+            raw_log_path=self._raw_log_path,
+        )
         await self._worker.start()
         self._started = True
         logger.info("Started Lean worker")
+
+    def set_raw_log_path(self, path: Optional[Path]) -> None:
+        """
+        Point this executor's raw REPL log at *path* (or disable with None).
+
+        Settable after start() because the eval harness only decides the run
+        directory — which is keyed by a timestamp generated inside run_eval —
+        after the executors have already been constructed and had Mathlib
+        loaded. Sets it on the live worker too, so it takes effect for the
+        current process rather than only after a restart.
+        """
+        self._raw_log_path = path
+        if self._worker is not None:
+            self._worker._raw_log_path = path
 
     async def reset(self, theorem: str) -> ProofState:
         """Initialize a new proof attempt and return the initial ProofState."""

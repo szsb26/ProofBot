@@ -35,9 +35,10 @@ to DGX Spark (10+ workers) with zero code changes.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from core.executor import LeanExecutor
 from core.ledger import Ledger
@@ -50,39 +51,11 @@ from core.policy import PolicyModel
 # these substrings.
 _BANNED_TACTIC_PATTERN = re.compile(r"\b(sorry|admit)\b")
 
+logger = logging.getLogger(__name__)
+
 
 def _contains_banned_tactic(tactic: str) -> bool:
     return bool(_BANNED_TACTIC_PATTERN.search(tactic))
-
-
-def _classify_tactic_error(error: str) -> str:
-    e = error.lower()
-    if e.startswith("lean error:\n"):
-        e = e[len("lean error:\n"):]
-    if "unknown identifier" in e or "unknown constant" in e:
-        return "hallucinated_lemma"
-    if "application type mismatch" in e or "function expected" in e:
-        return "wrong_arguments"
-    if "type mismatch" in e:
-        return "type_mismatch"
-    if "failed to synthesize" in e:
-        return "typeclass_failure"
-    if "unsolved goals" in e:
-        return "unsolved_goals"
-    if "no goals" in e:
-        return "no_goals"
-    if (
-        "expected token" in e
-        or "unexpected token" in e
-        or "unexpected end of input" in e
-        or "expected end of input" in e
-    ):
-        return "syntax_error"
-    if "maximum heart beats" in e or "deterministic timeout" in e:
-        return "max_heartbeats"
-    if "inserted a hidden sorry" in e:
-        return "hidden_sorry"
-    return "tactic_failed"
 
 
 @dataclass
@@ -99,8 +72,6 @@ class ProofResult:
         error:          Parse/init error; non-empty when nodes_visited == 0.
         failure_reason: Why the search failed (budget_exhausted,
                         frontier_exhausted, parse_error). Empty on success.
-        tactic_errors:  Counts of tactic-level error categories across all
-                        rejected tactics during this search.
     """
     success: bool
     proof_trace: list[str]
@@ -109,7 +80,6 @@ class ProofResult:
     theorem: str
     error: str = ""
     failure_reason: str = ""
-    tactic_errors: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
         if self.success:
@@ -203,8 +173,6 @@ class LedgerSearch:
         ledger = Ledger()
         ledger.add_state(initial_state)
 
-        tactic_errors: dict[str, int] = {}
-
         while ledger.frontier and calls < budget:
             calls += 1
 
@@ -216,11 +184,33 @@ class LedgerSearch:
             abandoned_ids = [
                 sid for sid in resp.abandoned_state_ids if sid != resp.chosen_state_id
             ]
-            ledger.abandon(abandoned_ids)
+            # Never let an abandonment empty the frontier. The loop below
+            # terminates on `not ledger.frontier`, so honouring such a request
+            # ends the whole search — and the director is pruning, not asking
+            # to stop. Observed live on imo2011_q3: turn 25 abandoned 11
+            # states at once and the search reported frontier_exhausted with
+            # HALF its 50-call budget unspent. Deciding when to stop is the
+            # budget's job, not the model's.
+            clearing = [sid for sid in abandoned_ids if sid in ledger.frontier]
+            if clearing and len(clearing) >= len(ledger.frontier):
+                logger.info(
+                    "ignoring abandon of %d state(s): would empty the frontier",
+                    len(clearing),
+                )
+            else:
+                ledger.abandon(abandoned_ids)
 
             state = ledger.frontier.get(resp.chosen_state_id)
             if state is None:
-                # The director referenced a stale, abandoned, or invalid id.
+                # Abandoned on an EARLIER turn and now explicitly chosen
+                # again. Re-selection is the clearest signal the abandonment
+                # was premature, so honour it rather than discarding the
+                # turn — the same reasoning as the same-turn guard above.
+                # This was pure waste before: 24 of 50 turns in one
+                # imo2005_q3 trial, 20 of 50 in an imo1968_tetrahedron one.
+                state = ledger.restore(resp.chosen_state_id)
+            if state is None:
+                # An id we have genuinely never held — hallucinated or stale.
                 # Nothing to expand this turn — try again next call.
                 continue
 
@@ -269,11 +259,8 @@ class LedgerSearch:
                 # re-running one nlinarith that succeeded every time.
                 ledger.record_success(resp.chosen_state_id, resp.tactic, new_id)
             else:
-                err = result.next_state.error or ""
-                category = _classify_tactic_error(err)
-                tactic_errors[category] = tactic_errors.get(category, 0) + 1
                 ledger.record_failure(
-                    resp.chosen_state_id, resp.tactic, category, err
+                    resp.chosen_state_id, resp.tactic, result.next_state.error or ""
                 )
 
         failure_reason = "frontier_exhausted" if not ledger.frontier else "budget_exhausted"
@@ -284,7 +271,6 @@ class LedgerSearch:
             elapsed_ms=(time.perf_counter() - start) * 1000,
             theorem=theorem,
             failure_reason=failure_reason,
-            tactic_errors=tactic_errors,
         )
 
 
@@ -317,10 +303,6 @@ async def prove_parallel(
         if r.success:
             return r
     best = max(results, key=lambda r: r.nodes_visited)
-    combined_errors: dict[str, int] = {}
-    for r in results:
-        for cat, count in r.tactic_errors.items():
-            combined_errors[cat] = combined_errors.get(cat, 0) + count
     return ProofResult(
         success=False,
         proof_trace=[],
@@ -328,5 +310,4 @@ async def prove_parallel(
         elapsed_ms=best.elapsed_ms,
         theorem=theorem,
         failure_reason=best.failure_reason,
-        tactic_errors=combined_errors,
     )

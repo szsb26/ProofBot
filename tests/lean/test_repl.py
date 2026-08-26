@@ -13,6 +13,7 @@ TestDeepSeekEndToEnd         — slow, real Lean + real DeepSeek API; same stack
                                with DeepSeekPolicy instead of AnthropicPolicy
 """
 
+import json
 import os
 import pytest
 import pytest_asyncio
@@ -30,7 +31,7 @@ from core.proof_state import ProofState, make_proof_state
 from policy.mock import MockPolicy
 from policy.anthropic import AnthropicPolicy
 from policy.deepseek import DeepSeekPolicy
-from search.ledger_search import LedgerSearch, _classify_tactic_error, prove_parallel
+from search.ledger_search import LedgerSearch, prove_parallel
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +311,7 @@ class TestLeanWorkerStepClosureDetection:
             "goals": [],
         })
         result = await worker.step(state, "apply?")
-        assert _classify_tactic_error(result.next_state.error) == "hidden_sorry"
+        assert "hidden sorry" in result.next_state.error.lower()
 
     async def test_nonempty_goals_still_parsed_normally(self):
         """Sanity check: the fix must not disturb the ordinary
@@ -842,3 +843,95 @@ class TestDeepSeekEndToEnd:
         )
         assert result.success
         assert len(result.proof_trace) > 0
+
+
+# ---------------------------------------------------------------------------
+# Raw REPL exchange logging (LeanWorker._log_exchange)
+# ---------------------------------------------------------------------------
+
+class TestRawLeanLog:
+    """
+    The raw JSONL log is the only unabridged record of what Lean said.
+
+    Everything downstream loses information: repl.py surfaces msg_errors[0]
+    and drops any further errors in the same response, the Ledger stores one
+    error string per attempt, and traces/ record the rendered PROMPT — which
+    caps tactic lists at 15 per state (2807 lists were capped across our
+    existing traces, one hiding 672 attempts) and errors at 2000 chars. So
+    "what did Lean actually return" was unanswerable after a run finished.
+    """
+
+    def _worker(self, path):
+        w = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False, raw_log_path=path)
+        return w
+
+    def _read(self, path):
+        return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+    def test_logs_nothing_when_no_path_configured(self, tmp_path):
+        w = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        w._log_exchange({"tactic": "simp"}, {"goals": []}, 1.0)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_records_request_and_full_response(self, tmp_path):
+        p = tmp_path / "worker1.jsonl"
+        w = self._worker(p)
+        w._log_exchange({"tactic": "simp", "proofState": 0}, {"goals": [], "env": 1}, 12.5)
+
+        rows = self._read(p)
+        assert len(rows) == 1
+        assert rows[0]["request"] == {"tactic": "simp", "proofState": 0}
+        assert rows[0]["response"] == {"goals": [], "env": 1}
+        assert rows[0]["seq"] == 1
+        assert rows[0]["elapsed_ms"] == 12.5
+
+    def test_preserves_every_error_not_just_the_first(self, tmp_path):
+        """The whole point: repl.py's extraction takes msg_errors[0], so a
+        response carrying several errors reaches the model as one. The raw
+        log must keep all of them or the loss is unrecoverable."""
+        p = tmp_path / "worker1.jsonl"
+        w = self._worker(p)
+        w._log_exchange(
+            {"tactic": "have h : P := by nlinarith"},
+            {"messages": [
+                {"severity": "error", "data": "linarith failed to find a contradiction"},
+                {"severity": "error", "data": "unsolved goals\n⊢ P"},
+                {"severity": "error", "data": "internal exception #5"},
+            ]},
+            40.0,
+        )
+        errs = [m["data"] for m in self._read(p)[0]["response"]["messages"]]
+        assert len(errs) == 3
+        assert "internal exception #5" in errs
+
+    def test_appends_across_exchanges_with_increasing_seq(self, tmp_path):
+        p = tmp_path / "worker1.jsonl"
+        w = self._worker(p)
+        for i in range(3):
+            w._log_exchange({"tactic": f"t{i}"}, {"goals": []}, 1.0)
+        assert [r["seq"] for r in self._read(p)] == [1, 2, 3]
+
+    def test_records_timeouts_which_are_invisible_downstream(self, tmp_path):
+        """A tactic that never returns produces no Ledger entry and no prompt
+        text, so without an explicit record the raw log would skip it and the
+        run would look like the tactic was never tried."""
+        p = tmp_path / "worker1.jsonl"
+        w = self._worker(p)
+        w._log_exchange({"tactic": "slow"}, None, 30000.0, error="timeout")
+
+        row = self._read(p)[0]
+        assert row["error"] == "timeout"
+        assert row["response"] is None
+
+    def test_logging_failure_never_breaks_the_search(self, tmp_path):
+        """Diagnostics must not be able to take down a proof run."""
+        w = self._worker(tmp_path / "no_such_dir" / "worker1.jsonl")
+        w._log_exchange({"tactic": "simp"}, {"goals": []}, 1.0)  # must not raise
+
+    def test_unicode_survives_round_trip(self, tmp_path):
+        """Lean goals are full of ℝ, ⊢, ≥ — they must stay readable."""
+        p = tmp_path / "worker1.jsonl"
+        w = self._worker(p)
+        w._log_exchange({"tactic": "nlinarith"}, {"goals": ["x y : ℝ ⊢ x ≥ y"]}, 1.0)
+        assert "ℝ" in p.read_text()
+        assert self._read(p)[0]["response"]["goals"] == ["x y : ℝ ⊢ x ≥ y"]
