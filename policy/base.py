@@ -48,6 +48,10 @@ DIRECTOR_SYSTEM_PROMPT = (
     "the overall approach that led there is wrong. Never put the same id in "
     "both \"abandon\" and \"chosen_state\" — choosing a state means you want "
     "to keep working on it.\n"
+    "- Abandoning is reversible. Abandoned states are listed under "
+    "\"Abandoned States\" with the reason you gave, and naming one as "
+    "\"chosen_state\" resumes it exactly where it was left. Only states in "
+    "that list or in \"Currently Open States\" can be chosen.\n"
     "- Choose exactly one open state (\"chosen_state\") to continue from. "
     "Copy its id exactly as shown in the state's bracket label, e.g. for "
     "\"[state a1b2c3d4]\" use \"a1b2c3d4\" — do not include the word \"state\" "
@@ -123,10 +127,19 @@ class DirectorResponse:
     abandoned_state_ids: list[str]
     tactic: str
     reasoning: str = ""
+    # Why the abandoned states were given up on. The prompt has always asked
+    # for this field; until now it was parsed nowhere and discarded, so the
+    # information was requested from the model every turn and thrown away.
+    # It is what labels each entry in the resumable-abandoned-states list.
+    abandon_reason: str = ""
 
 
 _MAX_TRIED_TACTICS_SHOWN = 15
 _MAX_TACTIC_DISPLAY_LEN = 100
+# Cap on the resumable-abandoned list. Each entry is one short line (no goal
+# text), so this is far cheaper than the open-state cap — but one observed run
+# retired 52 states, and an uncapped list would grow for the whole search.
+_MAX_RETIRED_STATES_SHOWN = 25
 # Cap on how many open states get shown at once. Without this, the frontier
 # can grow unboundedly — e.g. once every verified sub-step of a chained
 # candidate becomes its own frontier state — and showing all of them would
@@ -175,8 +188,15 @@ def serialize_ledger(
     tactic strings already tried (deduplicated, most-recent-first, capped),
     so the model can check "have I already tried this" before re-proposing
     a tactic verbatim rather than only seeing an aggregate failure count.
-    Abandoned states are omitted entirely; once given up on, they no longer
-    cost context.
+    Abandoned states are listed compactly — id, goal count, depth and the
+    reason given — but WITHOUT their goal text, so they stay resumable
+    without costing the context a full state would. They used to be omitted
+    entirely, which made abandonment a one-way door: the search can restore a
+    state the director re-selects, but the director had no way to name one it
+    could no longer see. In practice it named them anyway, by reading ids out
+    of its own persisted reasoning prose — 13 of 1953 turns across our traces
+    chose an id that appeared ONLY in that prose. That was us leaking stale
+    ids and then treating the resulting selection as a mistake.
     """
     parts = [f"## Theorem\n\n{theorem}\n"]
 
@@ -230,6 +250,32 @@ def serialize_ledger(
                 "just re-derives the same state, so continue from the "
                 "resulting state instead:\n"
                 f"{lines}\n"
+            )
+
+    # Abandoned-but-resumable states. Compact by design: id, size, depth and
+    # the director's own reason — no goal text, so a long-running search that
+    # has parked dozens of branches costs a few hundred bytes rather than
+    # re-rendering every state it ever pruned. Deepest first, matching how
+    # open states are ordered, and capped for the same runaway-prompt reason.
+    if ledger.retired:
+        retired = sorted(
+            ledger.retired.items(), key=lambda kv: -kv[1].depth
+        )[:_MAX_RETIRED_STATES_SHOWN]
+        total = len(ledger.retired)
+        header = "\n## Abandoned States (resumable — name the id as chosen_state)\n"
+        if total > len(retired):
+            header = (
+                f"\n## Abandoned States (resumable — name the id as "
+                f"chosen_state; showing {len(retired)} of {total}, deepest "
+                f"first)\n"
+            )
+        parts.append(header)
+        for sid, st in retired:
+            n = len(st.goals)
+            why = ledger.abandon_reasons.get(sid, "")
+            why = f' — "{_format_tactic_for_display(why)}"' if why else ""
+            parts.append(
+                f"  {sid}  {n} goal{'s' if n != 1 else ''}  depth {st.depth}{why}\n"
             )
 
     dead_by_parent: dict[str, list] = {}
@@ -304,9 +350,9 @@ def serialize_ledger(
 
     parts.append(
         f"\n\n## Task\n\n"
-        f"Choose exactly one open state to continue from, optionally abandon "
-        f"any you consider dead ends, and propose exactly one tactic for "
-        f"your chosen state."
+        f"Choose exactly one state to continue from — open, or one you "
+        f"abandoned earlier — optionally abandon any you consider dead ends, "
+        f"and propose exactly one tactic for your chosen state."
     )
     return "".join(parts)
 
@@ -434,6 +480,7 @@ def parse_director_response(text: str, fallback_state_id: str) -> DirectorRespon
         pass
 
     chosen = abandoned = reasoning = tactic = None
+    abandon_reason = None
     if isinstance(data, dict):
         try:
             chosen = data.get("chosen_state")
@@ -444,6 +491,8 @@ def parse_director_response(text: str, fallback_state_id: str) -> DirectorRespon
             reasoning = reasoning if isinstance(reasoning, str) else None
             tactic_field = data.get("tactic")
             tactic = tactic_field if isinstance(tactic_field, str) and tactic_field.strip() else None
+            ar = data.get("abandon_reason")
+            abandon_reason = ar if isinstance(ar, str) else None
         except (KeyError, TypeError):
             pass
     abandoned = abandoned or []
@@ -460,12 +509,15 @@ def parse_director_response(text: str, fallback_state_id: str) -> DirectorRespon
         recovered_abandon = _extract_json_string_array_field(text, "abandon")
         if recovered_abandon:
             abandoned = recovered_abandon
+    if abandon_reason is None:
+        abandon_reason = _extract_json_string_field(text, "abandon_reason")
 
     return DirectorResponse(
         chosen_state_id=chosen or fallback_state_id,
         abandoned_state_ids=abandoned,
         tactic=tactic or "simp",
         reasoning=reasoning or "",
+        abandon_reason=abandon_reason or "",
     )
 
 

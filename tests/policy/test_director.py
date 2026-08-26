@@ -289,15 +289,25 @@ class TestSerializeLedger:
         assert "Exhausted Attempts" not in text
 
     def test_abandoned_state_failures_excluded_from_summary(self):
+        """An abandoned state's failure HISTORY stays off the prompt — that
+        is the expensive part and it can be re-derived on resume.
+
+        The id itself is now shown, in the compact resumable list, because
+        the director cannot name a state it cannot see. (This test used to
+        assert the id was absent entirely; that predates abandonment being
+        reversible.)"""
         ledger = Ledger()
-        state = make_proof_state(["n = n"])
-        state_id = ledger.add_state(state)
-        ledger.record_failure(state_id, "bad")
-        ledger.abandon([state_id])
+        ledger.add_state(make_proof_state(["another open state"]))
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "a_uniquely_named_failed_tactic")
+        ledger.abandon([state_id], "wrong approach")
 
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Exhausted Attempts" not in text
-        assert state_id not in text
+        assert "a_uniquely_named_failed_tactic" not in text
+        # ...but it is resumable, so the id is listed.
+        assert state_id in text
+        assert "## Abandoned States" in text
 
     def test_includes_premises_when_present(self):
         ledger = Ledger()
@@ -848,3 +858,92 @@ class TestGetNextAction:
             assert resp.tactic == "simp"
         finally:
             patcher.stop()
+
+
+class TestAbandonedStatesAreVisibleAndResumable:
+    """
+    Abandonment is reversible in the search (Ledger.restore), but the director
+    is stateless per call and used to be shown NOTHING about abandoned states
+    — so it could not name one to resume it. In practice it named them anyway,
+    by reading ids out of its own persisted reasoning prose: across 1953 real
+    turns, 13 chose an id that appeared ONLY in that prose. That was us
+    leaking stale ids and then reading the result as the model disobeying.
+    """
+
+    def test_abandoned_states_are_listed_with_reason(self):
+        ledger = Ledger()
+        keep = ledger.add_state(make_proof_state(["keep me open"]))
+        gone = ledger.add_state(make_proof_state(["parked branch"]))
+        ledger.abandon([gone], "hf0_neg branch is stuck")
+
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "## Abandoned States" in text
+        assert gone in text
+        assert "hf0_neg branch is stuck" in text
+        assert "chosen_state" in text.split("## Abandoned States")[1][:120]
+
+    def test_abandoned_states_do_not_include_goal_text(self):
+        """The whole point of listing them compactly: a search that parked
+        dozens of branches must not re-render every goal it ever pruned."""
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["still open"]))
+        gone = ledger.add_state(make_proof_state(["UNIQUE_PARKED_GOAL_TEXT"]))
+        ledger.abandon([gone], "not promising")
+
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        section = text.split("## Abandoned States")[1].split("##")[0]
+        assert gone in section
+        assert "UNIQUE_PARKED_GOAL_TEXT" not in section
+
+    def test_restored_state_leaves_the_abandoned_list(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["still open"]))
+        gone = ledger.add_state(make_proof_state(["parked"]))
+        ledger.abandon([gone], "parked for now")
+        assert "## Abandoned States" in serialize_ledger("theorem foo := by", ledger, [])
+
+        ledger.restore(gone)
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "## Abandoned States" not in text
+        assert "parked for now" not in text
+
+    def test_no_section_when_nothing_abandoned(self):
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n = n"]))
+        assert "## Abandoned States" not in serialize_ledger("theorem foo := by", ledger, [])
+
+    def test_abandoned_list_is_capped(self):
+        """One observed run retired 52 states; the list must not grow for the
+        whole search the way an uncapped one would."""
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["stays open"]))
+        for i in range(40):
+            sid = ledger.add_state(make_proof_state([f"parked {i}"], depth=i))
+            ledger.abandon([sid], f"reason {i}")
+
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "showing 25 of 40" in text
+        # deepest are kept
+        assert "parked 39" not in text        # goal text never rendered
+        section = text.split("## Abandoned States")[1].split("##")[0]
+        assert "reason 39" in section
+        assert "reason 0" not in section
+
+    def test_abandon_reason_is_parsed_from_the_response(self):
+        """The prompt has always asked for abandon_reason; it was parsed
+        nowhere and silently discarded until it became the label for the
+        resumable list."""
+        raw = json.dumps({
+            "reasoning": "pruning the stuck branch",
+            "abandon": ["deadbeef"],
+            "abandon_reason": "case split led nowhere",
+            "chosen_state": "cafebabe",
+            "tactic": "nlinarith",
+        })
+        resp = parse_director_response(raw, "fallback")
+        assert resp.abandon_reason == "case split led nowhere"
+        assert resp.abandoned_state_ids == ["deadbeef"]
+
+    def test_missing_abandon_reason_defaults_to_empty(self):
+        raw = json.dumps({"chosen_state": "abc", "tactic": "simp"})
+        assert parse_director_response(raw, "fallback").abandon_reason == ""

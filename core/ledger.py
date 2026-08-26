@@ -58,6 +58,8 @@ class Ledger:
         abandoned: Ids the LLM has explicitly given up on. Removed from the
                    frontier at the moment of abandonment, but NOT a
                    permanent blacklist — see add_state and restore.
+        abandon_reasons: The director's stated reason per abandoned state,
+                   used to label it in the resumable-abandoned list.
         retired:   States removed by abandon(), kept so a later turn can
                    restore() them. Without this the ProofState was simply
                    dropped, and a director that abandoned a branch and then
@@ -75,6 +77,7 @@ class Ledger:
     abandoned: set[str] = field(default_factory=set)
     reasoning: dict[str, str] = field(default_factory=dict)
     retired: dict[str, ProofState] = field(default_factory=dict)
+    abandon_reasons: dict[str, str] = field(default_factory=dict)
 
     def add_state(self, state: ProofState) -> str:
         """
@@ -102,6 +105,7 @@ class Ledger:
         # resurrect the stale one alongside the live entry.
         self.retired.pop(state_id, None)
         self.abandoned.discard(state_id)
+        self.abandon_reasons.pop(state_id, None)
         return state_id
 
     def record_success(self, parent_id: str, tactic: str, child_id: str) -> None:
@@ -110,19 +114,25 @@ class Ledger:
     def record_failure(self, parent_id: str, tactic: str, error: str = "") -> None:
         self.entries.append(LedgerEntry(parent_id, tactic, "failed", None, error))
 
-    def abandon(self, state_ids: list[str]) -> None:
+    def abandon(self, state_ids: list[str], reason: str = "") -> None:
         """
         Remove states from the frontier, retaining them for restore().
 
         Not permanent: the director prunes speculatively and frequently asks
         for a pruned branch back a turn or two later. Keeping the ProofState
         is what makes honouring that request possible.
+
+        *reason* is the director's own stated `abandon_reason`. It labels the
+        state in the resumable-abandoned list so a later turn can tell why
+        this branch was parked without having to re-derive it.
         """
         for sid in state_ids:
             state = self.frontier.pop(sid, None)
             if state is not None:
                 self.retired[sid] = state
             self.abandoned.add(sid)
+            if reason:
+                self.abandon_reasons[sid] = reason
 
     def restore(self, state_id: str) -> ProofState | None:
         """
@@ -142,6 +152,7 @@ class Ledger:
             return None
         self.frontier[state_id] = state
         self.abandoned.discard(state_id)
+        self.abandon_reasons.pop(state_id, None)
         return state
 
     def failures_for(self, state_id: str) -> list[LedgerEntry]:

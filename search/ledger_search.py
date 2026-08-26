@@ -198,7 +198,7 @@ class LedgerSearch:
                     len(clearing),
                 )
             else:
-                ledger.abandon(abandoned_ids)
+                ledger.abandon(abandoned_ids, resp.abandon_reason)
 
             state = ledger.frontier.get(resp.chosen_state_id)
             if state is None:
