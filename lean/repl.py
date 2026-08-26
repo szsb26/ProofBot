@@ -633,10 +633,13 @@ class LeanWorker:
             # messages. If you see it again, do not theorise: read the whole
             # response body out of the raw log (traces/eval_*/lean/*.jsonl,
             # written under --trace) and check whether `messages` carries the
-            # real error. It matters because a director was seen abandoning a
-            # TRUE lemma after a tactic died on it; every other observed
-            # failure mode reaches the model with the complete error verbatim,
-            # so this is the one remaining candidate for a real gap.
+            # real error. Every other observed failure mode reaches the model
+            # with the complete error verbatim, so an empty `messages` here
+            # would be the one place the model is genuinely underinformed.
+            # (An earlier note claimed a director had abandoned a true lemma
+            # BECAUSE of an opaque failure like this. That was not supported:
+            # falsity assertions turned out to be slightly anti-correlated
+            # with visible crashes, 17% vs a 24% base rate.)
             msg_errors = [
                 m for m in response.get("messages", [])
                 if m.get("severity") == "error"
