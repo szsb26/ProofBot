@@ -444,7 +444,7 @@ class LeanWorker:
         self._log_exchange(payload, result, elapsed_ms)
         return result
 
-    async def reset(self, theorem: str) -> tuple[ProofState, int]:
+    async def reset(self, theorem: str, preamble: str = "") -> tuple[ProofState, int]:
         """
         Initialize a new proof attempt.
 
@@ -467,6 +467,25 @@ class LeanWorker:
         Returns:
             (initial_proof_state, repl_proof_state_id)
         """
+        # The proofState cache maps a goal hash to a REPL proofState id, and
+        # stable_hash covers only the goal TEXT — not the environment it was
+        # elaborated in. That is sound while every problem shares _base_env,
+        # but a statement with its own preamble gets its own environment
+        # below, and two problems can render an identical goal ("⊢ False"
+        # after by_contra is common) while meaning different things in them.
+        # Reusing a cached id across that boundary would silently run tactics
+        # against the wrong problem's context, so drop it at each reset.
+        # Nothing is lost: a finished problem's states are never revisited.
+        self._proof_state_cache.clear()
+
+        # `preamble` holds definitions the statement depends on. They must be
+        # committed as their OWN command: a proofState does not carry
+        # declarations made in the same command as the theorem, so otherwise
+        # every tactic naming one fails with "Unknown identifier" — including
+        # `exact h`, since elaborating the existing context needs the names.
+        # What counts as a preamble is the problem set's business, not this
+        # layer's (see EvalProblem.statement_preamble).
+
         # Format: "theorem foo : <stmt> := by\n  sorry"
         if ":= by" not in theorem:
             theorem = theorem.rstrip() + " := by"
@@ -478,9 +497,29 @@ class LeanWorker:
         # the REPL uses a fresh blank context where ring/linarith are unavailable.
         # For load_mathlib=False we omit "env" entirely — a fresh REPL has no
         # saved envs yet and passing "env": 0 causes "Unknown environment.".
+        env = self._base_env if self._load_mathlib else None
+
+        if preamble:
+            pre_payload: dict = {"cmd": preamble}
+            if env is not None:
+                pre_payload["env"] = env
+            pre_resp = await self._send(pre_payload)
+            pre_errs = [
+                m for m in pre_resp.get("messages", [])
+                if m.get("severity") == "error"
+            ]
+            if "message" in pre_resp or pre_errs:
+                # The vocabulary itself failed to elaborate — the theorem
+                # cannot mean anything, so report it rather than pressing on
+                # and blaming the prover for the fallout.
+                why = pre_resp.get("message") or pre_errs[0].get("data", "Lean error")
+                return ProofState(goals=(), error=f"statement preamble failed:\n{why}"), -1
+            # Elaborate the theorem in the environment the preamble produced.
+            env = pre_resp.get("env", env)
+
         payload: dict = {"cmd": cmd}
-        if self._load_mathlib:
-            payload["env"] = self._base_env
+        if env is not None:
+            payload["env"] = env
         response = await self._send(payload)
 
         # Check for parse errors
@@ -820,7 +859,7 @@ class SubprocessExecutor:
         if self._worker is not None:
             self._worker._raw_log_path = path
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         """Initialize a new proof attempt and return the initial ProofState."""
         async with self._lock:
             # If the subprocess was killed (e.g., due to a stuck drain timeout),
@@ -828,7 +867,7 @@ class SubprocessExecutor:
             if not self._worker._proc or self._worker._proc.returncode is not None:
                 logger.warning("Lean worker process is dead; restarting...")
                 await self._worker.start()
-            state, _ = await self._worker.reset(theorem)
+            state, _ = await self._worker.reset(theorem, preamble)
         return state
 
     async def step(self, state: ProofState, tactic: str) -> StepResult:

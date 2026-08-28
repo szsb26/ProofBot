@@ -48,7 +48,7 @@ class TestExtractProofCode:
 class ErroringExecutor:
     capacity = 1
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         return ProofState(goals=(), error="Lean parse error: unexpected token")
 
     async def step(self, state, tactic):
@@ -61,7 +61,7 @@ class ErroringExecutor:
 class AlreadyClosedExecutor:
     capacity = 1
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         return ProofState(goals=())
 
     async def step(self, state, tactic):
@@ -84,7 +84,7 @@ class ScriptedExecutor:
         self._initial_goal = initial_goal
         self.received: list[str] = []
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         return make_proof_state([self._initial_goal])
 
     async def step(self, state: ProofState, tactic: str):

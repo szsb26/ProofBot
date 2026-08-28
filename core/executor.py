@@ -83,7 +83,7 @@ class LeanExecutor(Protocol):
     in the search code.
     """
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         """
         Start a new proof attempt for the given theorem statement.
 

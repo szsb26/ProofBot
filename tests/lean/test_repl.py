@@ -935,3 +935,30 @@ class TestRawLeanLog:
         w._log_exchange({"tactic": "nlinarith"}, {"goals": ["x y : ℝ ⊢ x ≥ y"]}, 1.0)
         assert "ℝ" in p.read_text()
         assert self._read(p)[0]["response"]["goals"] == ["x y : ℝ ⊢ x ≥ y"]
+
+
+# ---------------------------------------------------------------------------
+# proofState cache hygiene across problems
+# ---------------------------------------------------------------------------
+
+class TestResetClearsProofStateCache:
+    """
+    stable_hash covers the goal TEXT only, not the environment it was
+    elaborated in. With per-problem preambles each problem gets its own
+    environment, so two problems can render an identical goal while meaning
+    different things — reusing a cached proofState across that boundary would
+    silently run tactics against the wrong context. Cheapest correct guard is
+    to drop the cache at each reset.
+    """
+
+    async def test_cache_is_dropped_on_reset(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        worker._proof_state_cache["stale-hash-from-a-previous-problem"] = 99
+        worker._send = AsyncMock(return_value={
+            "sorries": [{"proofState": 0, "goal": "⊢ True"}],
+            "env": 1,
+        })
+
+        await worker.reset("theorem foo : True := by")
+
+        assert "stale-hash-from-a-previous-problem" not in worker._proof_state_cache

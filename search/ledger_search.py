@@ -129,6 +129,7 @@ class LedgerSearch:
         self,
         theorem: str,
         budget: int = 100,
+        preamble: str = "",
     ) -> ProofResult:
         """
         Attempt to prove a theorem within a director-call budget.
@@ -146,7 +147,12 @@ class LedgerSearch:
             found to replace it).
         """
         start = time.perf_counter()
-        initial_state = await self.executor.reset(theorem)
+        # Lean needs the two parts separately (the preamble becomes its own
+        # command so its declarations are in scope for tactics); the director
+        # needs them together, since it cannot reason about `Move` without
+        # seeing what a Move is.
+        initial_state = await self.executor.reset(theorem, preamble)
+        shown_theorem = f"{preamble}\n\n{theorem}" if preamble else theorem
 
         if initial_state.is_error:
             return ProofResult(
@@ -176,7 +182,7 @@ class LedgerSearch:
         while ledger.frontier and calls < budget:
             calls += 1
 
-            resp = await self.policy.get_next_action(theorem, ledger, self.premises)
+            resp = await self.policy.get_next_action(shown_theorem, ledger, self.premises)
             # A state named as both chosen and abandoned in the same turn is
             # a self-contradictory response — choosing it is a clear signal
             # to keep it, so drop it from the abandon list rather than
@@ -278,6 +284,7 @@ async def prove_parallel(
     theorem: str,
     searches: list[LedgerSearch],
     budget: int = 100,
+    preamble: str = "",
 ) -> ProofResult:
     """
     Run k independent LedgerSearch instances concurrently.
@@ -298,7 +305,9 @@ async def prove_parallel(
         The first successful ProofResult, or — if all searches fail —
         the result with the most director calls made.
     """
-    results = await asyncio.gather(*[s.prove(theorem, budget) for s in searches])
+    results = await asyncio.gather(
+        *[s.prove(theorem, budget, preamble) for s in searches]
+    )
     for r in results:
         if r.success:
             return r

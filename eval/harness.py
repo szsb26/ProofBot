@@ -197,7 +197,8 @@ async def run_eval(
                     for e in executors
                 ]
             result = await prove_parallel(
-                problem.statement, searches=searches, budget=budget
+                problem.statement, searches=searches, budget=budget,
+                preamble=problem.statement_preamble
             )
             trace_sources = traced_policies
 

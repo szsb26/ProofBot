@@ -25,7 +25,7 @@ class ErroringExecutor:
 
     capacity = 1
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         return ProofState(goals=(), error="Lean parse error: unexpected token")
 
     async def step(self, state, tactic):
@@ -48,7 +48,7 @@ class AlwaysCloseExecutor:
 
     capacity = 1
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         return make_proof_state(["dummy goal"])
 
     async def step(self, state: ProofState, tactic: str) -> StepResult:
@@ -515,7 +515,7 @@ class TestLedgerSearchIntermediateStates:
         class ChainedExecutor:
             capacity = 1
 
-            async def reset(self, theorem):
+            async def reset(self, theorem, preamble=""):
                 return make_proof_state(["dummy goal"])
 
             async def step(self, state, tactic):
@@ -564,7 +564,7 @@ class TestLedgerSearchIntermediateStates:
         class PartialFailExecutor:
             capacity = 1
 
-            async def reset(self, theorem):
+            async def reset(self, theorem, preamble=""):
                 return make_proof_state(["dummy goal"])
 
             async def step(self, state, tactic):

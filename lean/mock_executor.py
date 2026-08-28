@@ -34,7 +34,7 @@ class MockExecutor:
     def capacity(self) -> int:
         return self._capacity
 
-    async def reset(self, theorem: str) -> ProofState:
+    async def reset(self, theorem: str, preamble: str = "") -> ProofState:
         if self._step_delay_ms > 0:
             await asyncio.sleep(self._step_delay_ms / 1000.0)
 
