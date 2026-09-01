@@ -118,7 +118,12 @@ def main(argv=None) -> int:
                 "stale": r["timestamp"][:8] < PROOFSTATUS_FIX_DATE,
             })
 
-    names = sorted(hist, key=lambda n: (tier_of.get(n, ""), n))
+    # Every benchmark problem gets a row, attempted or not: a can/cannot-solve
+    # table that lists only attempts hides the untested majority.
+    TIER_ORDER = {"easy": 0, "medium": 1, "hard": 2, "stretch": 3, "imo": 4}
+    for n, prob in PROBLEM_BY_NAME.items():
+        tier_of.setdefault(n, prob.difficulty)
+    names = sorted(PROBLEM_BY_NAME, key=lambda n: (TIER_ORDER.get(tier_of.get(n, ""), 9), n))
     if args.tier:
         names = [n for n in names if tier_of.get(n) == args.tier]
 
@@ -126,11 +131,15 @@ def main(argv=None) -> int:
           f"{'best':>6}  {'attempts':<10} last")
     shown = 0
     for name in names:
-        atts = hist[name]
+        atts = hist.get(name, [])
         wins = [a for a in atts if a["ok"]]
         if args.unsolved and wins:
             continue
         shown += 1
+        if not atts:
+            print(f"{name:<32}{tier_of.get(name,'?'):<9}{'—':<14}{'—':<10}"
+                  f"{'—':>6}  {'—':<10} never run")
+            continue
         first = wins[0] if wins else None
         # Empty-proof records (success with no tactics — see "empty" above)
         # are not proofs, so they must not set the best-node figure. Three such
@@ -175,13 +184,6 @@ def main(argv=None) -> int:
     print(f"\n{shown} shown | {len(attempted)} attempted | {solved} with a recorded win, "
           f"of which {trusted} under the current success criterion")
     print(f"  {len(never)} NEVER ATTEMPTED of {len(PROBLEM_BY_NAME)} in problems.py")
-    if never:
-        by_tier: dict[str, list] = defaultdict(list)
-        for n in never:
-            by_tier[PROBLEM_BY_NAME[n].difficulty].append(n)
-        for tier in sorted(by_tier):
-            names_ = ", ".join(sorted(by_tier[tier]))
-            print(f"  never run [{tier}]: {names_[:150]}{'…' if len(names_) > 150 else ''}")
     print("  * = first solved on a dirty tree; that SHA does not reproduce it")
     print("  (machine-local: results/ is gitignored, so other machines' runs are absent)")
     return 0
