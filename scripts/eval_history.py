@@ -127,7 +127,7 @@ def main(argv=None) -> int:
     if args.tier:
         names = [n for n in names if tier_of.get(n) == args.tier]
 
-    print(f"{'problem':<32}{'tier':<9}{'first solved':<14}{'commit':<10}"
+    print(f"{'problem':<36}{'tier':<9}{'first solved':<14}{'commit':<10}"
           f"{'best':>6}  {'attempts':<10} last")
     shown = 0
     for name in names:
@@ -136,8 +136,10 @@ def main(argv=None) -> int:
         if args.unsolved and wins:
             continue
         shown += 1
+        spec = "spec" in PROBLEM_BY_NAME[name].tags
+        mark = " [spec]" if spec else ""
         if not atts:
-            print(f"{name:<32}{tier_of.get(name,'?'):<9}{'—':<14}{'—':<10}"
+            print(f"{(name+mark):<36}{tier_of.get(name,'?'):<9}{'—':<14}{'—':<10}"
                   f"{'—':>6}  {'—':<10} never run")
             continue
         first = wins[0] if wins else None
@@ -150,7 +152,7 @@ def main(argv=None) -> int:
         trials = sum(a["trials"] for a in atts)
         last = atts[-1]
         flag = "*" if (first and first["dirty"]) else ""
-        print(f"{name:<32}{tier_of.get(name,'?'):<9}"
+        print(f"{(name+mark):<36}{tier_of.get(name,'?'):<9}"
               f"{(first['ts'][:8] if first else '—'):<14}"
               f"{((first['commit']+flag) if first else '—'):<10}"
               f"{(str(best) if real_wins else '—'):>6}  "
@@ -159,14 +161,14 @@ def main(argv=None) -> int:
 
         empties = [a for a in wins if a["empty"]]
         if empties:
-            print(f"{'':<32}!! {len(empties)} EMPTY-PROOF 'solve(s)' — success with "
+            print(f"{'':<36}!! {len(empties)} EMPTY-PROOF 'solve(s)' — success with "
                   f"no tactics, not a proof")
         stale_wins = [a for a in wins if a["stale"]]
         if stale_wins and len(stale_wins) == len(wins):
-            print(f"{'':<32}!! all {len(wins)} win(s) predate the proofStatus fix "
+            print(f"{'':<36}!! all {len(wins)} win(s) predate the proofStatus fix "
                   f"({PROOFSTATUS_FIX_DATE}) — success criterion since rejected")
         if len(statements[name]) > 1:
-            print(f"{'':<32}!! STATEMENT CHANGED between runs "
+            print(f"{'':<36}!! STATEMENT CHANGED between runs "
                   f"({len(statements[name])} variants) — results not comparable")
 
     # Never-attempted problems are part of the picture: a can/cannot-solve
@@ -181,8 +183,22 @@ def main(argv=None) -> int:
 
     solved = sum(1 for n in names if any(a["ok"] for a in hist[n]))
     trusted = sum(1 for n in names if trustworthy(n))
+    # Spec lemmas are the formalisation's own sanity checks ("These pin down
+    # that the encoded definitions behave as intended"), not competition
+    # problems. Counting them alongside main statements overstates the result.
+    def is_spec(n: str) -> bool:
+        return "spec" in PROBLEM_BY_NAME[n].tags
+
+    main_names = [n for n in names if not is_spec(n)]
+    main_won = sum(1 for n in main_names if trustworthy(n))
+    spec_names = [n for n in names if is_spec(n)]
+    spec_won = sum(1 for n in spec_names if trustworthy(n))
     print(f"\n{shown} shown | {len(attempted)} attempted | {solved} with a recorded win, "
           f"of which {trusted} under the current success criterion")
+    if spec_names:
+        print(f"  main statements: {main_won}/{len(main_names)} solved   |   "
+              f"[spec] lemmas (formalisation sanity checks, not competition "
+              f"problems): {spec_won}/{len(spec_names)}")
     print(f"  {len(never)} NEVER ATTEMPTED of {len(PROBLEM_BY_NAME)} in problems.py")
     print("  * = first solved on a dirty tree; that SHA does not reproduce it")
     print("  (machine-local: results/ is gitignored, so other machines' runs are absent)")
