@@ -8,13 +8,20 @@ Answers the questions a pile of timestamped JSON files cannot:
     - did its STATEMENT change between runs (which invalidates comparison)?
 
 Derived rather than maintained by hand, because a hand-kept table rots and the
-results files are already the source of truth. Nothing here is written back;
-run it whenever you want the current picture.
+results files are already the source of truth.
+
+MACHINE-LOCAL BY DESIGN. results/ is gitignored, so this reflects only runs
+made on this machine — a collaborator's runs will never appear here, and
+yours will not appear in theirs. Do not read a gap as "never attempted
+anywhere"; read it as "never attempted here". If a shared record is ever
+wanted, that is a decision to commit results/, not something this script can
+paper over.
 
     python scripts/eval_history.py                 # every problem attempted
     python scripts/eval_history.py --tier imo      # one tier
     python scripts/eval_history.py --unsolved      # only never-solved
     python scripts/eval_history.py --runs          # one row per run instead
+    python scripts/eval_history.py --write         # also dump to results/eval-history.txt
 
 Runs made by the test suite (policy/model "mock") are excluded by default:
 they use LEAN_SKIP_MATHLIB, so simp/ring/omega do not exist and everything
@@ -55,6 +62,11 @@ def main(argv=None) -> int:
     ap.add_argument("--unsolved", action="store_true", help="only never-solved problems")
     ap.add_argument("--runs", action="store_true", help="list runs instead of problems")
     ap.add_argument("--include-mock", action="store_true")
+    ap.add_argument(
+        "--write", action="store_true",
+        help="also write the table to results/eval-history.txt (gitignored, "
+             "like the rest of results/ — this record is machine-local)",
+    )
     args = ap.parse_args(argv)
 
     runs = load_runs(args.include_mock)
@@ -116,7 +128,7 @@ def main(argv=None) -> int:
         print(f"{name:<32}{tier_of.get(name,'?'):<9}"
               f"{(first['ts'][:8] if first else '—'):<14}"
               f"{((first['commit']+flag) if first else '—'):<10}"
-              f"{(best if wins else 0) or '—':>6}  "
+              f"{(str(best) if wins else '—'):>6}  "
               f"{f'{passes}/{trials}':<10} "
               f"{last['ts'][:8]} {'ok' if last['ok'] else 'fail'}")
 
@@ -124,10 +136,50 @@ def main(argv=None) -> int:
             print(f"{'':<32}!! STATEMENT CHANGED between runs "
                   f"({len(statements[name])} variants) — results not comparable")
 
-    print(f"\n{shown} problem(s) from {len(runs)} real run(s)")
+    # Never-attempted problems are part of the picture: a can/cannot-solve
+    # table that silently omits them overstates coverage.
+    attempted = set(hist)
+    never = [n for n, p in PROBLEM_BY_NAME.items() if n not in attempted]
+    if args.tier:
+        never = [n for n in never if PROBLEM_BY_NAME[n].difficulty == args.tier]
+
+    solved = sum(1 for n in (names if not args.unsolved else [])
+                 if any(a["ok"] for a in hist[n]))
+    print(f"\n{shown} shown | {len(attempted)} attempted, {solved} ever solved "
+          f"| {len(never)} NEVER ATTEMPTED of {len(PROBLEM_BY_NAME)} in problems.py")
+    if never:
+        by_tier: dict[str, list] = defaultdict(list)
+        for n in never:
+            by_tier[PROBLEM_BY_NAME[n].difficulty].append(n)
+        for tier in sorted(by_tier):
+            names_ = ", ".join(sorted(by_tier[tier]))
+            print(f"  never run [{tier}]: {names_[:150]}{'…' if len(names_) > 150 else ''}")
     print("  * = first solved on a dirty tree; that SHA does not reproduce it")
+    print("  (machine-local: results/ is gitignored, so other machines' runs are absent)")
     return 0
 
 
+def cli(argv=None) -> int:
+    """Run main(), echoing to stdout and optionally saving a copy.
+
+    The copy lands in results/, which is gitignored — this record is
+    machine-local by design (see the module docstring).
+    """
+    import contextlib, io
+    argv = list(sys.argv[1:] if argv is None else argv)
+    want_write = "--write" in argv
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = main(argv)
+    text = buf.getvalue()
+    sys.stdout.write(text)
+    if want_write and code == 0:
+        dest = Path(__file__).parent.parent / "results" / "eval-history.txt"
+        dest.parent.mkdir(exist_ok=True)
+        dest.write_text(text)
+        print(f"\nwritten to {dest.relative_to(Path(__file__).parent.parent)}")
+    return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
