@@ -40,6 +40,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from eval.problems import PROBLEM_BY_NAME  # noqa: E402
 
+# a663c58a (2026-08-01) made proofStatus == "Completed" the only accepted
+# success signal. Before it, a tactic that merely emptied the goal list counted
+# as a proof — which apply?/exact? do routinely, since they close the current
+# state after printing a suggestion. Runs older than this recorded wins that
+# were never proofs; see EMPTY-PROOF below for the ones still visible.
+PROOFSTATUS_FIX_DATE = "20260801"
+
 
 def load_runs(include_mock: bool) -> list[dict]:
     runs = []
@@ -104,6 +111,11 @@ def main(argv=None) -> int:
                 "dirty": r.get("dirty", False), "model": r.get("model") or "?",
                 "passes": p.get("passes", 0), "trials": p.get("trials", 1),
                 "nodes": p.get("nodes_visited", 0), "ok": p.get("success", False),
+                # A "solve" with no tactics is not a proof. Recorded rather
+                # than filtered, so the bad rows are visible instead of quietly
+                # dropped.
+                "empty": bool(p.get("success")) and not p.get("proof_trace"),
+                "stale": r["timestamp"][:8] < PROOFSTATUS_FIX_DATE,
             })
 
     names = sorted(hist, key=lambda n: (tier_of.get(n, ""), n))
@@ -120,7 +132,11 @@ def main(argv=None) -> int:
             continue
         shown += 1
         first = wins[0] if wins else None
-        best = min((a["nodes"] for a in wins), default=0)
+        # Empty-proof records (success with no tactics — see "empty" above)
+        # are not proofs, so they must not set the best-node figure. Three such
+        # records from 2026-07-03 were rendering solved problems as "best 0".
+        real_wins = [a for a in wins if not a["empty"]]
+        best = min((a["nodes"] for a in real_wins), default=0)
         passes = sum(a["passes"] for a in atts)
         trials = sum(a["trials"] for a in atts)
         last = atts[-1]
@@ -128,10 +144,18 @@ def main(argv=None) -> int:
         print(f"{name:<32}{tier_of.get(name,'?'):<9}"
               f"{(first['ts'][:8] if first else '—'):<14}"
               f"{((first['commit']+flag) if first else '—'):<10}"
-              f"{(str(best) if wins else '—'):>6}  "
+              f"{(str(best) if real_wins else '—'):>6}  "
               f"{f'{passes}/{trials}':<10} "
               f"{last['ts'][:8]} {'ok' if last['ok'] else 'fail'}")
 
+        empties = [a for a in wins if a["empty"]]
+        if empties:
+            print(f"{'':<32}!! {len(empties)} EMPTY-PROOF 'solve(s)' — success with "
+                  f"no tactics, not a proof")
+        stale_wins = [a for a in wins if a["stale"]]
+        if stale_wins and len(stale_wins) == len(wins):
+            print(f"{'':<32}!! all {len(wins)} win(s) predate the proofStatus fix "
+                  f"({PROOFSTATUS_FIX_DATE}) — success criterion since rejected")
         if len(statements[name]) > 1:
             print(f"{'':<32}!! STATEMENT CHANGED between runs "
                   f"({len(statements[name])} variants) — results not comparable")
@@ -143,10 +167,14 @@ def main(argv=None) -> int:
     if args.tier:
         never = [n for n in never if PROBLEM_BY_NAME[n].difficulty == args.tier]
 
-    solved = sum(1 for n in (names if not args.unsolved else [])
-                 if any(a["ok"] for a in hist[n]))
-    print(f"\n{shown} shown | {len(attempted)} attempted, {solved} ever solved "
-          f"| {len(never)} NEVER ATTEMPTED of {len(PROBLEM_BY_NAME)} in problems.py")
+    def trustworthy(n: str) -> bool:
+        return any(a["ok"] and not a["empty"] and not a["stale"] for a in hist[n])
+
+    solved = sum(1 for n in names if any(a["ok"] for a in hist[n]))
+    trusted = sum(1 for n in names if trustworthy(n))
+    print(f"\n{shown} shown | {len(attempted)} attempted | {solved} with a recorded win, "
+          f"of which {trusted} under the current success criterion")
+    print(f"  {len(never)} NEVER ATTEMPTED of {len(PROBLEM_BY_NAME)} in problems.py")
     if never:
         by_tier: dict[str, list] = defaultdict(list)
         for n in never:
