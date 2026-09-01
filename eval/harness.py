@@ -33,6 +33,37 @@ class ProblemResult:
     successful_trial_traces: list[str] = field(default_factory=list)  # paths, only when --trace-successes is on
 
 
+def _provenance() -> dict:
+    """Identify the code that produced a run.
+
+    Without this a stored result is uninterpretable: eval_20260827_161523.json
+    records 0/3 on IMO 2026 and looks like a capability measurement, but it
+    predates 43740dd4 — those problems were unprovable by construction at the
+    time. A timestamp alone cannot distinguish the two.
+
+    `dirty` matters as much as the commit: a run made with uncommitted changes
+    is not reproducible from the SHA, and during active development that is
+    the common case rather than the exception.
+    """
+    import subprocess
+
+    def _git(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=Path(__file__).parent.parent,
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except Exception:
+            return ""
+
+    toolchain = Path(__file__).parent.parent / "lean_project" / "lean-toolchain"
+    return {
+        "commit": _git("rev-parse", "--short", "HEAD"),
+        "dirty": bool(_git("status", "--porcelain", "--untracked-files=no")),
+        "lean_toolchain": toolchain.read_text().strip() if toolchain.exists() else "",
+    }
+
+
 @dataclass
 class EvalSummary:
     timestamp: str
@@ -41,6 +72,10 @@ class EvalSummary:
     workers: int
     budget: int
     trials: int
+    # Which code produced this — see _provenance().
+    commit: str
+    dirty: bool
+    lean_toolchain: str
     total: int
     passed: int          # problems with at least one passing trial (pass@k)
     pass_rate: float     # passed / total  (pass@k rate)
@@ -90,6 +125,7 @@ def _build_summary(
         workers=workers,
         budget=budget,
         trials=trials,
+        **_provenance(),
         total=total,
         passed=passed,
         pass_rate=round(passed / total, 3) if total else 0.0,
@@ -266,7 +302,10 @@ async def run_eval(
                 name=problem.name,
                 difficulty=problem.difficulty,
                 tags=list(problem.tags),
-                statement=problem.statement,
+                # Full text (preamble + theorem) so the record says what was
+                # actually proven and stays comparable across refactors that
+                # move parts between fields.
+                statement=problem.full_statement,
                 success=success,
                 passes=passes,
                 trials=trials,

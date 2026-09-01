@@ -628,6 +628,21 @@ class TestRunEvalTracing:
 _MOCK_FLAGS = ["--policy", "mock", "--executor", "mock"]
 
 
+@pytest.fixture(autouse=True)
+def _never_write_to_the_real_results_dir(tmp_path, monkeypatch):
+    """Point run_eval's RESULTS_DIR at a temp dir for every test in this file.
+
+    run_eval.main() saves an EvalSummary to RESULTS_DIR, so CLI tests were
+    depositing mock-policy runs into the repo's results/ — 129 of 204 files,
+    interleaved by timestamp with real evaluations. They record 0/5 on the easy
+    tier (tests run with LEAN_SKIP_MATHLIB=1, so simp/ring/omega do not exist),
+    which reads exactly like a catastrophic regression next to a real run.
+    """
+    import run_eval as run_eval_module
+    monkeypatch.setattr(run_eval_module, "RESULTS_DIR", tmp_path / "results")
+
+
+
 class TestEvalCLI:
 
     def test_parse_defaults(self):
