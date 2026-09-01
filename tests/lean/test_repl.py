@@ -27,7 +27,8 @@ from lean.repl import (
     _annotate_chain_error,
     LEAN_PROJECT_DIR,
 )
-from core.proof_state import ProofState, make_proof_state
+from core.executor import StepResult
+from core.proof_state import ProofState, make_goal, make_proof_state
 from policy.mock import MockPolicy
 from policy.anthropic import AnthropicPolicy
 from policy.deepseek import DeepSeekPolicy
@@ -962,3 +963,61 @@ class TestResetClearsProofStateCache:
         await worker.reset("theorem foo : True := by")
 
         assert "stale-hash-from-a-previous-problem" not in worker._proof_state_cache
+
+
+class TestWorkerRestartRecovery:
+    """
+    A stuck tactic forces the subprocess to be killed (see the TimeoutError
+    branch in _send), which wipes _proof_state_cache. Every state the Ledger
+    holds then points at REPL ids that no longer exist.
+
+    Measured before this existed: a 155s `simp` killed the worker on turn 9 of
+    imo2026_q1_terminal_value, and 41 of the remaining 49 turns never reached
+    Lean — the run scored 0/50 and read in the results exactly like a model
+    failure. A ProofState carries its full tactic path, so the state can be
+    re-derived by replaying it from a fresh reset.
+    """
+
+    async def test_rebuilds_a_state_whose_repl_id_was_lost(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        worker._last_theorem = "theorem foo : True := by"
+        state = ProofState(goals=(make_goal("True"),), tactic_trace=("trivial",))
+
+        calls = []
+
+        async def fake_reset(theorem, preamble=""):
+            calls.append(("reset", theorem))
+            base = make_proof_state(["True"])
+            worker._proof_state_cache[base.stable_hash()] = 0
+            return base, 0
+
+        async def fake_step(st, tac):
+            calls.append(("step", tac))
+            worker._proof_state_cache[state.stable_hash()] = 7
+            return StepResult(next_state=state, tactic=tac)
+
+        worker.reset = fake_reset
+        worker.step = fake_step
+        assert await worker._rebuild_state(state) == 7
+        assert calls == [("reset", "theorem foo : True := by"), ("step", "trivial")]
+
+    async def test_gives_up_when_no_theorem_recorded(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        assert await worker._rebuild_state(make_proof_state(["x"])) is None
+
+    async def test_does_not_recurse_while_already_rebuilding(self):
+        """_rebuild_state calls step(), which can cache-miss again. Without the
+        guard that is unbounded recursion."""
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        worker._last_theorem = "theorem foo : True := by"
+        worker._rebuilding = True
+        assert await worker._rebuild_state(make_proof_state(["x"])) is None
+
+    async def test_unrecoverable_miss_reports_the_worker_lost_sentinel(self):
+        """The search keys on this exact error to end the trial rather than
+        spend its remaining budget."""
+        from lean.repl import WORKER_LOST_ERROR
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])          # never cached
+        result = await worker.step(state, "simp")
+        assert result.next_state.error == WORKER_LOST_ERROR

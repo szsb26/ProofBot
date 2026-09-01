@@ -67,6 +67,12 @@ logger = logging.getLogger(__name__)
 # it contains the Lean files, dependencies, and compiled artifacts needed to run the REPL.
 LEAN_PROJECT_DIR = Path(__file__).parent.parent / "lean_project"
 
+# Raised as a ProofState.error when a state cannot be reached because the REPL
+# subprocess was restarted and could not be rebuilt. Distinct from a Lean error
+# because it says nothing about the mathematics — the search should end the
+# trial rather than keep spending budget.
+WORKER_LOST_ERROR = "Lean worker was restarted and this proof state could not be rebuilt"
+
 _BY_KEYWORD_RE = re.compile(r"\bby\b")
 # Matches a top-level segment ending in "have NAME : STMT :=" (or the
 # anonymous "have : STMT :="), right before its inline proof's "by" —
@@ -216,6 +222,11 @@ class LeanWorker:
         # Optional JSONL log of every REPL exchange (see _log_exchange).
         self._raw_log_path = raw_log_path
         self._raw_log_seq = 0
+        # Last theorem/preamble handed to reset(), so a state can be re-derived
+        # if the subprocess is restarted mid-search (see _rebuild_state).
+        self._last_theorem: str | None = None
+        self._last_preamble: str = ""
+        self._rebuilding = False
 
     def _log_exchange(
         self,
@@ -477,6 +488,8 @@ class LeanWorker:
         # against the wrong problem's context, so drop it at each reset.
         # Nothing is lost: a finished problem's states are never revisited.
         self._proof_state_cache.clear()
+        if not self._rebuilding:
+            self._last_theorem, self._last_preamble = theorem, preamble
 
         # `preamble` holds definitions the statement depends on. They must be
         # committed as their OWN command: a proofState does not carry
@@ -555,6 +568,41 @@ class LeanWorker:
 
         return initial_state, repl_ps_id
 
+    async def _rebuild_state(self, state: ProofState) -> Optional[int]:
+        """Re-derive a proof state after the worker was restarted.
+
+        Replays the state's tactic_trace from a fresh reset. Costs one REPL
+        call per tactic in the path, which is far cheaper than losing the rest
+        of the search — the alternative, measured, was 41 dead turns out of 49.
+
+        Returns the new REPL proofState id, or None if recovery is impossible
+        (no theorem recorded yet, reset fails, or a replayed tactic no longer
+        lands where it did — e.g. it was nondeterministic).
+        """
+        if self._last_theorem is None or self._rebuilding:
+            return None
+        self._rebuilding = True
+        try:
+            logger.warning(
+                "rebuilding proof state after worker restart (replaying %d tactic(s))",
+                len(state.tactic_trace),
+            )
+            base, _ = await self.reset(self._last_theorem, self._last_preamble)
+            if base.is_error:
+                return None
+            current = base
+            for tac in state.tactic_trace:
+                result = await self.step(current, tac)
+                if result.next_state.is_error:
+                    return None
+                current = result.next_state
+            return self._proof_state_cache.get(state.stable_hash())
+        except Exception:
+            logger.warning("proof state rebuild failed", exc_info=True)
+            return None
+        finally:
+            self._rebuilding = False
+
     async def step(
         self,
         state: ProofState,
@@ -587,10 +635,25 @@ class LeanWorker:
         # error out if we dont have this state in our cache. This should not happen if our caching and routing logic is correct,
         # but we check just in case.
         if repl_ps_id is None:
-            # State not in cache — return error
+            # The cache is wiped when a stuck tactic forces the subprocess to
+            # be killed (see the TimeoutError branch in _send). Every state the
+            # Ledger is holding then points at REPL ids that no longer exist,
+            # so WITHOUT recovery the rest of the run is spent on a Lean that
+            # has forgotten everything. Measured: one 155s `simp` killed the
+            # worker on turn 9 of imo2026_q1_terminal_value and the remaining
+            # 41 of 49 turns never reached Lean at all — a void run that reads
+            # in the results exactly like a model failure.
+            #
+            # A ProofState carries the full tactic path from the root, so the
+            # state can be re-derived: reset the theorem and replay the trace.
+            repl_ps_id = await self._rebuild_state(state)
+
+        if repl_ps_id is None:
             error_state = ProofState(
                 goals=state.goals,
-                error=f"proof state not found in REPL cache",
+                # Distinguishable on purpose: the search stops the trial on
+                # this rather than spending its remaining budget.
+                error=WORKER_LOST_ERROR,
                 depth=state.depth,
                 tactic_trace=state.tactic_trace,
             )

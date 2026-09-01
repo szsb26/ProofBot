@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from core.executor import LeanExecutor
 from core.ledger import Ledger
 from core.policy import PolicyModel
+from lean.repl import WORKER_LOST_ERROR
 
 # Reject sorry/admit anywhere in a tactic, not just as the whole tactic —
 # both are valid Lean terms, so they can be smuggled in nested inside an
@@ -227,6 +228,24 @@ class LedgerSearch:
                 continue
 
             result = await self.executor.step(state, resp.tactic)
+
+            # A restarted Lean subprocess invalidates every proof state the
+            # Ledger holds. If the executor could not rebuild this one, nothing
+            # else in the frontier is reachable either, so continuing just
+            # burns the budget against a Lean that has forgotten the proof —
+            # measured at 41 dead turns out of 49 before this check existed,
+            # producing a trace indistinguishable from a model failure.
+            if result.next_state.error == WORKER_LOST_ERROR:
+                logger.error("worker lost and unrecoverable; ending trial at call %d", calls)
+                return ProofResult(
+                    success=False,
+                    proof_trace=[],
+                    nodes_visited=calls,
+                    elapsed_ms=(time.perf_counter() - start) * 1000,
+                    theorem=theorem,
+                    error=WORKER_LOST_ERROR,
+                    failure_reason="worker_lost",
+                )
 
             # Every genuinely-verified sub-step of a chained tactic (e.g.
             # "intro n; simp; omega") becomes its own frontier state, not
