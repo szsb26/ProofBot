@@ -14,6 +14,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from eval.problems import PROBLEM_BY_NAME
@@ -52,6 +54,14 @@ async def _run(args: argparse.Namespace) -> int:
     if unknown:
         print(f"error: unknown problem(s): {', '.join(unknown)}", file=sys.stderr)
         return 1
+
+    # Without this the key in .env is invisible, AnthropicPolicy is built
+    # with an empty key, and every problem fails in ~0.1s as
+    # "draft_failed" — four instant failures that read like a baseline
+    # result rather than a missing credential. run_eval.py has always
+    # called this; this script never did, which is why the north-star
+    # comparison has no recorded numbers.
+    load_dotenv()
 
     if args.policy == "deepseek":
         policy = DeepSeekPolicy(model=args.model) if args.model else DeepSeekPolicy()
