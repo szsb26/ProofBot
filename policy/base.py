@@ -94,6 +94,13 @@ DIRECTOR_SYSTEM_PROMPT = (
     "feedback on every step, and keeps the progress you have already made. "
     "This is also the only way to build a reusable lemma you intend to apply "
     "more than once.\n"
+    "- NEVER write `sorry` or `admit`, anywhere in a tactic — not as a step, "
+    "not inside `:= by ...`, and not as a `first | ... | sorry` fallback. Such "
+    "a tactic is rejected without being run, so the whole turn is lost, "
+    "including any legitimate steps chained before it. When you want to defer "
+    "part of the work, use the bare `have` above instead: that is the supported "
+    "way to say \"I will prove this later\", and unlike `sorry` it keeps the "
+    "sub-goal open and tracked for you.\n"
     "- Respond with JSON only, matching exactly this shape:\n"
     '{"reasoning": "<your natural-language plan for the chosen state>", '
     '"abandon": ["<state_id>", ...], "abandon_reason": "<brief reason, or '

@@ -204,6 +204,62 @@ class TestLedgerSearchDirectorBehavior:
         result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=5))
         assert not result.success
 
+    def test_banned_tactic_is_reported_back_not_silently_dropped(self):
+        """A rejected tactic must reach the next prompt with a reason.
+
+        It used to be skipped in silence — nothing ran, nothing was recorded,
+        so the model never saw the rule it was breaking. On imo2026_q5 that
+        cost turns 13 AND 14, the second carrying six legitimate `have` steps
+        that went out with the trailing `sorry` and were rebuilt over the two
+        turns after.
+        """
+        seen_prompts = []
+
+        class SorryThenGiveUpPolicy:
+            def __init__(self):
+                self.calls = 0
+
+            async def get_next_action(self, theorem, ledger, premises):
+                self.calls += 1
+                seen_prompts.append(ledger)
+                chosen = next(iter(ledger.frontier))
+                return DirectorResponse(
+                    chosen_state_id=chosen,
+                    abandoned_state_ids=[],
+                    tactic="intro n; have h : n = n := rfl; sorry",
+                )
+
+            async def close(self):
+                pass
+
+        search = LedgerSearch(policy=SorryThenGiveUpPolicy(), executor=MockExecutor())
+        result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=3))
+        assert not result.success
+
+        from policy.base import serialize_ledger
+        ledger = seen_prompts[-1]
+        rendered = serialize_ledger("theorem foo : n + 0 = n := by", ledger, [])
+        assert "sorry" in rendered, "the rejected tactic must be visible to the director"
+        assert "bare `have`" in rendered or "have name : statement" in rendered, (
+            "the rejection must say what to do instead"
+        )
+
+    def test_banned_tactic_error_names_the_offending_token(self):
+        from search.ledger_search import _banned_tactic_error
+        msg = _banned_tactic_error("intro n; have h : n = n := rfl; sorry")
+        assert "`sorry`" in msg
+        assert "admit" not in msg, "should name the token actually used"
+
+    def test_banned_tactic_error_explains_native_decide_differently(self):
+        """sorry means \"you deferred work\"; native_decide means \"that is not a
+        proof\". The remedy differs, so the message must too."""
+        from search.ledger_search import _banned_tactic_error
+        msg = _banned_tactic_error("native_decide")
+        assert "axiom" in msg
+        assert "have name : statement" not in msg, (
+            "bare-have advice is meaningless for native_decide"
+        )
+
     def test_native_decide_is_filtered(self):
         """native_decide is the one banned tactic NOT also caught by the
         success check: verified against a live REPL it returns proofStatus

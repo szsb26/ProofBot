@@ -81,6 +81,38 @@ def _contains_banned_tactic(tactic: str) -> bool:
     return bool(_BANNED_TACTIC_PATTERN.search(tactic))
 
 
+def _banned_tactic_error(tactic: str) -> str:
+    """
+    Why a tactic was rejected, phrased for the director rather than for us.
+
+    Recorded on the state as if it were a Lean error so the next prompt shows
+    it under "Tactics already tried here". Previously the turn was skipped in
+    silence: nothing reached Lean, nothing reached the ledger, and the model
+    had no way to learn a rule it is never shown breaking. Measured on
+    imo2026_q5, where turns 13 and 14 both ended in `sorry` — the second
+    carrying six legitimate `have` steps that were discarded with it, then
+    rebuilt from scratch over turns 16-17.
+    """
+    match = _BANNED_TACTIC_PATTERN.search(tactic)
+    token = match.group(0) if match else "a forbidden tactic"
+    if token in ("sorry", "admit"):
+        remedy = (
+            "`" + token + "` is never accepted, anywhere in a tactic — not as a "
+            "step, not inside `:= by ...`, not as a `first | ... | " + token + "` "
+            "fallback. To defer part of the work, write a bare "
+            "`have name : statement` with no `:= by`: that opens the statement "
+            "as a goal you can prove over later turns and hands you `name` now."
+        )
+    else:
+        remedy = (
+            "`" + token + "` is never accepted: it discharges the goal by trusting "
+            "the compiler rather than the kernel, and adds an axiom, so a proof "
+            "using it would not count. Prove the goal with ordinary tactics "
+            "(`decide` is fine — kernel reduction introduces no axioms)."
+        )
+    return "Rejected without being run — " + remedy
+
+
 @dataclass
 class ProofResult:
     """
@@ -246,7 +278,12 @@ class LedgerSearch:
             ledger.set_reasoning(resp.chosen_state_id, resp.reasoning)
 
             if _contains_banned_tactic(resp.tactic):
-                # Nothing legitimate to try this turn — try again next call.
+                # Nothing legitimate to run, but the turn must still leave a
+                # trace: record it as a failure so the next prompt shows the
+                # tactic and the reason under "Tactics already tried here".
+                ledger.record_failure(
+                    resp.chosen_state_id, resp.tactic, _banned_tactic_error(resp.tactic)
+                )
                 continue
 
             result = await self.executor.step(state, resp.tactic)
