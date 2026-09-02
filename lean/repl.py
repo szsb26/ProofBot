@@ -966,6 +966,12 @@ class LeanWorker:
         current_ps_id = repl_ps_id
         response: dict = {}
         intermediate_states: list[ProofState] = []
+        # The sub-steps Lean actually ran, in order. NOT the same as the
+        # tactic the director wrote: _discover_steps splits chains and
+        # _peel_bare_have rewrites `have h : T := by tac` into a bare
+        # `have h : T`. tactic_trace must record what ran, or the trace we
+        # print is not a proof. See the comment at the closed-state build.
+        executed: list[str] = []
 
         for step_idx, (sub_tactic, response) in enumerate(steps):
             # Parse response. Note that response is a JSON object which contains keys like proofState, goals, proofStatus, etc...
@@ -1041,6 +1047,7 @@ class LeanWorker:
                 )
 
             current_ps_id = response["proofState"]
+            executed.append(sub_tactic)
             if response.get("proofStatus", "") == "Completed":
                 # Goal closed before exhausting the chain — nothing left to
                 # prove, so remaining steps (which would error on "no
@@ -1079,11 +1086,24 @@ class LeanWorker:
         proof_status = response.get("proofStatus", "")
 
         if proof_status == "Completed":
-            # Proof closed
+            # Proof closed.
+            #
+            # tactic_trace records `executed`, not `tactic`. These differ
+            # whenever the chain was split or a `have ... := by ...` was
+            # peeled, and recording the director's original string produced a
+            # proof_trace that does not replay: measured on
+            # eval_20260902_140914 (imo2005_q3, solved 2/2), pasting the
+            # recorded trace back into Lean as one command failed with "No
+            # goals to be solved". The trace said
+            #   have hB : … ≠ 0 := by positivity; have hD : … ; field_simp; ring
+            # while Lean was actually sent the peeled `have hB : … ≠ 0` and
+            # the rest as separate steps against a different goal. Checkpoints
+            # (below) already recorded `sub_tactics`; only the two terminal
+            # states did not, so a single trace mixed both conventions.
             closed_state = ProofState(
                 goals=(),
                 depth=state.depth + 1,
-                tactic_trace=state.tactic_trace + (tactic,),
+                tactic_trace=state.tactic_trace + tuple(executed),
             )
             return StepResult(
                 next_state=closed_state,
@@ -1121,7 +1141,7 @@ class LeanWorker:
         next_state = ProofState(
             goals=_parse_goals(goals_raw),
             depth=state.depth + 1,
-            tactic_trace=state.tactic_trace + (tactic,),
+            tactic_trace=state.tactic_trace + tuple(executed),
         )
 
         # Cache the new proof state

@@ -765,6 +765,43 @@ class TestLeanWorkerStepChaining:
         assert result.success
         assert result.proof_closed
 
+    async def test_trace_records_what_lean_ran_not_what_the_model_wrote(self):
+        """proof_trace must be the executed steps, or it is not a proof.
+
+        Measured on eval_20260902_140914 (imo2005_q3, solved 2/2): pasting the
+        recorded trace back into Lean failed with "No goals to be solved".
+        The trace held the director's original
+            have hB : ... := by positivity; ...; field_simp; ring
+        while Lean had actually been sent the PEELED `have hB : ...` and the
+        rest as separate steps against a different goal. Checkpoints already
+        recorded the executed steps; the two terminal states recorded the raw
+        string, so one trace mixed both conventions.
+        """
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ P", "⊢ Q"]},
+            {"proofStatus": "", "proofState": 2, "goals": ["⊢ Q"]},
+            {"proofStatus": "Completed", "proofState": 3, "goals": []},
+        ]))
+        result = await worker.step(state, "have h : P := by simp; exact h")
+
+        assert result.proof_closed
+        trace = list(result.next_state.tactic_trace)
+        assert trace == ["have h : P", "simp", "exact h"], trace
+        assert "have h : P := by simp; exact h" not in trace, (
+            "the unsplit original must not appear — it is not what Lean ran"
+        )
+
+    async def test_unsplit_tactic_still_records_itself_verbatim(self):
+        """The fix must not change the common case: a single tactic that Lean
+        accepts whole is recorded exactly as written."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "Completed", "proofState": 1, "goals": [],
+        })
+        result = await worker.step(state, "omega")
+        assert list(result.next_state.tactic_trace) == ["omega"]
+
     async def test_chain_stops_and_reports_the_step_that_failed(self):
         worker, state = self._make_worker_with_cached_state()
         worker._send = AsyncMock(side_effect=_lean_like_send([
