@@ -142,7 +142,31 @@ class DirectorResponse:
 
 
 _MAX_TRIED_TACTICS_SHOWN = 15
-_MAX_TACTIC_DISPLAY_LEN = 100
+# Outlier guard, not a routine trim. This was 100, which truncated 18% of all
+# tactics ever sent (486 of 2688) while the prompt tells the director "do not
+# repeat verbatim" and "read the error before retrying a similar idea" — it
+# cannot do either against a clipped tactic. Measured across the traces, 44
+# distinct tactics rendered IDENTICALLY to another attempt on the same state
+# once cut at 100. Raising it to 600 (past the 722-char worst case seen) costs
+# ~1% of prompt size: only 12 lines in a 100K-char turn-50 prompt were
+# truncated at all, because _MAX_TRIED_TACTICS_SHOWN already bounds the volume.
+# Capping HOW MANY entries are shown controls size; capping how long each one
+# is controls almost nothing and deletes the distinguishing tail.
+_MAX_TACTIC_DISPLAY_LEN = 600
+# Abandon reasons are PROSE, not tactics, and used to share the cap above.
+# At 100 that truncated 93% of them (1567 of 1674 written across all runs),
+# discarding 187,683 characters of the director's own explanations — and since
+# a sentence puts its conclusion last, it kept the setup and cut the finding.
+# One real example, imo2026_q5 turn 37, where the model had written exactly the
+# durable result we later went looking for a place to store:
+#   full: "diagonal x=y=z substitutions into hcross/hqm are provably
+#          degenerate, only ever yielding trivial (f(z)-z)^2>=0; need
+#          asymmetric substitution instead"
+#   shown: "...only ever yielding trivial …"     <- both the tautology and the
+#                                                   remedy cut off
+# At 400 only 2% truncate (p90 is 320 chars); the list is already capped at
+# _MAX_RETIRED_STATES_SHOWN entries, so the worst case is ~2% of prompt size.
+_MAX_ABANDON_REASON_DISPLAY_LEN = 400
 # Cap on the resumable-abandoned list. Each entry is one short line (no goal
 # text), so this is far cheaper than the open-state cap — but one observed run
 # retired 52 states, and an uncapped list would grow for the whole search.
@@ -171,6 +195,14 @@ def _format_tactic_for_display(tactic: str) -> str:
     oneline = " ".join(tactic.split())
     if len(oneline) > _MAX_TACTIC_DISPLAY_LEN:
         return oneline[:_MAX_TACTIC_DISPLAY_LEN] + "…"
+    return oneline
+
+
+def _format_reason_for_display(reason: str) -> str:
+    """Collapse an abandon reason to one line, capped as prose not as a tactic."""
+    oneline = " ".join(reason.split())
+    if len(oneline) > _MAX_ABANDON_REASON_DISPLAY_LEN:
+        return oneline[:_MAX_ABANDON_REASON_DISPLAY_LEN] + "…"
     return oneline
 
 
@@ -292,7 +324,7 @@ def serialize_ledger(
         for sid, st in retired:
             n = len(st.goals)
             why = ledger.abandon_reasons.get(sid, "")
-            why = f' — "{_format_tactic_for_display(why)}"' if why else ""
+            why = f' — "{_format_reason_for_display(why)}"' if why else ""
             parts.append(
                 f"  {sid}  {n} goal{'s' if n != 1 else ''}  depth {st.depth}{why}\n"
             )

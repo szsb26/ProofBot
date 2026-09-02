@@ -272,15 +272,62 @@ class TestSerializeLedger:
         assert shown == 16, f"expected only the 16 short tactics to show, got {shown} entries"
         assert "showing 16 of 66 unique" in text
 
-    def test_long_multiline_tactic_is_truncated_and_flattened(self):
+    def test_multiline_tactic_is_flattened_to_one_line(self):
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
-        long_tactic = "induction n with\n| zero => simp\n| succ n ih => " + ("x" * 150)
-        ledger.record_failure(state_id, long_tactic)
-
+        ledger.record_failure(state_id, "induction n with\n| zero => simp\n| succ n ih => simp")
         text = serialize_ledger("theorem foo := by", ledger, [])
-        assert "\n| zero" not in text  # flattened to one line
-        assert "…" in text  # truncated
+        assert "\n| zero" not in text
+        assert "induction n with | zero => simp" in text
+
+    def test_a_realistically_long_tactic_is_shown_whole(self):
+        """The cap is an outlier guard, not a routine trim.
+
+        At the old 100-char cap, 18% of every tactic ever sent was truncated,
+        and 44 pairs of genuinely different tactics rendered identically —
+        while the prompt instructs the director not to repeat one verbatim.
+        This is a real 213-char tactic from imo2026_q5 turn 39.
+        """
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        real = ("have hA : Real.sqrt (((z:ℝ)^2 + (f z:ℝ)^2)/2) ≥ 0 := Real.sqrt_nonneg _; "
+                "nlinarith [mul_le_mul h4 h4 (by positivity) (le_trans (by positivity) h4), h5]")
+        assert 100 < len(real) < 600
+        ledger.record_failure(state_id, real)
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert real in text, "a tactic of ordinary length must not be clipped"
+        assert "…" not in text
+
+    def test_pathological_tactic_is_still_truncated(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(state_id, "nlinarith [" + ("x" * 900) + "]")
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "…" in text
+
+    def test_abandon_reason_is_not_capped_like_a_tactic(self):
+        """Abandon reasons are prose and used to share the tactic cap.
+
+        At 100 chars that truncated 93% of every reason written across all
+        runs. This is the real reason from imo2026_q5 turn 37 — the finding
+        the search most needed to keep, cut in half at the old cap.
+        """
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        reason = ("diagonal x=y=z substitutions into hcross/hqm are provably degenerate, "
+                  "only ever yielding trivial (f(z)-z)^2>=0; need asymmetric substitution instead")
+        assert len(reason) > 100
+        ledger.abandon([state_id], reason)
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "(f(z)-z)^2>=0" in text, "the tautology it found must survive"
+        assert "need asymmetric substitution instead" in text, "so must the remedy"
+
+    def test_pathological_abandon_reason_is_still_truncated(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.abandon([state_id], "because " + ("y" * 900))
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "…" in text
 
     def test_no_dead_branch_section_when_nothing_failed(self):
         ledger = Ledger()
