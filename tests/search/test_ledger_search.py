@@ -204,6 +204,53 @@ class TestLedgerSearchDirectorBehavior:
         result = asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=5))
         assert not result.success
 
+    def test_native_decide_is_filtered(self):
+        """native_decide is the one banned tactic NOT also caught by the
+        success check: verified against a live REPL it returns proofStatus
+        "Completed", so without this filter the search would accept it as a
+        genuine proof. It discharges the goal by trusting the compiler and
+        adds the Lean.ofReduceBool axiom — and scripts/verify_imo2026.py
+        already rejects reference solutions that use it, so accepting it in
+        our own proofs would apply a weaker standard to ourselves."""
+        class FixedTacticPolicy:
+            def __init__(self, tactic):
+                self.tactic = tactic
+
+            async def get_next_action(self, theorem, ledger, premises):
+                return DirectorResponse(
+                    chosen_state_id=next(iter(ledger.frontier)),
+                    abandoned_state_ids=[],
+                    tactic=self.tactic,
+                )
+
+            async def close(self):
+                pass
+
+        for tactic in ("native_decide",
+                       "exact (by native_decide)",
+                       "intro a b; native_decide",
+                       "exact Lean.ofReduceBool h1 h2 h3"):
+            search = LedgerSearch(
+                policy=FixedTacticPolicy(tactic),
+                executor=AlwaysCloseExecutor(),
+            )
+            result = asyncio.run(
+                search.prove("theorem foo : n + 0 = n := by", budget=3))
+            assert not result.success, f"{tactic!r} was allowed to close a proof"
+
+    def test_kernel_decide_is_allowed(self):
+        """`decide` and `decide +kernel` introduce no axioms — banning them
+        would reject legitimate proofs."""
+        from search.ledger_search import _contains_banned_tactic
+        assert not _contains_banned_tactic("decide")
+        assert not _contains_banned_tactic("decide +kernel")
+
+    def test_banned_pattern_does_not_catch_innocent_identifiers(self):
+        from search.ledger_search import _contains_banned_tactic
+        for tactic in ("exact sorry_free_lemma", "exact h.admits",
+                       "simp [Nat.decide_eq_true]", "norm_num"):
+            assert not _contains_banned_tactic(tactic), tactic
+
     def test_embedded_sorry_is_filtered_not_just_bare_sorry(self):
         """A tactic like 'exact absurd hcard (by sorry)' smuggles sorry in as
         a nested term-mode proof — it must be rejected even though it isn't

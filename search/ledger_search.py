@@ -45,12 +45,34 @@ from core.ledger import Ledger
 from core.policy import PolicyModel
 from lean.repl import WORKER_LOST_ERROR
 
-# Reject sorry/admit anywhere in a tactic, not just as the whole tactic —
-# both are valid Lean terms, so they can be smuggled in nested inside an
-# otherwise legitimate-looking tactic (e.g. "exact absurd hcard (by sorry)").
-# Word boundaries avoid false positives on identifiers that merely contain
-# these substrings.
-_BANNED_TACTIC_PATTERN = re.compile(r"\b(sorry|admit)\b")
+# Tactics that must never be allowed to close a proof, matched anywhere in
+# the string rather than as the whole tactic — all are valid Lean terms and
+# can be smuggled inside an otherwise legitimate-looking tactic (e.g.
+# "exact absurd hcard (by sorry)"). Word boundaries avoid false positives on
+# identifiers that merely contain these substrings ("sorry_free_lemma",
+# "h.admits").
+#
+# Note this encodes OUR POLICY, not Lean's semantics — unlike the parsing
+# helpers in lean/repl.py, getting it wrong permits something we did not mean
+# to permit rather than misrepresenting what Lean said. So a pattern is the
+# right shape here; it just has to be right.
+#
+#   sorry / admit  Belt and braces: Lean also reports proofStatus
+#                  "Incomplete: contains sorry" for these, and for `sorryAx`
+#                  written out as a term in any form (verified against a live
+#                  REPL), so the success check would reject them anyway.
+#   native_decide  NOT covered by anything else. Verified against a live
+#                  REPL: it returns proofStatus "Completed", so without this
+#                  the search would accept it as a genuine proof — while
+#                  scripts/verify_imo2026.py rejects reference solutions that
+#                  use it, because it discharges the goal by trusting the
+#                  compiler and adds the Lean.ofReduceBool axiom. Proposed 11
+#                  times across recorded runs and never applied successfully,
+#                  so this closes a latent hole rather than a live one.
+#
+# `decide` and `decide +kernel` are deliberately NOT banned: kernel reduction
+# introduces no axioms and is a legitimate proof.
+_BANNED_TACTIC_PATTERN = re.compile(r"\b(sorry|admit|native_decide|ofReduceBool)\b")
 
 logger = logging.getLogger(__name__)
 
