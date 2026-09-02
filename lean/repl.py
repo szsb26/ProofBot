@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.executor import LeanExecutor, StepResult
-from core.proof_state import Goal, Hypothesis, ProofState
+from core.proof_state import Goal, ProofState
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,109 @@ _BY_KEYWORD_RE = re.compile(r"\bby\b")
 # Confirmed against a real Lean REPL: bare "have h" with no type at
 # all is rejected outright.
 _HAVE_WITH_INLINE_PROOF_RE = re.compile(r"^have\b(\s+\S+)?\s*:(?!=).*:=$", re.DOTALL)
+# A top-level "=>" opens a body whose ';' sequence that body rather than
+# separating steps — "induction x with | a => …", "case pos => …",
+# "next => …", "conv => …". The one construct where "=>" does NOT open such a
+# body is a lambda ("exact fun x => x; simp"), so that is the exception tested
+# for, rather than enumerating the keywords that do.
+_LAMBDA_KEYWORD_RE = re.compile(r"(?:\bfun\b|λ)")
+# Bracket pairs that must suppress splitting. Anonymous-constructor brackets
+# ⟨⟩ are included: without them a "by" inside ⟨…⟩ reads as top-level and
+# aborts the scan, shipping an unsplit ';' that Lean rejects outright.
+_OPEN_BRACKETS = "([{⟨"
+_CLOSE_BRACKETS = ")]}⟩"
+# Lean's focus dot. A "· tac; tac" block is one tactic whose body runs on the
+# focused goal and must close it, so its ';' are not step separators.
+_FOCUS_DOT = "·"
+
+# Lean prefixes syntax errors with the source position it choked at
+# ("<input>:1:7: expected end of input"). Elaboration errors — unknown
+# constant, type mismatch, unsolved goals — carry no such prefix, so this
+# distinguishes "you sent me something I cannot parse" from "I ran it and it
+# failed".
+_PARSE_ERROR_RE = re.compile(r"<input>:\d+:\d+:")
+
+
+def _is_parse_error(response: dict) -> bool:
+    """True when Lean rejected the string as syntax rather than running it."""
+    blob = str(response.get("message", ""))
+    for m in response.get("messages") or []:
+        blob += " " + str(m.get("data", ""))
+    return bool(_PARSE_ERROR_RE.search(blob))
+
+
+def _has_error_messages(response: dict) -> bool:
+    """True when Lean returned a state but logged an error alongside it."""
+    return any(
+        m.get("severity") == "error" for m in (response.get("messages") or [])
+    )
+
+
+def _is_have_decomposition(tactic: str, parts: list[str]) -> bool:
+    """
+    Did the splitter open a bare sub-goal from "have NAME : STMT := by REST"?
+
+    That split is deliberate rather than a parsing workaround — it exists to
+    checkpoint the sub-proof step by step (see _split_top_level_tactics) — and
+    the original string parses whole, so the preflight in `step` would
+    otherwise silently undo it.
+    """
+    stripped = tactic.strip()
+    head = parts[0].strip()
+    if not head.startswith("have") or not stripped.startswith(head):
+        return False
+    return stripped[len(head):].lstrip().startswith(":=")
+
+
+def _candidate_boundaries(tactic: str) -> list[int]:
+    """Offsets of every ';' that COULD be a step separator.
+
+    Bracket depth is lexical and unambiguous, so this is a superset of the
+    real cut points — deliberately including the ones _split_top_level_tactics
+    protects (branch bodies, focus blocks, `with |` alternatives). Which of
+    them is real is decided by Lean in `_discover_steps`, not by us: every
+    time we have decided that ourselves we have eventually been wrong.
+
+    Only '<;>' is excluded, because splitting there corrupts the token itself
+    into two invalid fragments rather than producing a wrong-but-valid split.
+    """
+    out: list[int] = []
+    depth = 0
+    n = len(tactic)
+    for i, c in enumerate(tactic):
+        if c in _OPEN_BRACKETS:
+            depth += 1
+        elif c in _CLOSE_BRACKETS:
+            depth = max(depth - 1, 0)
+        elif depth == 0 and c == ";":
+            if i > 0 and i + 1 < n and tactic[i - 1] == "<" and tactic[i + 1] == ">":
+                continue
+            out.append(i)
+    return out
+
+
+def _peel_bare_have(tactic: str) -> Optional[tuple[str, str]]:
+    """Split "have NAME : STMT := by REST" into ("have NAME : STMT", REST).
+
+    The one decomposition that is deliberate rather than a parsing workaround:
+    the whole string parses fine, so Lean would happily run it as one atomic
+    unit — and that is exactly the problem. Measured on tournament_champion,
+    347 inlined sub-lemmas were proposed and every sampled failure was a small
+    mechanical slip *inside* the `by` block, discarding a correct decomposition
+    each time. Opening the bare `have` instead keeps the sub-goal attackable
+    step by step. Returns None when the tactic is not that shape.
+    """
+    parts = _split_top_level_tactics(tactic)
+    if len(parts) < 2 or not _is_have_decomposition(tactic, parts):
+        return None
+    head = parts[0].strip()
+    rest = tactic.strip()[len(head):].lstrip()
+    if not rest.startswith(":="):
+        return None
+    rest = rest[2:].lstrip()
+    if _BY_KEYWORD_RE.match(rest, 0):
+        rest = rest[2:].lstrip()
+    return (head, rest) if rest else None
 
 
 def _split_top_level_tactics(tactic: str) -> list[str]:
@@ -97,6 +200,32 @@ def _split_top_level_tactics(tactic: str) -> list[str]:
     separated by ';' or by a newline. Splitting on our end and sending each
     step as its own sequential call lets a chained candidate actually run
     instead of being silently lost to a parse error.
+
+    Three kinds of ';' are NOT separators and must be left alone, because in
+    each the semicolon sequences tactics *inside* a construct that Lean
+    parses as one atomic tactic:
+
+      * inside an alternative body of a structured tactic —
+        "induction xs with | nil => intro a; simp | cons hd tl ih => ...".
+        Splitting ships a truncated alternative list, and Lean answers
+        "unsolved goals" for the branches that never arrived. The model sees
+        only that the step failed, so it rewrites a branch that never ran:
+        imo2026_q3_spec_share_bounds sent "induction xs with | nil => intro a"
+        thirteen times running (raw log seq 339-351) across 14 turns and
+        eleven different branch bodies, none of which reached Lean; imo2026_q6
+        lost its last four turns the same way. 51 of 576 tactics in one
+        evaluation were truncated like this.
+      * inside a focus block — "· simp; omega". The dot requires its body to
+        close the focused goal, so "· simp" alone fails whenever `simp` does
+        not finish the job.
+      * inside ⟨⟩ — anonymous-constructor brackets count toward depth, so a
+        "by" in "refine ⟨x, by linarith, ?_⟩; rest" no longer aborts the scan
+        and leaves the top-level ';' in the string for Lean to reject.
+
+    Confirmed against a real Lean REPL: the tactic endpoint accepts
+    "induction n with | zero => rfl | succ k ih => rw [Nat.succ_add]; rw [ih]"
+    and "· rw [Nat.add_comm]; rfl" as single tactics, while "intro h; exact h"
+    is still rejected outright — so plain chains must still be split.
 
     Semicolons that are part of Lean's '<;>' combinator ("run this tactic
     on every goal produced by the previous one") are also left untouched —
@@ -135,14 +264,50 @@ def _split_top_level_tactics(tactic: str) -> list[str]:
     start = 0
     i = 0
     n = len(tactic)
+    # Set once a top-level '·' has been seen: everything after it belongs to
+    # that focus block until the next top-level '·'.
+    in_focus_block = False
     while i < n:
         c = tactic[i]
-        if c in "([{":
+        if c in _OPEN_BRACKETS:
             depth += 1
-        elif c in ")]}":
+        elif c in _CLOSE_BRACKETS:
             depth = max(depth - 1, 0)
         elif depth == 0:
-            if c == ";" and i > 0 and i + 1 < n and tactic[i - 1] == "<" and tactic[i + 1] == ">":
+            if c == _FOCUS_DOT:
+                # A new focus block starts here. Close whatever came before
+                # it, then stop treating ';' as a separator until the next
+                # dot: "· simp; omega" must reach Lean whole, or the dot
+                # demands `simp` alone close the goal and the step fails.
+                # A ';' immediately before the next dot separated the two
+                # blocks rather than sequencing anything, so it is dropped:
+                # "· sorry; · sorry" must not yield a dangling "· sorry;".
+                segment = tactic[start:i].strip().rstrip(";").strip()
+                if segment:
+                    parts.append(segment)
+                    start = i
+                in_focus_block = True
+            elif in_focus_block:
+                # Inside a focus block: only another top-level dot ends it.
+                pass
+            elif tactic.startswith("=>", i) and not _LAMBDA_KEYWORD_RE.search(
+                tactic, start, i
+            ):
+                # This "=>" opens a body — a structured-tactic alternative
+                # ("induction x with | nil => intro a; simp | cons …"), a
+                # "case pos => …", a "next => …" or a "conv => …". Every ';'
+                # from here on sequences that body, so the whole remainder
+                # must reach Lean as one tactic. Splitting here shipped a
+                # truncated construct that Lean rejected with "unsolved
+                # goals", and the model — told only that the step failed —
+                # spent up to 14 consecutive turns rewriting a branch that
+                # had never run.
+                #
+                # A lambda's "=>" opens no such body ("exact fun x => x;
+                # simp" really is two steps), so a "fun"/"λ" earlier in the
+                # current segment suppresses the stop.
+                break
+            elif c == ";" and i > 0 and i + 1 < n and tactic[i - 1] == "<" and tactic[i + 1] == ">":
                 # Part of Lean's '<;>' combinator ("apply to every resulting
                 # goal"), not a step separator — splitting here corrupts it
                 # into two dangling fragments (e.g. "cases h1 <" / "> ...").
@@ -560,8 +725,11 @@ class LeanWorker:
         repl_ps_id = sorry["proofState"]
         goal_str = sorry.get("goal", "")
 
-        # Parse the goal string into our ProofState structure
-        initial_state = _parse_goal_string(goal_str)
+        # Lean's own words, carried verbatim — no reconstruction.
+        initial_state = (
+            ProofState(goals=(Goal(text=goal_str.strip()),))
+            if goal_str.strip() else ProofState(goals=())
+        )
 
         # Cache this proof state
         self._proof_state_cache[initial_state.stable_hash()] = repl_ps_id
@@ -602,6 +770,77 @@ class LeanWorker:
             return None
         finally:
             self._rebuilding = False
+
+    async def _probe_longest_prefix(
+        self, remaining: str, ps_id: int
+    ) -> tuple[str, str, dict]:
+        """Find where the next tactic ends by asking Lean, longest first.
+
+        Returns (executed_text, rest, response). Every rejected candidate is a
+        parse error: ~1ms, and it neither runs anything nor changes any proof
+        state, so exactly one candidate executes.
+
+        Longest-first is required, not an optimisation. A truncated construct
+        can be perfectly valid syntax —
+        "induction n with | zero => simp | succ k ih => rw [x]" parses fine and
+        fails later with "unsolved goals" — so a shortest-first scan would
+        accept it and reintroduce the truncation bug this replaced.
+        """
+        candidates = [remaining]
+        candidates += [remaining[:c] for c in reversed(_candidate_boundaries(remaining))]
+        first_parse_error: Optional[dict] = None
+        for cand in candidates:
+            text = cand.strip()
+            if not text:
+                continue
+            response = await self._send({"tactic": text, "proofState": ps_id})
+            if _is_parse_error(response):
+                if first_parse_error is None:
+                    first_parse_error = response
+                continue
+            rest = remaining[len(cand):].lstrip()
+            if rest.startswith(";"):
+                rest = rest[1:].lstrip()
+            return text, rest, response
+        # Nothing parsed. Report the error for the whole string — that is what
+        # the model actually wrote, so it is the error worth showing.
+        return (
+            remaining.strip(),
+            "",
+            first_parse_error or {"message": "Lean error:\nempty tactic"},
+        )
+
+    async def _discover_steps(
+        self, tactic: str, ps_id: int
+    ) -> list[tuple[str, dict]]:
+        """Run a candidate as a sequence of steps, Lean deciding the splits.
+
+        Returns [(text, response), ...] in execution order; the final entry may
+        be a failure. Stops early on failure or once the proof closes.
+        """
+        steps: list[tuple[str, dict]] = []
+        remaining = tactic.strip()
+        current = ps_id
+        while remaining:
+            peeled = _peel_bare_have(remaining)
+            if peeled:
+                # Deliberate decomposition, not a parsing question — the whole
+                # string parses, so Lean must not be asked here.
+                text, remaining = peeled
+                response = await self._send({"tactic": text, "proofState": current})
+            else:
+                text, remaining, response = await self._probe_longest_prefix(
+                    remaining, current
+                )
+            steps.append((text, response))
+            if ("proofState" not in response
+                    or "message" in response
+                    or _has_error_messages(response)):
+                break
+            current = response["proofState"]
+            if response.get("proofStatus", "") == "Completed":
+                break
+        return steps
 
     async def step(
         self,
@@ -663,8 +902,38 @@ class LeanWorker:
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
 
-        sub_tactics = _split_top_level_tactics(tactic)
-        if not sub_tactics:
+        # ---- Let Lean decide where each step ends. ----
+        #
+        # _split_top_level_tactics models a fragment of the Lean grammar by
+        # hand, and has been wrong five separate times: '<;>', nested 'by',
+        # ⟨⟩ depth, 'with |' alternative bodies, '·' focus blocks, and
+        # 'case'/'next'/'conv' bodies. Each miss silently mutilated a correct
+        # tactic — imo2026_q3_spec_share_bounds sent
+        # "induction xs with | nil => intro a" and nothing else, thirteen
+        # times running, while the model rewrote a branch that had never been
+        # sent. Constructs it still gets wrong exist today ("first | t; t | t",
+        # "repeat t; t", "iterate n t; t" all parse whole).
+        #
+        # So the grammar model is no longer load-bearing. Candidate cut points
+        # come from bracket depth alone (unambiguous), and Lean is asked which
+        # of them is real: the longest prefix it parses IS the next tactic.
+        # An unknown construct now costs a millisecond instead of a mangling.
+        try:
+            steps = await self._discover_steps(tactic, repl_ps_id)
+        except LeanREPLError as e:
+            # The worker was killed or drained; re-running would pay twice.
+            return StepResult(
+                next_state=ProofState(
+                    goals=state.goals,
+                    error=str(e),
+                    depth=state.depth,
+                    tactic_trace=state.tactic_trace,
+                ),
+                tactic=tactic,
+                elapsed_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        if not steps:
             error_state = ProofState(
                 goals=state.goals,
                 error="Lean error:\nempty tactic",
@@ -677,33 +946,12 @@ class LeanWorker:
                 elapsed_ms=(time.perf_counter() - start) * 1000,
             )
 
+        sub_tactics = [text for text, _ in steps]
         current_ps_id = repl_ps_id
         response: dict = {}
         intermediate_states: list[ProofState] = []
 
-        for step_idx, sub_tactic in enumerate(sub_tactics):
-            # Send this step of the chain to the REPL, against whatever
-            # proofState the previous step (or the original state, for the
-            # first step) left us at.
-            try:
-                response = await self._send({
-                    "tactic": sub_tactic,
-                    "proofState": current_ps_id,
-                })
-            except LeanREPLError as e:
-                error_state = ProofState(
-                    goals=state.goals,
-                    error=str(e),
-                    depth=state.depth,
-                    tactic_trace=state.tactic_trace,
-                )
-                return StepResult(
-                    next_state=error_state,
-                    tactic=tactic,
-                    elapsed_ms=(time.perf_counter() - start) * 1000,
-                    intermediate_states=tuple(intermediate_states),
-                )
-
+        for step_idx, (sub_tactic, response) in enumerate(steps):
             # Parse response. Note that response is a JSON object which contains keys like proofState, goals, proofStatus, etc...
             if "message" in response:
                 # Tactic failed (REPL top-level error string)
@@ -968,60 +1216,13 @@ class SubprocessExecutor:
 # ---------------------------------------------------------------------------
 
 def _parse_goals(goals_raw: list[str]) -> tuple[Goal, ...]:
-    """Parse the REPL's raw `goals` list into a tuple of Goal objects."""
-    return tuple(
-        _parse_goal_string(g).goals[0]
-        for g in goals_raw
-        if _parse_goal_string(g).goals
-    )
+    """Wrap the REPL's raw `goals` strings as Goals, verbatim.
 
-
-def _parse_goal_string(goal_str: str) -> ProofState:
+    Deliberately no parsing: see Goal's docstring. Lean's rendering is the
+    authority on what the proof position is, and every attempt to rebuild it
+    from parts lost information — 890 of 3704 recorded goals were corrupted
+    before this was removed.
     """
-    Parse a Lean goal string into a ProofState.
+    return tuple(Goal(text=g.strip()) for g in goals_raw if g and g.strip())
 
-    Input format (from REPL):
-        "n : Nat\\nh : n > 0\\n⊢ n + 0 = n"
 
-    Output:
-        Usually a goal looks like:
-
-        n : Nat
-        h : n > 0
-        ⊢ n + 0 = n
-
-        targets start with symbol turnstile "⊢",
-        and hypotheses must contain ":"
-
-        Returns a ProofState with one Goal containing the hypotheses(tuple of Hypothesis) and target(str).
-    """
-    if not goal_str.strip():
-        return ProofState(goals=())
-
-    lines = goal_str.strip().split("\n")
-
-    hypotheses = []
-    target = None
-
-    for line in lines:
-        line = line.strip()
-        if line.startswith("⊢"):
-            target = line[1:].strip()
-        elif " : " in line and not line.startswith("⊢"):
-            # only split at the first occurence, hence 1 as second argument
-            parts = line.split(" : ", 1)
-            if len(parts) == 2:
-                hypotheses.append(Hypothesis(
-                    name=parts[0].strip(), #for ex., name=
-                    type_=parts[1].strip(),
-                ))
-
-    if target is None:
-        # No turnstile found — treat whole string as target
-        target = goal_str.strip()
-
-    goal = Goal(
-        hypotheses=tuple(hypotheses),
-        target=target,
-    )
-    return ProofState(goals=(goal,))

@@ -82,7 +82,7 @@ class TestMockExecutor:
         assert result.success
         assert not result.proof_closed
         assert result.next_state.num_goals == 1
-        assert "n + 0 = n" in result.next_state.goals[0].target
+        assert "n + 0 = n" in result.next_state.goals[0].text
 
     def test_unknown_tactic_fails(self):
         executor = MockExecutor()

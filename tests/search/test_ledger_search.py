@@ -553,9 +553,9 @@ class TestLedgerSearchIntermediateStates:
         asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=1))
 
         ledger = captured_ledgers[0]
-        goal_targets = {s.goals[0].target for s in ledger.frontier.values() if s.goals}
-        assert "intermediate goal" in goal_targets
-        assert "final goal" in goal_targets
+        goal_texts = {s.goals[0].text for s in ledger.frontier.values() if s.goals}
+        assert any("intermediate goal" in t for t in goal_texts)
+        assert any("final goal" in t for t in goal_texts)
 
     def test_intermediate_states_from_a_failed_candidate_still_get_added(self):
         """A chain that fails partway must still expose the checkpoints
@@ -603,8 +603,8 @@ class TestLedgerSearchIntermediateStates:
         asyncio.run(search.prove("theorem foo : n + 0 = n := by", budget=1))
 
         ledger = captured_ledgers[0]
-        goal_targets = {s.goals[0].target for s in ledger.frontier.values() if s.goals}
-        assert "survived checkpoint" in goal_targets
+        goal_texts = {s.goals[0].text for s in ledger.frontier.values() if s.goals}
+        assert any("survived checkpoint" in t for t in goal_texts)
 
 
 # ---------------------------------------------------------------------------

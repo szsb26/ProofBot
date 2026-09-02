@@ -22,9 +22,13 @@ from unittest.mock import AsyncMock
 from lean.repl import (
     LeanWorker,
     SubprocessExecutor,
-    _parse_goal_string,
     _split_top_level_tactics,
     _annotate_chain_error,
+    _parse_goals,
+    _candidate_boundaries,
+    _peel_bare_have,
+    _is_parse_error,
+    _is_have_decomposition,
     LEAN_PROJECT_DIR,
 )
 from core.executor import StepResult
@@ -35,46 +39,264 @@ from policy.deepseek import DeepSeekPolicy
 from search.ledger_search import LedgerSearch, prove_parallel
 
 
+# Lean rejects a plain ';' chain outright, so step() preflights the whole
+# string against the REPL and gets a parse error back before falling through
+# to the split. Mocks for chained tactics must include that first response or
+# they do not describe the real protocol.
+_PARSE_REJECT = {"message": "Lean error:\n<input>:1:7: expected end of input"}
+
+
+def _lean_like_send(responses):
+    """A `_send` stub that rejects chains the way Lean's parser does.
+
+    step() now discovers step boundaries by offering Lean progressively
+    shorter prefixes, so a stub that just replays a fixed list will hand a
+    success back for "tac1; tac2" and the test silently checks nothing. Real
+    Lean answers "expected end of input" for any string with a top-level ';',
+    so the stub does too, and the canned responses are consumed only by
+    strings Lean would actually accept.
+
+    This is the same lesson as tests/lean/test_recorded_goals.py: a mock that
+    encodes what we believe rather than what Lean does is how a 24% goal
+    corruption rate survived 387 green tests.
+    """
+    remaining = iter(responses)
+
+    async def _send(payload):
+        tactic = payload.get("tactic", "")
+        if _candidate_boundaries(tactic):
+            return _PARSE_REJECT
+        return next(remaining)
+
+    return _send
+
+
 # ---------------------------------------------------------------------------
-# Parser tests (fast, no Lean needed)
+# Goals reach the model exactly as Lean wrote them (fast, no Lean needed)
 # ---------------------------------------------------------------------------
 
-class TestParseGoalString:
+class TestGoalsAreCarriedVerbatim:
+    """
+    There used to be a `_parse_goal_string` here that rebuilt Lean's goal
+    text into hypothesis/target fields, and the prompt and the state hash
+    were both built from the rebuilt version. Lean wraps long lines, and the
+    parser only understood one-line entries, so:
 
-    def test_simple_goal(self):
-        # _parse_goal_string() returns a ProofState with a single Goal.
-        # No hypotheses because the string has no " : " lines.
-        result = _parse_goal_string("⊢ n + 0 = n")
-        assert result.num_goals == 1
-        assert result.goals[0].target == "n + 0 = n"
-        assert len(result.goals[0].hypotheses) == 0
+      * a hypothesis whose type wrapped lost its name line (no " : ") and its
+        continuation lines — it vanished entirely
+      * a target that wrapped was cut off after its first line
+      * a continuation line containing a colon became an invented hypothesis
 
-    def test_goal_with_hypotheses(self):
-        # Lines before ⊢ are parsed as hypotheses in "name : type" format.
-        result = _parse_goal_string("n : Nat\nh : n > 0\n⊢ n + 0 = n")
-        assert result.num_goals == 1
-        assert result.goals[0].target == "n + 0 = n"
-        assert len(result.goals[0].hypotheses) == 2
-        assert result.goals[0].hypotheses[0].name == "n"
-        assert result.goals[0].hypotheses[0].type_ == "Nat"
-        assert result.goals[0].hypotheses[1].name == "h"
-        assert result.goals[0].hypotheses[1].type_ == "n > 0"
+    Measured over 3704 recorded goals: 890 corrupted (24%) — 653 deletions,
+    468 truncations, 305 fabrications. 1061 deleted hypotheses were mostly
+    the model's own `have` sub-lemmas (218 named `key`), since a decomposition
+    is exactly the kind of long statement that wraps. The model noticed and
+    misdiagnosed it 53 times across 20 traces.
 
-    def test_empty_goal(self):
-        # Empty string means the REPL returned no goals → proof is closed.
-        result = _parse_goal_string("")
-        assert result.is_closed
+    The parser is gone. These tests pin the invariant that replaced it.
+    """
 
-    def test_universal_goal(self):
-        # ∀ in the target must not be mistaken for a hypothesis even though
-        # the string contains " : ".
-        result = _parse_goal_string("⊢ ∀ (n : Nat), n + 0 = n")
-        assert result.goals[0].target == "∀ (n : Nat), n + 0 = n"
+    def test_goals_reach_the_state_unchanged(self):
+        raw = ["n : Nat\nh : n > 0\n⊢ n + 0 = n", "⊢ True"]
+        goals = _parse_goals(raw)
+        assert [g.text for g in goals] == raw
+        assert [g.serialize() for g in goals] == raw
+
+    def test_wrapped_hypothesis_survives(self):
+        """The `key` case, verbatim from traces/eval_20260825_223800 seq 135 —
+        a lemma the model had just created, deleted from its own context."""
+        raw = ("x y z : ℝ\n"
+               "key :\n"
+               "  ∀ (a b c : ℝ),\n"
+               "    0 < a → a * b * c ≥ 1 → (a ^ 5 - a ^ 2) ≥ (a ^ 2 - b * c)\n"
+               "⊢ (x ^ 5 - x ^ 2) / (x ^ 5 + y ^ 2) ≥\n"
+               "    0")
+        shown = _parse_goals([raw])[0].serialize()
+        assert shown == raw
+        assert "key :" in shown              # the lemma is still there
+        assert "0 < a → a * b * c ≥ 1" in shown   # …with its statement
+        assert shown.rstrip().endswith("0")  # the target is not cut off
+
+    def test_wrapped_target_is_not_truncated(self):
+        raw = "hn : 0 < n\n⊢ AdmissibleMark n A ∧\n    ∀ (B : Finset ℝ), 2 ≤ L A B"
+        shown = _parse_goals([raw])[0].serialize()
+        assert shown == raw
+        assert "∀ (B : Finset ℝ)" in shown
+
+    def test_continuation_line_is_not_promoted_to_a_hypothesis(self):
+        """`∀ (B : Finset ℝ),` contains " : ", so the old parser rendered it
+        as a hypothesis ABOVE the goal it had been cut from."""
+        raw = "hn : 0 < n\n⊢ ∃ B,\n    ∀ (B : Finset ℝ), P B"
+        assert _parse_goals([raw])[0].serialize() == raw
+
+    def test_empty_and_blank_goals_are_dropped(self):
+        assert _parse_goals([]) == ()
+        assert _parse_goals(["", "   "]) == ()
+
+
+class TestStateIdentityUsesLeansText:
+    """stable_hash decides whether two branches are the same proof position.
+    Built from the parsed fields it merged states that differed only in a
+    deleted hypothesis: 17 buckets of genuinely different goals collided."""
+
+    def test_goals_differing_only_in_a_wrapped_hypothesis_are_distinct(self):
+        a = ProofState(goals=_parse_goals(["key :\n  ∀ a, a = a\n⊢ P"]))
+        b = ProofState(goals=_parse_goals(["key :\n  ∀ a, a = 1\n⊢ P"]))
+        assert a.stable_hash() != b.stable_hash()
+
+    def test_case_label_keeps_states_distinct(self):
+        """Two goals identical apart from Lean's case tag are NOT merged.
+        Tempting to merge — 18 such pairs exist in the recorded corpus — but
+        the model targets goals by that tag ("case pos => exact …"), so a
+        merge can route such a tactic to the wrong state. Over-splitting is
+        safe; under-splitting is the bug this module exists to prevent."""
+        a = ProofState(goals=_parse_goals(["case succ\nn : ℕ\n⊢ P"]))
+        b = ProofState(goals=_parse_goals(["case zero\nn : ℕ\n⊢ P"]))
+        c = ProofState(goals=_parse_goals(["n : ℕ\n⊢ P"]))
+        assert a.stable_hash() != b.stable_hash()
+        assert a.stable_hash() != c.stable_hash()
+
+    def test_inaccessible_renumbering_does_not_split_a_state(self):
+        a = ProofState(goals=_parse_goals(["h✝¹ : P\n⊢ Q"]))
+        b = ProofState(goals=_parse_goals(["h✝ : P\n⊢ Q"]))
+        assert a.stable_hash() == b.stable_hash()
 
 
 # ---------------------------------------------------------------------------
 # _split_top_level_tactics / _annotate_chain_error (fast, pure functions)
 # ---------------------------------------------------------------------------
+
+class TestCandidateBoundaries:
+    """Where a tactic COULD be cut. Deliberately a superset of the real cut
+    points — bracket depth is lexical and unambiguous, while deciding which
+    cuts are real is the guesswork that was wrong five times. Lean adjudicates
+    in _discover_steps."""
+
+    def test_top_level_semicolons_are_offered(self):
+        assert _candidate_boundaries("intro n; simp; omega") == [7, 13]
+
+    def test_semicolons_inside_brackets_are_not_offered(self):
+        assert _candidate_boundaries("simp [a, b]; omega") == [11]
+        assert _candidate_boundaries("refine ⟨a, by tac; more⟩") == []
+
+    def test_the_combinator_is_never_a_boundary(self):
+        """Splitting '<;>' corrupts the token itself into two invalid
+        fragments, unlike other bad splits which merely mean the wrong thing."""
+        assert _candidate_boundaries("cases h <;> simp") == []
+
+    def test_branch_bodies_ARE_offered_and_lean_rejects_them(self):
+        """The key difference from the old splitter: cuts inside an induction
+        branch are offered as candidates rather than suppressed by a rule.
+        Lean then refuses the truncated prefix, so the construct stays whole —
+        without us needing to know that `with |` opens a branch body."""
+        tactic = "induction xs with | nil => intro a; simp | cons h t => simp"
+        assert _candidate_boundaries(tactic) != []
+
+    def test_no_semicolons_means_no_boundaries(self):
+        assert _candidate_boundaries("simp") == []
+
+
+class TestPeelBareHave:
+    """"have NAME : STMT := by REST" is decomposed deliberately, not to work
+    around parsing — the whole string parses fine. Lean must not be consulted
+    here or it would run the sub-proof atomically, which is the behaviour this
+    replaced: 347 inlined sub-lemmas on tournament_champion, every sampled
+    failure a mechanical slip inside the `by` block discarding a correct
+    decomposition."""
+
+    def test_have_with_inline_proof_is_peeled(self):
+        assert _peel_bare_have("have h : P := by intro y; simp") == (
+            "have h : P", "intro y; simp")
+
+    def test_have_without_a_stated_type_is_not_peeled(self):
+        assert _peel_bare_have("have h := by simp") is None
+
+    def test_a_plain_chain_is_not_peeled(self):
+        assert _peel_bare_have("intro n; simp") is None
+
+
+class TestDiscoverStepsAsksLeanWhereToCut:
+    """The orchestration: offer progressively shorter prefixes, and the first
+    one Lean parses is the next tactic.
+
+    The stub below declares which strings are atomic, standing in for Lean's
+    grammar. That is the point — the production code no longer contains that
+    knowledge anywhere.
+    """
+
+    def _worker_where_atomic(self, atomic, results=None):
+        """A worker whose Lean accepts exactly `atomic` strings."""
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])
+        worker._proof_state_cache[state.stable_hash()] = 0
+        counter = {"n": 0}
+        results = results or {}
+
+        async def _send(payload):
+            t = payload.get("tactic", "")
+            if t not in atomic:
+                return _PARSE_REJECT
+            if t in results:
+                return results[t]
+            counter["n"] += 1
+            return {"proofStatus": "", "proofState": counter["n"],
+                    "goals": [f"⊢ after {t}"]}
+
+        worker._send = _send
+        return worker, state
+
+    async def test_an_embedded_unknown_construct_is_kept_whole(self):
+        """The gap the preflight alone could not close: a construct our rules
+        mangle, sitting inside a genuine chain. The whole string does not
+        parse, so a preflight cannot save it — but shortening from the right
+        finds `skip`, and then the remainder parses whole."""
+        worker, state = self._worker_where_atomic(
+            {"skip", "first | rfl; rfl | simp"})
+        sent = []
+        inner = worker._send
+
+        async def spy(payload):
+            sent.append(payload.get("tactic"))
+            return await inner(payload)
+
+        worker._send = spy
+        await worker.step(state, "skip; first | rfl; rfl | simp")
+        executed = [t for t in sent if t in {"skip", "first | rfl; rfl | simp"}]
+        assert executed == ["skip", "first | rfl; rfl | simp"]
+        assert "first | rfl" not in sent or sent.count("first | rfl") == 0
+
+    async def test_a_genuine_chain_is_still_split(self):
+        worker, state = self._worker_where_atomic({"intro n", "simp", "omega"})
+        sent = []
+        inner = worker._send
+
+        async def spy(payload):
+            sent.append(payload.get("tactic"))
+            return await inner(payload)
+
+        worker._send = spy
+        await worker.step(state, "intro n; simp; omega")
+        assert [t for t in sent if t in {"intro n", "simp", "omega"}] == [
+            "intro n", "simp", "omega"]
+
+    async def test_longest_prefix_wins_over_a_shorter_one_that_also_parses(self):
+        """A truncated construct can be valid syntax that fails later, so a
+        shortest-first scan would accept it and reintroduce the truncation."""
+        whole = "induction n with | zero => simp; ring | succ k => simp"
+        truncated = "induction n with | zero => simp"
+        worker, state = self._worker_where_atomic({whole, truncated})
+        sent = []
+        inner = worker._send
+
+        async def spy(payload):
+            sent.append(payload.get("tactic"))
+            return await inner(payload)
+
+        worker._send = spy
+        await worker.step(state, whole)
+        assert sent[0] == whole
+        assert truncated not in sent
+
 
 class TestSplitTopLevelTactics:
     """
@@ -158,6 +380,164 @@ class TestSplitProtectsSemicolonCombinator:
     def test_semicolon_combinator_inside_brackets_still_not_split_either_way(self):
         tactic = "simp [foo <;> bar]; omega"
         assert _split_top_level_tactics(tactic) == ["simp [foo <;> bar]", "omega"]
+
+
+class TestSplitProtectsStructuredAlternatives:
+    """
+    A ';' inside the body of an `induction/cases ... with | alt => ...`
+    alternative sequences that branch — it is not a step separator. Splitting
+    there ships a truncated alternative list, which Lean rejects with
+    "unsolved goals" because the remaining branches were never sent.
+
+    Measured cost of getting this wrong: 51 truncated tactics across 576 in
+    one 14-problem evaluation. imo2026_q3_spec_share_bounds sent
+    "induction xs with | nil => intro a" — and nothing else — thirteen times
+    in a row (raw REPL log seq 339-351). The model is told only that the step
+    failed, so it spent 14 consecutive turns rewriting a `nil` branch that had
+    never run, trying eleven different bodies, none of which reached Lean.
+    imo2026_q6 lost its final four turns the same way.
+
+    Confirmed against a real Lean REPL: the endpoint accepts
+    "induction n with | zero => rfl | succ k ih => rw [Nat.succ_add]; rw [ih]"
+    as a single tactic, while a plain "intro h; exact h" is still rejected
+    with "expected end of input" — so chains must still be split, just not
+    inside a branch.
+    """
+
+    def test_semicolon_inside_an_induction_branch_is_not_split(self):
+        tactic = ("induction xs with | nil => intro a; simp "
+                  "| cons hd tl ih => intro a; simp [ih]")
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_leading_chain_still_splits_but_the_induction_stays_whole(self):
+        tactic = ("intro k; induction k with | zero => simp "
+                  "| succ n ih => rw [Nat.succ_mul]; omega")
+        assert _split_top_level_tactics(tactic) == [
+            "intro k",
+            "induction k with | zero => simp | succ n ih => rw [Nat.succ_mul]; omega",
+        ]
+
+    def test_cases_alternatives_are_protected_too(self):
+        tactic = "cases xs with | nil => intro a; rfl | cons hd tl => intro a; simp"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_nested_alternatives_stay_in_one_piece(self):
+        tactic = ("induction l with | nil => simp "
+                  "| cons a t ih => cases t with | nil => simp | cons b t' => simp; ring")
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_rcases_with_pattern_still_splits(self):
+        """`rcases h with a | b` has a '|' but opens no branch bodies (no
+        '=>'), so a following ';' is still a real step separator."""
+        assert _split_top_level_tactics("rcases h with a | b; simp") == [
+            "rcases h with a | b", "simp",
+        ]
+
+    def test_case_tag_body_is_protected(self):
+        """`case`/`next`/`conv` open a body with no '|' and no 'with', so a
+        rule keyed on those keywords misses them. The rule is keyed on the
+        '=>' itself instead."""
+        tactic = "case pos => exact h; simp"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_next_body_is_protected(self):
+        tactic = "next => intro x; simp"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_conv_block_is_protected(self):
+        tactic = "conv => rw [foo]; rfl"
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_lambda_arrow_does_not_stop_splitting(self):
+        """A '=>' from a lambda opens no body — "exact fun x => x; simp"
+        really is two steps, so a "fun"/"λ" in the current segment suppresses
+        the stop."""
+        assert _split_top_level_tactics("exact fun x => x; simp") == [
+            "exact fun x => x", "simp",
+        ]
+
+    def test_lambda_after_an_earlier_top_level_bar_still_splits(self):
+        """Regression: keying the stop on "a '|' was seen earlier" made the
+        flag sticky, so an unrelated lambda later in the string wrongly
+        stopped the split and shipped a top-level ';' to Lean."""
+        assert _split_top_level_tactics(
+            "rcases h with a | b; exact fun x => x; simp"
+        ) == ["rcases h with a | b", "exact fun x => x", "simp"]
+
+    def test_lambda_inside_a_branch_body_does_not_reopen_splitting(self):
+        tactic = ("induction xs with | nil => exact fun x => x; simp "
+                  "| cons h t => simp")
+        assert _split_top_level_tactics(tactic) == [tactic]
+
+    def test_lambda_in_a_have_term_proof_still_splits(self):
+        assert _split_top_level_tactics("have h : P := fun n => f n; simp") == [
+            "have h : P := fun n => f n", "simp",
+        ]
+
+
+class TestSplitProtectsFocusBlocks:
+    """
+    Lean's focus dot runs its body on one goal and requires that goal to be
+    closed. So "· simp; omega" is one tactic: splitting it into "· simp" plus
+    "omega" demands that `simp` alone close the goal, and the step fails with
+    "unsolved goals" when it does not.
+
+    Confirmed against a real Lean REPL: "· rw [Nat.add_comm]; rfl" parses and
+    runs, reporting an error raised from *inside* the bullet body.
+    """
+
+    def test_semicolon_inside_a_focus_block_is_not_split(self):
+        assert _split_top_level_tactics("· unfold padicValNat; simp [hp]") == [
+            "· unfold padicValNat; simp [hp]",
+        ]
+
+    def test_consecutive_focus_blocks_are_separated(self):
+        assert _split_top_level_tactics("constructor; · simp; ring; · omega") == [
+            "constructor", "· simp; ring", "· omega",
+        ]
+
+    def test_separator_semicolon_before_a_dot_is_dropped(self):
+        """The ';' between two blocks separates them rather than sequencing
+        anything, so it must not survive as a dangling "· sorry;"."""
+        assert _split_top_level_tactics("by_cases h : P; · sorry; · sorry") == [
+            "by_cases h : P", "· sorry", "· sorry",
+        ]
+
+    def test_focus_placeholder_inside_brackets_is_not_a_focus_block(self):
+        """`(· ≤ ·)` is Lean's anonymous-function placeholder, not a focus
+        dot — it sits inside brackets and must not start a new part."""
+        assert _split_top_level_tactics("have h := (A ∪ B).sort (· ≤ ·); simp") == [
+            "have h := (A ∪ B).sort (· ≤ ·)", "simp",
+        ]
+
+
+class TestSplitTracksAnonymousConstructorBrackets:
+    """
+    ⟨⟩ must count toward bracket depth. Without it, a "by" inside an
+    anonymous constructor reads as a top-level `by`, aborts the scan, and the
+    whole string ships to Lean with its top-level ';' intact — which the
+    tactic endpoint rejects with "expected end of input". Seen live at raw
+    REPL log seq 561, 686 and 687.
+    """
+
+    def test_by_inside_anonymous_constructor_does_not_abort_the_split(self):
+        tactic = ("refine ⟨a + b - 180/n, by linarith, ?_, by ring⟩; "
+                  "have hnpos : (0:ℝ) < 180/(n:ℝ)")
+        assert _split_top_level_tactics(tactic) == [
+            "refine ⟨a + b - 180/n, by linarith, ?_, by ring⟩",
+            "have hnpos : (0:ℝ) < 180/(n:ℝ)",
+        ]
+
+    def test_semicolon_inside_anonymous_constructor_is_not_a_separator(self):
+        assert _split_top_level_tactics("exact ⟨by simp; omega, h⟩") == [
+            "exact ⟨by simp; omega, h⟩",
+        ]
+
+    def test_have_with_anonymous_constructor_proof_then_a_real_chain(self):
+        tactic = "have hmn : m ≠ 0 ∧ n ≠ 0 := ⟨by omega, by omega⟩; rw [foo]"
+        assert _split_top_level_tactics(tactic) == [
+            "have hmn : m ≠ 0 ∧ n ≠ 0 := ⟨by omega, by omega⟩", "rw [foo]",
+        ]
 
 
 class TestSplitHaveWithInlineProof:
@@ -326,7 +706,7 @@ class TestLeanWorkerStepClosureDetection:
         result = await worker.step(state, "intro n")
         assert result.success
         assert not result.proof_closed
-        assert result.next_state.goals[0].target == "n = n"
+        assert result.next_state.goals[0].text == "n : Nat\n⊢ n = n"
 
 
 # ---------------------------------------------------------------------------
@@ -357,14 +737,15 @@ class TestLeanWorkerStepChaining:
 
     async def test_two_step_chain_sends_each_step_against_prior_proofstate(self):
         worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(side_effect=[
+        worker._send = AsyncMock(side_effect=_lean_like_send([
             {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n"]},
             {"proofStatus": "Completed", "proofState": 2, "goals": []},
-        ])
+        ]))
         result = await worker.step(state, "intro n; rfl")
 
-        assert worker._send.await_count == 2
-        first_call, second_call = worker._send.await_args_list
+        assert worker._send.await_count == 3
+        preflight, first_call, second_call = worker._send.await_args_list
+        assert preflight.args[0] == {"tactic": "intro n; rfl", "proofState": 0}
         assert first_call.args[0] == {"tactic": "intro n", "proofState": 0}
         assert second_call.args[0] == {"tactic": "rfl", "proofState": 1}
         assert result.success
@@ -372,13 +753,13 @@ class TestLeanWorkerStepChaining:
 
     async def test_chain_stops_and_reports_the_step_that_failed(self):
         worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(side_effect=[
+        worker._send = AsyncMock(side_effect=_lean_like_send([
             {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n"]},
             {"message": "Lean error:\nunknown identifier `bogus`"},
-        ])
+        ]))
         result = await worker.step(state, "intro n; exact bogus")
 
-        assert worker._send.await_count == 2
+        assert worker._send.await_count == 3
         assert not result.success
         assert "step 2 of 2" in result.next_state.error
         assert '"exact bogus"' in result.next_state.error
@@ -387,13 +768,16 @@ class TestLeanWorkerStepChaining:
     async def test_chain_does_not_execute_steps_after_a_step_that_failed(self):
         """A 3-step chain that fails on step 2 must never send step 3."""
         worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(side_effect=[
+        worker._send = AsyncMock(side_effect=_lean_like_send([
             {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n"]},
             {"message": "Lean error:\nboom"},
             {"proofStatus": "Completed", "proofState": 99, "goals": []},
-        ])
+        ]))
         await worker.step(state, "intro n; bad_tactic; rfl")
-        assert worker._send.await_count == 2
+        # Count the *executed* steps, not the probes: boundary discovery
+        # sends extra candidates that Lean rejects without running anything.
+        sent = [c.args[0]["tactic"] for c in worker._send.await_args_list]
+        assert "rfl" not in sent, f"step 3 ran after step 2 failed: {sent}"
 
     async def test_chain_stops_early_once_goal_closes(self):
         """If step 1 of a 3-step chain already closes the goal, steps 2
@@ -423,6 +807,141 @@ class TestLeanWorkerStepChaining:
 # LeanWorker.step() intermediate-state checkpointing (fast, mocks _send)
 # ---------------------------------------------------------------------------
 
+class TestPreflightWholeTactic:
+    """
+    `_split_top_level_tactics` models a fragment of the Lean grammar by hand,
+    and has been wrong five times ('<;>', nested 'by', ⟨⟩ depth, 'with |'
+    alternative bodies, '·' focus blocks, 'case'/'next'/'conv' bodies). Each
+    miss silently mutilated a correct tactic: imo2026_q3_spec_share_bounds
+    spent 14 consecutive turns debugging an induction branch that had never
+    been sent, and imo2026_q6 lost its final four turns the same way.
+    Constructs the splitter still gets wrong are known to exist — verified
+    against a real REPL, "first | t; t | t", "repeat t; t" and "iterate n t; t"
+    all parse whole and are still split.
+
+    So step() treats the split as a hint. When it claims a chain, Lean is
+    asked first: a parse error is ~1ms and mutates no proof state, while a
+    successful parse means the model wrote one atomic tactic that must not be
+    taken apart.
+    """
+
+    def _make_worker_with_cached_state(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])
+        worker._proof_state_cache[state.stable_hash()] = 0
+        return worker, state
+
+    async def test_a_construct_lean_parses_whole_is_never_taken_apart(self):
+        """The regression this whole mechanism exists for: even if the
+        splitter wrongly claims two steps, Lean parsing the string means it
+        is sent intact."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "Completed", "proofState": 1, "goals": [],
+        })
+        tactic = "first | rfl; rfl | rfl"
+        assert len(_split_top_level_tactics(tactic)) > 1  # splitter is wrong here
+        result = await worker.step(state, tactic)
+
+        assert worker._send.await_count == 1
+        assert worker._send.await_args_list[0].args[0] == {
+            "tactic": tactic, "proofState": 0,
+        }
+        assert result.proof_closed
+
+    async def test_preflight_result_is_reused_not_re_executed(self):
+        """A tactic that parses must run exactly once — re-sending it after
+        the probe would pay for an expensive tactic twice."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 7, "goals": ["⊢ B"]},
+        ])
+        await worker.step(state, "induction n with | zero => simp; ring | succ k ih => simp")
+        assert worker._send.await_count == 1
+
+    async def test_a_genuine_chain_falls_back_to_the_split(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ A"]},
+            {"proofStatus": "Completed", "proofState": 2, "goals": []},
+        ]))
+        result = await worker.step(state, "intro n; rfl")
+
+        sent = [c.args[0]["tactic"] for c in worker._send.await_args_list]
+        assert sent == ["intro n; rfl", "intro n", "rfl"]
+        assert result.proof_closed
+
+    async def test_single_tactic_is_never_preflighted(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "proofStatus": "", "proofState": 1, "goals": ["⊢ True"],
+        })
+        await worker.step(state, "simp")
+        assert worker._send.await_count == 1
+
+    async def test_have_decomposition_is_never_preflighted(self):
+        """"have NAME : STMT := by REST" parses whole, so preflighting it
+        would silently undo the deliberate bare-sub-goal split — the one
+        split that exists for checkpointing rather than for parsing."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=[
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ P", "⊢ Q"]},
+            {"proofStatus": "", "proofState": 2, "goals": ["⊢ Q"]},
+        ])
+        await worker.step(state, "have h : P := by simp")
+
+        sent = [c.args[0]["tactic"] for c in worker._send.await_args_list]
+        assert sent == ["have h : P", "simp"]
+
+    async def test_elaboration_failure_is_not_mistaken_for_a_parse_error(self):
+        """"unknown identifier" means Lean parsed and ran it — the string is
+        one tactic and must not be split afterwards."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(return_value={
+            "message": "Lean error:\nunknown identifier `bogus`",
+        })
+        await worker.step(state, "induction n with | zero => exact bogus; rfl | succ k ih => simp")
+        assert worker._send.await_count == 1
+
+
+class TestIsParseError:
+
+    def test_position_prefixed_syntax_error_is_a_parse_error(self):
+        assert _is_parse_error(
+            {"message": "Lean error:\n<input>:1:7: expected end of input"})
+
+    def test_elaboration_error_is_not_a_parse_error(self):
+        assert not _is_parse_error({"message": "Lean error:\nunsolved goals"})
+
+    def test_error_in_messages_list_is_inspected_too(self):
+        assert not _is_parse_error(
+            {"messages": [{"data": "Unknown constant `foo`"}]})
+
+    def test_successful_response_is_not_a_parse_error(self):
+        assert not _is_parse_error({"proofState": 1, "goals": []})
+
+
+class TestIsHaveDecomposition:
+
+    def test_have_with_inline_proof_is_a_decomposition(self):
+        t = "have h : P := by intro y; simp"
+        assert _is_have_decomposition(t, _split_top_level_tactics(t))
+
+    def test_have_without_inline_proof_is_not(self):
+        t = "have hp; simp"
+        assert not _is_have_decomposition(t, _split_top_level_tactics(t))
+
+    def test_plain_chain_is_not(self):
+        t = "intro k; simp"
+        assert not _is_have_decomposition(t, _split_top_level_tactics(t))
+
+    def test_have_later_in_a_chain_is_not_the_leading_construct(self):
+        """The split there begins with the chain, not the have, so the whole
+        string is a genuine chain and Lean will reject it anyway."""
+        t = "intro k; have h : P := by simp"
+        assert not _is_have_decomposition(t, _split_top_level_tactics(t))
+
+
 class TestLeanWorkerStepIntermediateStates:
     """
     Each genuinely-verified sub-step of a chained candidate must be exposed
@@ -447,11 +966,11 @@ class TestLeanWorkerStepIntermediateStates:
 
     async def test_successful_chain_exposes_all_but_the_last_step(self):
         worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(side_effect=[
+        worker._send = AsyncMock(side_effect=_lean_like_send([
             {"proofStatus": "", "proofState": 1, "goals": ["n : Nat\n⊢ n = n → True"]},
             {"proofStatus": "", "proofState": 2, "goals": ["n : Nat\nh : n = n\n⊢ True"]},
             {"proofStatus": "Completed", "proofState": 3, "goals": []},
-        ])
+        ]))
         result = await worker.step(state, "intro n; intro h; trivial")
 
         assert len(result.intermediate_states) == 2
@@ -462,10 +981,10 @@ class TestLeanWorkerStepIntermediateStates:
 
     async def test_intermediate_states_have_increasing_depth(self):
         worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(side_effect=[
+        worker._send = AsyncMock(side_effect=_lean_like_send([
             {"proofStatus": "", "proofState": 1, "goals": ["⊢ A"]},
             {"proofStatus": "", "proofState": 2, "goals": ["⊢ B"]},
-        ])
+        ]))
         result = await worker.step(state, "tac1; tac2")
         assert result.intermediate_states[0].depth == state.depth + 1
 
@@ -473,11 +992,11 @@ class TestLeanWorkerStepIntermediateStates:
         """A 3-step chain failing on step 3 must still expose the
         checkpoints from steps 1 and 2, which genuinely compiled."""
         worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(side_effect=[
+        worker._send = AsyncMock(side_effect=_lean_like_send([
             {"proofStatus": "", "proofState": 1, "goals": ["⊢ A"]},
             {"proofStatus": "", "proofState": 2, "goals": ["⊢ B"]},
             {"message": "Lean error:\nboom"},
-        ])
+        ]))
         result = await worker.step(state, "tac1; tac2; bad_tac3")
 
         assert not result.success
@@ -497,10 +1016,10 @@ class TestLeanWorkerStepIntermediateStates:
         stable_hash() to already be in the proof-state cache, since step()
         looks the REPL id up from the state alone."""
         worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(side_effect=[
+        worker._send = AsyncMock(side_effect=_lean_like_send([
             {"proofStatus": "", "proofState": 1, "goals": ["⊢ A"]},
             {"proofStatus": "", "proofState": 2, "goals": ["⊢ B"]},
-        ])
+        ]))
         result = await worker.step(state, "tac1; tac2")
         checkpoint = result.intermediate_states[0]
 
@@ -554,7 +1073,7 @@ class TestSubprocessExecutor:
         assert result.success
         assert not result.proof_closed
         assert result.next_state.num_goals == 1
-        assert "n + 0 = n" in result.next_state.goals[0].target
+        assert "n + 0 = n" in result.next_state.goals[0].text
 
     async def test_step_simp_closes(self, executor):
         # "intro n" then "simp" is a complete proof.

@@ -10,42 +10,76 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
-
-
-@dataclass(frozen=True)
-class Hypothesis:
-    """
-    A single hypothesis in the local context of a goal. We can think of this as already established facts that we can use to prove the goal.
-    Frozen classes are immutable, so once a Hypothesis is created, its name and type cannot be changed. This makes it easier to reason about 
-    the proof state and ensures that the hash of a ProofState is stable.
-    
-    Example: given `h : n > 0`, name="h", type_="n > 0"
-    """
-    name: str
-    type_: str
-
-    def serialize(self) -> str:
-        return f"{self.name} : {self.type_}"
+import re
 
 
 @dataclass(frozen=True)
 class Goal:
     """
-    A single open goal: a list of hypotheses and a target to prove. The target is a proposition we want to prove, 
-    and the hypotheses are the assumptions we can use to prove it. The |- symbol separates the hypotheses from the target in Lean.
+    A single open goal, held EXACTLY as Lean printed it.
 
-    Example:
-    hypotheses = [Hypothesis("n", "ℕ"), Hypothesis("h", "n > 0")]
-    target = "n + 0 = n"
+    A goal is a self-contained sub-theorem: the hypotheses you may assume,
+    then `⊢` and the target to prove. Example:
+
+        n : ℕ
+        h : n > 0
+        ⊢ n + 0 = n
+
+    `text` is Lean's own bytes, verbatim. It is deliberately NOT split into
+    hypothesis/target fields.
+
+    Why: it used to be. `_parse_goal_string` read the text line by line,
+    treating anything containing " : " as a hypothesis, and Lean wraps long
+    lines. A hypothesis whose type wrapped lost its name line (no " : ") AND
+    its continuation lines, so it vanished; a target that wrapped was cut off
+    after its first line; and a continuation line that happened to contain a
+    colon was rendered as an invented hypothesis. Measured across 3704
+    recorded goals: 890 corrupted (24%) — 653 deleted hypotheses, 468
+    truncated targets, 305 fabricated ones. Of 1061 deleted hypotheses the
+    large majority were the model's own `have` sub-lemmas (218 named `key`),
+    because a decomposition is exactly the kind of long statement that wraps.
+
+    Both consumers of the old fields wanted the text back anyway: serialize()
+    glued them into a string for the prompt, and stable_hash() hashed them.
+    So the decomposition was pure loss, and the model was shown goals with
+    its own lemmas missing and targets cut off mid-expression. It said so, 53
+    times across 20 traces ("the goal displays only '⊢ ∀ (n : ℕ),' which is
+    truncated/abnormal"), and blamed its own tactics, having no way to see
+    that a rendering layer existed.
     """
-    hypotheses: tuple[Hypothesis, ...]
-    target: str
+    text: str
 
     def serialize(self) -> str:
-        hyp_str = "\n".join(h.serialize() for h in self.hypotheses)
-        if hyp_str:
-            return f"{hyp_str}\n⊢ {self.target}"
-        return f"⊢ {self.target}"
+        return self.text
+
+
+# NOTE: Lean's case label ("case succ") is deliberately NOT stripped, though
+# it looks like a mere tag. Two goals identical apart from it were observed 18
+# times, and merging them is tempting — but the model addresses goals BY that
+# label ("case pos => exact MulanWins.win hin"), so merging lets such a tactic
+# land on the wrong one. Under-splitting states is precisely the failure this
+# module was rewritten to remove; over-splitting costs 18 extra frontier
+# entries out of 1177 and is never wrong.
+# Inaccessible names print as `h✝`, and `h✝¹`, `h✝²` … when shadowed. The
+# numbering is positional, so a renumbering must not read as a new state.
+_INACCESSIBLE_RE = re.compile("✝[⁰¹²³⁴⁵⁶⁷⁸⁹]*")
+# Metavariable ids (`?m.470`) are allocation counters, not mathematics.
+_METAVAR_RE = re.compile(r"\?[mu]\.\d+")
+
+
+def _normalise_for_hash(text: str) -> str:
+    """Drop the parts of a goal's rendering that can differ without the proof
+    position differing.
+
+    Deliberately minimal. Verified against 1177 distinct recorded goals: this
+    normalisation merges nothing that was otherwise distinct, so it costs no
+    deduplication today and only guards against a renumbering tomorrow. Every
+    other difference in Lean's text is treated as a different state — after a
+    parser merged 17 buckets of genuinely different goals, the bias here is
+    firmly toward splitting rather than merging."""
+    t = _INACCESSIBLE_RE.sub("✝", text)
+    t = _METAVAR_RE.sub("?", t)
+    return "\n".join(line.rstrip() for line in t.strip().split("\n"))
 
 
 @dataclass(frozen=True)
@@ -116,13 +150,7 @@ class ProofState:
         the REPL result of applying a tactic depends only on the goal state.
         """
         content = json.dumps(
-            [
-                [
-                    [(h.name, h.type_) for h in goal.hypotheses],
-                    goal.target,
-                ]
-                for goal in self.goals
-            ],
+            [_normalise_for_hash(goal.text) for goal in self.goals],
             sort_keys=True,
         )
         return hashlib.sha256(content.encode()).hexdigest()[:16]
@@ -139,8 +167,9 @@ def make_goal(target: str, hypotheses: list[tuple[str, str]] | None = None) -> G
     Usage:
         make_goal("n + 0 = n", [("n", "ℕ"), ("h", "n > 0")])
     """
-    hyps = tuple(Hypothesis(name, type_) for name, type_ in (hypotheses or []))
-    return Goal(hypotheses=hyps, target=target)
+    lines = [f"{name} : {type_}" for name, type_ in (hypotheses or [])]
+    lines.append(f"⊢ {target}")
+    return Goal(text="\n".join(lines))
 
 
 def make_proof_state(

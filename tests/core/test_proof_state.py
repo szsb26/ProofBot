@@ -6,34 +6,11 @@ Run with:  python3 -m pytest core/test_proof_state.py -v
 
 import pytest
 from core.proof_state import (
-    Hypothesis,
     Goal,
     ProofState,
     make_goal,
     make_proof_state,
 )
-
-
-# ---------------------------------------------------------------------------
-# Hypothesis
-# ---------------------------------------------------------------------------
-
-class TestHypothesis:
-    def test_serialize(self):
-        h = Hypothesis(name="h", type_="n > 0")
-        assert h.serialize() == "h : n > 0"
-
-    def test_immutable(self):
-        h = Hypothesis(name="h", type_="n > 0")
-        with pytest.raises(Exception):
-            h.name = "x"
-
-    def test_equality(self):
-        h1 = Hypothesis("h", "n > 0")
-        h2 = Hypothesis("h", "n > 0")
-        h3 = Hypothesis("h", "n > 1")
-        assert h1 == h2
-        assert h1 != h3
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +32,23 @@ class TestGoal:
     def test_immutable(self):
         goal = make_goal("n + 0 = n")
         with pytest.raises(Exception):
-            goal.target = "True"
+            goal.text = "True"
+
+    def test_goal_carries_leans_text_verbatim(self):
+        """The point of the type: a wrapped hypothesis and a wrapped target
+        must survive intact. Rebuilding them from parsed parts is what
+        deleted 653 hypotheses and truncated 468 targets across 3704
+        recorded goals."""
+        lean_said = (
+            "x y z : ℝ\n"
+            "key :\n"
+            "  ∀ (a b c : ℝ),\n"
+            "    0 < a → a * b * c ≥ 1 → (a ^ 5 - a ^ 2) ≥ (a ^ 2 - b * c)\n"
+            "⊢ (x ^ 5 - x ^ 2) / (x ^ 5 + y ^ 2) +\n"
+            "      (y ^ 5 - y ^ 2) / (y ^ 5 + z ^ 2) ≥\n"
+            "    0"
+        )
+        assert Goal(text=lean_said).serialize() == lean_said
 
     def test_equality(self):
         g1 = make_goal("n + 0 = n", [("n", "ℕ")])

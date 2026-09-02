@@ -16,8 +16,40 @@ from __future__ import annotations
 import asyncio
 import time
 
-from core.proof_state import ProofState, Goal, Hypothesis, make_goal
+from core.proof_state import ProofState, Goal, make_goal
 from core.executor import StepResult
+
+
+# The mock reads goals it wrote itself, in a shape it defined, so these two
+# lookups are safe in a way that parsing Lean's output never was: there is no
+# external source of truth to drift from. Goal carries text only (see its
+# docstring — reconstructing Lean's rendering from parts corrupted 24% of real
+# goals), so these replace the old .target / .hypotheses fields.
+
+def _target_of(goal: Goal) -> str:
+    """The part after the turnstile."""
+    _, sep, tail = goal.text.partition("\u22a2")
+    return tail.strip() if sep else goal.text.strip()
+
+
+def _hypothesis_lines(goal: Goal) -> list[str]:
+    """The context lines, i.e. everything above the turnstile."""
+    out = []
+    for line in goal.text.split("\n"):
+        if line.strip().startswith("\u22a2"):
+            break
+        if line.strip():
+            out.append(line)
+    return out
+
+
+def _hypothesis_names(goal: Goal) -> list[str]:
+    names = []
+    for line in _hypothesis_lines(goal):
+        head, sep, _ = line.partition(" : ")
+        if sep:
+            names.extend(head.split())
+    return names
 
 
 class MockExecutor:
@@ -81,7 +113,7 @@ class MockExecutor:
         tactic = tactic.strip()
         current_goal = state.goals[0]
         remaining_goals = state.goals[1:]
-        target = current_goal.target.strip()
+        target = _target_of(current_goal)
 
         # sorry always closes
         if tactic == "sorry":
@@ -124,9 +156,10 @@ class MockExecutor:
             name = parts[1] if len(parts) > 1 else "x"
             if target.startswith("∀"):
                 inner = target.split(",", 1)[-1].strip()
-                new_hyp = Hypothesis(name=name, type_="ℕ")
-                new_hyps = current_goal.hypotheses + (new_hyp,)
-                new_goal = Goal(hypotheses=new_hyps, target=inner)
+                new_goal = Goal(text="\n".join(
+                    _hypothesis_lines(current_goal)
+                    + [f"{name} : ℕ", f"⊢ {inner}"]
+                ))
                 new_goals = (new_goal,) + remaining_goals
                 return ProofState(
                     goals=new_goals,
@@ -137,7 +170,7 @@ class MockExecutor:
 
         # exact / assumption
         if tactic.startswith("exact") or tactic == "assumption":
-            hyp_names = [h.name for h in current_goal.hypotheses]
+            hyp_names = _hypothesis_names(current_goal)
             term = tactic.split()[-1] if len(tactic.split()) > 1 else ""
             if term in hyp_names or tactic == "assumption":
                 return self._advance(state, remaining_goals, tactic)
