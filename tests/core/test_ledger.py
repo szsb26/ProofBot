@@ -123,21 +123,46 @@ class TestLedgerFailuresFor:
 
 class TestLedgerReasoning:
 
-    def test_set_reasoning_stores_text(self):
+    def test_set_reasoning_stores_text_with_its_turn(self):
         ledger = Ledger()
-        ledger.set_reasoning("abc123", "Trying to establish the base case via simp.")
-        assert ledger.reasoning["abc123"] == "Trying to establish the base case via simp."
+        ledger.set_reasoning("abc123", "Trying to establish the base case via simp.", 4)
+        assert ledger.reasoning["abc123"] == [
+            (4, "Trying to establish the base case via simp.")
+        ]
 
     def test_set_reasoning_blank_text_is_a_noop(self):
         ledger = Ledger()
-        ledger.set_reasoning("abc123", "")
+        ledger.set_reasoning("abc123", "", 1)
         assert "abc123" not in ledger.reasoning
 
-    def test_set_reasoning_overwrites_previous_plan(self):
+    def test_set_reasoning_appends_rather_than_overwriting(self):
+        """The overwrite it replaced cost a real run.
+
+        On imo2026_q5 turn 28 established that a substitution yields a
+        tautology, turn 29 chose the same state and destroyed that note, and
+        turn 37 walked back into the refuted path. An earlier plan must
+        survive a later one.
+        """
         ledger = Ledger()
-        ledger.set_reasoning("abc123", "First plan.")
-        ledger.set_reasoning("abc123", "Revised plan after failures.")
-        assert ledger.reasoning["abc123"] == "Revised plan after failures."
+        ledger.set_reasoning("abc123", "First plan.", 28)
+        ledger.set_reasoning("abc123", "Revised plan after failures.", 29)
+        assert ledger.reasoning["abc123"] == [
+            (28, "First plan."),
+            (29, "Revised plan after failures."),
+        ]
+
+    def test_set_reasoning_drops_an_exact_repeat(self):
+        ledger = Ledger()
+        ledger.set_reasoning("abc123", "Same plan.", 3)
+        ledger.set_reasoning("abc123", "Same plan.", 4)
+        assert ledger.reasoning["abc123"] == [(3, "Same plan.")]
+
+    def test_latest_reasoning_returns_the_most_recent(self):
+        ledger = Ledger()
+        assert ledger.latest_reasoning("nope") == ""
+        ledger.set_reasoning("abc123", "First.", 1)
+        ledger.set_reasoning("abc123", "Second.", 2)
+        assert ledger.latest_reasoning("abc123") == "Second."
 
     def test_reasoning_defaults_to_empty_dict(self):
         ledger = Ledger()

@@ -275,7 +275,7 @@ class LedgerSearch:
                 # Nothing to expand this turn — try again next call.
                 continue
 
-            ledger.set_reasoning(resp.chosen_state_id, resp.reasoning)
+            ledger.set_reasoning(resp.chosen_state_id, resp.reasoning, calls)
 
             if _contains_banned_tactic(resp.tactic):
                 # Nothing legitimate to run, but the turn must still leave a
@@ -317,7 +317,7 @@ class LedgerSearch:
             # accepted state.
             for checkpoint in result.intermediate_states:
                 checkpoint_id = ledger.add_state(checkpoint)
-                ledger.set_reasoning(checkpoint_id, resp.reasoning)
+                ledger.set_reasoning(checkpoint_id, resp.reasoning, calls)
 
             if result.proof_closed:
                 return ProofResult(
@@ -330,7 +330,7 @@ class LedgerSearch:
 
             if result.success:
                 new_id = ledger.add_state(result.next_state)
-                ledger.set_reasoning(new_id, resp.reasoning)
+                ledger.set_reasoning(new_id, resp.reasoning, calls)
                 # Record the success, not just failures. A state is never
                 # evicted from the frontier after being expanded (so the
                 # director can backtrack to it), and stable_hash is

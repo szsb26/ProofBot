@@ -375,9 +375,32 @@ class TestSerializeLedger:
     def test_shows_persisted_reasoning_for_open_state(self):
         ledger = Ledger()
         state_id = ledger.add_state(make_proof_state(["n = n"]))
-        ledger.set_reasoning(state_id, "Plan to close via induction on n.")
+        ledger.set_reasoning(state_id, "Plan to close via induction on n.", 1)
         text = serialize_ledger("theorem foo := by", ledger, [])
         assert "Plan to close via induction on n." in text
+
+    def test_shows_every_plan_for_a_state_with_its_turn_number(self):
+        """An earlier conclusion must still be visible after a later plan.
+
+        This is the imo2026_q5 failure: turn 28 refuted a substitution, turn
+        29 wrote a new plan for the same state, and by turn 37 the refutation
+        was gone from the prompt entirely — so the model proposed the refuted
+        substitution again. Turn numbers matter too: the director call carries
+        no conversation history, so they are the only way to tell a
+        nine-turn-old finding from a fresh thought.
+        """
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.set_reasoning(state_id, "Substituting y = f x gives a tautology.", 28)
+        ledger.set_reasoning(state_id, "Try squaring both sides instead.", 29)
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "Substituting y = f x gives a tautology." in text, (
+            "the earlier refutation must survive the later plan"
+        )
+        assert "Try squaring both sides instead." in text
+        assert "Turn 28:" in text and "Turn 29:" in text
+        # oldest first, so a refutation reads before the plan that followed it
+        assert text.index("Turn 28:") < text.index("Turn 29:")
 
     def test_no_plan_line_when_no_reasoning_recorded(self):
         ledger = Ledger()
@@ -746,8 +769,10 @@ class TestGetNextAction:
 
             # The caller (LedgerSearch) is responsible for persisting this into
             # the ledger — get_next_action itself only returns it.
-            ledger.set_reasoning(resp.chosen_state_id, resp.reasoning)
-            assert ledger.reasoning[resp.chosen_state_id] == "Close the reflexive goal directly."
+            ledger.set_reasoning(resp.chosen_state_id, resp.reasoning, 1)
+            assert ledger.reasoning[resp.chosen_state_id] == [
+                (1, "Close the reflexive goal directly.")
+            ]
         finally:
             patcher.stop()
 

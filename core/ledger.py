@@ -66,16 +66,32 @@ class Ledger:
                    asked for it back — which happens constantly — got a
                    silently wasted turn (measured: 24 of 50 turns in one
                    imo2005_q3 trial, 20 of 50 in an imo1968_tetrahedron one).
-        reasoning: The director's most recent stated natural-language plan
-                   for each state, keyed by state id. Otherwise a director
-                   call's reasoning is discarded the moment the turn ends —
-                   this is the only memory of "why" that persists across
-                   turns for a given branch.
+        reasoning: Every stated natural-language plan for each state, keyed
+                   by state id, oldest first, each tagged with the turn that
+                   wrote it. The director call is stateless — one user
+                   message, no conversation history — so this is the ONLY
+                   channel by which one turn tells a later turn anything it
+                   cannot read off the goal text.
+
+                   It used to hold one plan per state and overwrite. Measured
+                   on imo2026_q5: turn 28 worked out that substituting
+                   y = f x into hqm yields the tautology 2(f x - x)^2 >= 0,
+                   turn 29 chose the same state and overwrote that finding,
+                   and turn 37 — with the note gone — proposed the refuted
+                   substitution again calling it "NOT just the trivial
+                   identity", spending the rest of the budget. 50 turns over
+                   31 distinct states means at least 19 plans were destroyed
+                   that way.
+
+                   Kept oldest-first and NEVER capped by recency: a
+                   "keep the last N" rule reproduces exactly the bug above,
+                   dropping turn 28 and keeping turn 29. Negative results
+                   accumulate early and stay true.
     """
     frontier: dict[str, ProofState] = field(default_factory=dict)
     entries: list[LedgerEntry] = field(default_factory=list)
     abandoned: set[str] = field(default_factory=set)
-    reasoning: dict[str, str] = field(default_factory=dict)
+    reasoning: dict[str, list[tuple[int, str]]] = field(default_factory=dict)
     retired: dict[str, ProofState] = field(default_factory=dict)
     abandon_reasons: dict[str, str] = field(default_factory=dict)
 
@@ -162,7 +178,23 @@ class Ledger:
             if e.parent_id == state_id and e.outcome != "success"
         ]
 
-    def set_reasoning(self, state_id: str, text: str) -> None:
-        """Record the director's stated plan for a state. No-op on blank text."""
-        if text:
-            self.reasoning[state_id] = text
+    def set_reasoning(self, state_id: str, text: str, turn: int) -> None:
+        """
+        Append the director's stated plan for a state. No-op on blank text.
+
+        Appends rather than overwrites — see the `reasoning` field docs for
+        the measured failure that motivated it. An exact repeat of the most
+        recent plan is dropped, so a director that re-states the same
+        intention verbatim does not pad the prompt.
+        """
+        if not text:
+            return
+        history = self.reasoning.setdefault(state_id, [])
+        if history and history[-1][1] == text:
+            return
+        history.append((turn, text))
+
+    def latest_reasoning(self, state_id: str) -> str:
+        """The most recent stated plan for a state, or "" if there is none."""
+        history = self.reasoning.get(state_id)
+        return history[-1][1] if history else ""

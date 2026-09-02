@@ -556,10 +556,9 @@ class TestLedgerSearchDirectorBehavior:
         assert result.success
         second_ledger = calls[1]
         state_id = next(iter(second_ledger.frontier))
-        assert (
-            second_ledger.reasoning[state_id]
-            == "Trying nope first because it seemed promising."
-        )
+        assert second_ledger.reasoning[state_id] == [
+            (1, "Trying nope first because it seemed promising.")
+        ]
 
     def test_explicit_abandon_removes_state_but_search_continues_via_new_states(self):
         """Abandoning one state should not end the search if other open

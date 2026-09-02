@@ -238,9 +238,21 @@ def serialize_ledger(
     for state_id, state in shown_open:
         path = ", ".join(state.tactic_trace) if state.tactic_trace else "(root)"
         parts.append(f"\n[state {state_id}] (path: {path})\n{state.serialize()}\n")
-        plan = ledger.reasoning.get(state_id)
-        if plan:
-            parts.append(f"Last stated plan for this state: {plan}\n")
+        # Every plan ever stated for this state, oldest first, with the turn
+        # that wrote it. The turn numbers are the ONLY temporal information
+        # anywhere in this prompt — the director call carries no conversation
+        # history, so without them a refutation from thirty turns ago is
+        # indistinguishable from the thought it had a moment before.
+        history = ledger.reasoning.get(state_id) or []
+        if history:
+            lines = "\n".join(f"  - Turn {n}: {text}" for n, text in history)
+            label = (
+                "Stated plan for this state:"
+                if len(history) == 1
+                else "Stated plans for this state, oldest first "
+                     "(earlier conclusions still hold unless refuted):"
+            )
+            parts.append(f"{label}\n{lines}\n")
         applied = done_by_parent.get(state_id)
         if applied:
             seen_applied: list[tuple[str, str]] = []
