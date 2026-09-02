@@ -1,8 +1,8 @@
-# Theorem Prover
+# ProofBot
 
 An LLM-guided proof search system for Lean 4.
 
-Naive LLM theorem provers ask the model to prove a theorem in one shot. Because the LLM never runs Lean to verify its output, hallucinations and invalid derivations slip through. This repo takes a different approach: the LLM proposes a tactic, and it is immediately verified by a real Lean 4 process. A `Ledger` records every open proof state and every tactic attempted against it — no scores, no priority queue. Each turn, one LLM call reads the full ledger and decides both which state to continue from (or abandon) and which single tactic to try there, until a complete proof is found or the budget is exhausted.
+Naive LLM theorem provers ask the model to prove a theorem in one shot. Because the LLM never runs Lean to verify its output, hallucinations and invalid derivations slip through. ProofBot takes a different approach: the LLM proposes a tactic, and it is immediately verified by a real Lean 4 process. A `Ledger` records every open proof state and every tactic attempted against it — no scores, no priority queue. Each turn, one LLM call reads the full ledger and decides both which state to continue from (or abandon) and which single tactic to try there, until a complete proof is found or the budget is exhausted.
 
 An earlier design ranked states with a hand-coded heuristic (goal count + depth) driving a priority queue. An eval across the hard/stretch problem tiers showed the ledger-driven design matches or exceeds it (pass@1 76%→86%, pass@5 80%→100%) while removing an entire component, so it was retired.
 
@@ -235,15 +235,17 @@ The `imo` tier is 22 real competition problems lifted from Mathlib's `Archive/Im
 — no helper lemmas, no hints — it finds and verifies complete Lean proofs of
 competition problems from the International Mathematical Olympiad.
 
-Measured 2026-08-25, budget 50, temperature 1.0:
+Measured 2026-08-25, budget 50, temperature 1.0. Rows marked † were
+re-measured 2026-09-01, after a round of harness fixes (goal-text rendering,
+tactic-boundary splitting); the outcomes did not change.
 
 | Problem | DeepSeek v4 Pro | Claude Sonnet 5 |
 |---|---|---|
-| `imo1959_q1` — gcd / coprimality | ✓ 3/3, 14 nodes | ✓ 1/1, 11 nodes |
-| `imo1964_q1a` — modular arithmetic | ✓ 3/3, 41 nodes | ✓ 2/2, **6 nodes** |
+| `imo1959_q1` — gcd / coprimality | ✓ 3/3, 14 nodes | ✓ 2/2, 10 nodes † |
+| `imo1964_q1a` — modular arithmetic | ✓ 3/3, 41 nodes | ✓ 2/2, **8 nodes** † |
 | `imo1963_q5` — trigonometric identity | ~ 1/3, 47 nodes | ✓ 1/1, 23 nodes |
 | `imo2005_q3` — algebraic inequality | ✗ 0/3 | ✓ 2/2, 27 nodes |
-| `imo2011_q3` — functional equation | ✗ 0/3 | ✗ 0/1 |
+| `imo2011_q3` — functional equation | ✗ 0/3 | ✗ 0/1, budget exhausted † |
 
 Sonnet 5 solves 4 of the 5 and is consistently cheaper where both succeed.
 
