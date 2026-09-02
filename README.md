@@ -243,7 +243,7 @@ tactic-boundary splitting); the outcomes did not change.
 |---|---|---|
 | `imo1959_q1` — gcd / coprimality | ✓ 3/3, 14 nodes | ✓ 2/2, 10 nodes † |
 | `imo1964_q1a` — modular arithmetic | ✓ 3/3, 41 nodes | ✓ 2/2, **8 nodes** † |
-| `imo1963_q5` — trigonometric identity | ~ 1/3, 47 nodes | ✓ 1/1, 23 nodes |
+| `imo1963_q5` — trigonometric identity | ~ 1/3, 47 nodes | ✓ 2/2, 17 nodes † |
 | `imo2005_q3` — algebraic inequality | ✗ 0/3 | ✓ 2/2, 27 nodes |
 | `imo2011_q3` — functional equation | ✗ 0/3 | ✗ 0/1, budget exhausted † |
 
