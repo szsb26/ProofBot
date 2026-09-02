@@ -177,7 +177,9 @@ def _peel_bare_have(tactic: str) -> Optional[tuple[str, str]]:
     step by step. Returns None when the tactic is not that shape.
     """
     parts = _split_top_level_tactics(tactic)
-    if len(parts) < 2 or not _is_have_decomposition(tactic, parts):
+    # Not `len(parts) < 2`: "have h : T := by" with an empty body splits to a
+    # single part, and that is exactly the shape worth peeling.
+    if not parts or not _is_have_decomposition(tactic, parts):
         return None
     head = parts[0].strip()
     rest = tactic.strip()[len(head):].lstrip()
@@ -186,7 +188,12 @@ def _peel_bare_have(tactic: str) -> Optional[tuple[str, str]]:
     rest = rest[2:].lstrip()
     if _BY_KEYWORD_RE.match(rest, 0):
         rest = rest[2:].lstrip()
-    return (head, rest) if rest else None
+    # An empty REST ("have h : T := by" with nothing after it) still peels.
+    # Lean rejects that string outright — an empty `by` block is a syntax
+    # error — so sending it whole costs a turn for nothing, while the bare
+    # `have` is plainly what was intended and opens the sub-goal. 22 recorded
+    # tactics have this shape.
+    return head, rest
 
 
 def _split_top_level_tactics(tactic: str) -> list[str]:
@@ -333,6 +340,12 @@ def _annotate_chain_error(raw_error: str, sub_tactics: list[str], failed_idx: in
 
     A no-op (returns raw_error unchanged) when the candidate wasn't split
     into multiple steps, so single-tactic candidates are unaffected.
+
+    Deliberately reports "step N" and not "step N of M": since Lean decides
+    the step boundaries as execution proceeds (see _discover_steps), the
+    total is only known once the chain finishes, and a chain that fails
+    stops early. Reporting "step 2 of 2" for a three-piece candidate that
+    failed on its second step would tell the model its third piece ran.
     """
     if len(sub_tactics) <= 1:
         return raw_error
@@ -340,7 +353,7 @@ def _annotate_chain_error(raw_error: str, sub_tactics: list[str], failed_idx: in
     if body.startswith("Lean error:\n"):
         body = body[len("Lean error:\n"):]
     prefix = "; ".join(sub_tactics[:failed_idx])
-    header = f'Lean error (step {failed_idx + 1} of {len(sub_tactics)} in this chain — "{sub_tactics[failed_idx]}" — failed'
+    header = f'Lean error (step {failed_idx + 1} in this chain — "{sub_tactics[failed_idx]}" — failed'
     if prefix:
         header += f', after "{prefix}" succeeded'
     header += "):\n"
@@ -788,27 +801,30 @@ class LeanWorker:
         """
         candidates = [remaining]
         candidates += [remaining[:c] for c in reversed(_candidate_boundaries(remaining))]
-        first_parse_error: Optional[dict] = None
+        smallest_failure: Optional[tuple[str, dict]] = None
         for cand in candidates:
             text = cand.strip()
             if not text:
                 continue
             response = await self._send({"tactic": text, "proofState": ps_id})
             if _is_parse_error(response):
-                if first_parse_error is None:
-                    first_parse_error = response
+                # Keep the SHORTEST failing candidate, not the first. Lean
+                # reports an unrecognised tactic name as a parse error too
+                # ("<input>:1:1: unknown tactic"), so when nothing parses the
+                # smallest unit we tried is the one that isolates the problem.
+                # Reporting the longest instead told the model that
+                # "bogus_xyz; exact h" was one failing step, when the real
+                # fault was `bogus_xyz` alone.
+                smallest_failure = (text, response)
                 continue
             rest = remaining[len(cand):].lstrip()
             if rest.startswith(";"):
                 rest = rest[1:].lstrip()
             return text, rest, response
-        # Nothing parsed. Report the error for the whole string — that is what
-        # the model actually wrote, so it is the error worth showing.
-        return (
-            remaining.strip(),
-            "",
-            first_parse_error or {"message": "Lean error:\nempty tactic"},
-        )
+        if smallest_failure is not None:
+            text, response = smallest_failure
+            return text, "", response
+        return remaining.strip(), "", {"message": "Lean error:\nempty tactic"}
 
     async def _discover_steps(
         self, tactic: str, ps_id: int

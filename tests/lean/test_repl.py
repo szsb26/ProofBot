@@ -208,6 +208,13 @@ class TestPeelBareHave:
         assert _peel_bare_have("have h : P := by intro y; simp") == (
             "have h : P", "intro y; simp")
 
+    def test_have_ending_in_a_bare_by_still_peels(self):
+        """"have h : T := by" with nothing after it is a syntax error in Lean,
+        so sending it whole burns a turn. The bare `have` is plainly the
+        intent and opens the sub-goal. 22 recorded tactics have this shape."""
+        assert _peel_bare_have("have hmod : 2 ^ n % 7 = 1 := by") == (
+            "have hmod : 2 ^ n % 7 = 1", "")
+
     def test_have_without_a_stated_type_is_not_peeled(self):
         assert _peel_bare_have("have h := by simp") is None
 
@@ -619,9 +626,16 @@ class TestAnnotateChainError:
             ["by_contra h", "push_neg at h", "exact y"],
             2,
         )
-        assert "step 3 of 3" in result
+        assert "step 3 in this chain" in result
         assert '"exact y"' in result
         assert "unknown identifier `y`" in result
+
+    def test_no_step_total_is_claimed(self):
+        """Lean decides the boundaries as execution proceeds, so the total is
+        unknown when a chain fails early. Claiming "step 2 of 2" for a
+        three-piece candidate would say its third piece ran."""
+        result = _annotate_chain_error("boom", ["intro n", "bogus"], 1)
+        assert "of 2" not in result and "step 2 in this chain" in result
 
     def test_multi_step_error_mentions_preceding_successful_steps(self):
         result = _annotate_chain_error(
@@ -761,7 +775,7 @@ class TestLeanWorkerStepChaining:
 
         assert worker._send.await_count == 3
         assert not result.success
-        assert "step 2 of 2" in result.next_state.error
+        assert "step 2 in this chain" in result.next_state.error
         assert '"exact bogus"' in result.next_state.error
         assert "unknown identifier `bogus`" in result.next_state.error
 
