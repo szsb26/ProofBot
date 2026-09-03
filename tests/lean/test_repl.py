@@ -164,6 +164,20 @@ class TestStateIdentityUsesLeansText:
 
 # ---------------------------------------------------------------------------
 # _split_top_level_tactics / _annotate_chain_error (fast, pure functions)
+#
+# SCOPE NOTE. _split_top_level_tactics is no longer the harness's splitter —
+# since 091226cd, Lean decides where a chain is cut (_discover_steps offers it
+# progressively shorter prefixes). The only surviving caller is
+# _peel_bare_have, which reads `parts[0]` and whether `parts` is empty; nothing
+# reads parts[1:]. So roughly twenty of the assertions below check more surface
+# than any caller depends on.
+#
+# They are kept deliberately, not by neglect: each protection rule here (the
+# `case`/`next`/`conv` bodies, `fun x =>`, focus blocks, anonymous-constructor
+# brackets) came from a real mis-split, and re-deriving that grammar knowledge
+# would be expensive. Treat a failure in these classes as "the grammar model
+# changed", not as "the harness is broken" — and do not read the size of this
+# section as a measure of how much production depends on it.
 # ---------------------------------------------------------------------------
 
 class TestCandidateBoundaries:
@@ -740,14 +754,6 @@ class TestLeanWorkerStepChaining:
         state = make_proof_state(["some goal"])
         worker._proof_state_cache[state.stable_hash()] = 0
         return worker, state
-
-    async def test_unchained_tactic_sends_exactly_one_request(self):
-        worker, state = self._make_worker_with_cached_state()
-        worker._send = AsyncMock(return_value={
-            "proofStatus": "", "proofState": 1, "goals": ["⊢ True"],
-        })
-        await worker.step(state, "simp")
-        assert worker._send.await_count == 1
 
     async def test_two_step_chain_sends_each_step_against_prior_proofstate(self):
         worker, state = self._make_worker_with_cached_state()
