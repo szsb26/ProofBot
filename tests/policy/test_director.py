@@ -544,16 +544,60 @@ class TestDirectorSystemPromptGuidance:
     def test_prompt_warns_that_inline_by_proofs_are_all_or_nothing(self):
         assert "atomic unit" in DIRECTOR_SYSTEM_PROMPT
 
-    def test_prompt_does_not_deny_the_combinator_our_splitter_supports(self):
-        """lean/repl.py has a dedicated branch keeping `<;>` intact through
-        the chain splitter, commented "apply to every resulting goal". The
-        prompt used to flatly assert "Every tactic applies to the FIRST goal
-        only", i.e. tell the model a combinator we deliberately support does
-        not exist. Additive correction only — the first-goal default it
-        already described is still stated."""
+    def test_prompt_states_the_first_goal_default_without_denying_the_rest(self):
+        """The default must be stated — `tac1; tac2` really does hit one goal —
+        but not as a restriction.
+
+        The wording used to be "a tactic applies to the FIRST goal only, so the
+        goals are worked through in order". That is false as a claim about
+        tactics: all_goals, on_goal, case and rotate_left are themselves
+        tactics. The model obeyed it — 9 goal-selection tactics across 3025
+        sent — and imo2026_q5 spent ~24 turns on a false goal 1 while both
+        halves of the theorem sat untouched behind it.
+        """
         assert "<;>" in DIRECTOR_SYSTEM_PROMPT
-        assert "FIRST goal only" in DIRECTOR_SYSTEM_PROMPT   # default still stated
-        assert "Every tactic applies to the FIRST goal only" not in DIRECTOR_SYSTEM_PROMPT
+        assert "By default a tactic acts on the FIRST goal" in DIRECTOR_SYSTEM_PROMPT
+        assert "worked through in order" not in DIRECTOR_SYSTEM_PROMPT
+        assert "You are not restricted to it" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_names_the_goal_selection_tactics(self):
+        """Verified against a live REPL: these four act on a chosen goal
+        without permuting the list. pick_goal/rotate_*/swap also work but
+        reorder, and stable_hash is order-sensitive, so they spawn duplicate
+        ledger nodes — the prompt steers away from them rather than hiding
+        them."""
+        for tac in ("case <tag> => tac", "on_goal n => tac",
+                    "all_goals tac", "any_goals tac"):
+            assert tac in DIRECTOR_SYSTEM_PROMPT, tac
+        assert "reach for them last" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_says_every_goal_must_close(self):
+        """A state is a conjunction. Without this the model can read progress
+        as strictly sequential rather than "closing any goal is progress"."""
+        assert "ALL of them must eventually be proved" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_tells_the_model_it_is_stateless(self):
+        """The director call is one user message with no conversation history
+        (policy/anthropic.py), so `reasoning` is the only channel between
+        turns. The model was never told, and wrote narration rather than
+        durable notes."""
+        assert "no memory of previous turns" in DIRECTOR_SYSTEM_PROMPT
+        assert "note to someone who will read it later" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_warns_an_unproved_have_may_be_false(self):
+        """imo2026_q5 introduced `hconst`, false for the functions the theorem
+        characterises, and spent half the budget on it — suspecting at turn 45
+        and continuing anyway, with the pre-`have` state open the whole
+        time."""
+        assert "claim, not a fact" in DIRECTOR_SYSTEM_PROMPT
+        assert "a false claim can never be closed" in DIRECTOR_SYSTEM_PROMPT
+
+    def test_prompt_describes_semicolon_accurately(self):
+        """`tac1; tac2` runs tac2 on whatever is first AFTERWARDS, which may be
+        a different goal — measured: from ['n = n', 'n + 0 = n', 'n = n'],
+        `(rfl; rfl)` closes the first TWO goals."""
+        assert "FIRST afterwards" in DIRECTOR_SYSTEM_PROMPT
+        assert "not the same as all_goals" in DIRECTOR_SYSTEM_PROMPT
 
     def test_prompt_does_not_promise_an_uncapped_frontier(self):
         """serialize_ledger caps the displayed frontier at
