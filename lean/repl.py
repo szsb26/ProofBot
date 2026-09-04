@@ -73,17 +73,29 @@ LEAN_PROJECT_DIR = Path(__file__).parent.parent / "lean_project"
 # trial rather than keep spending budget.
 WORKER_LOST_ERROR = "Lean worker was restarted and this proof state could not be rebuilt"
 
+# A 'by' opens a proof that extends to the end of the line, so nothing after
+# it is a top-level step separator — the scan in _split_top_level_tactics
+# stops there.
+#
+# There used to be an exception: "have NAME : STMT := by REST" was cut into a
+# bare "have NAME : STMT" plus REST as free-standing steps, so that a slip
+# inside REST would not also discard the statement. It was the only place we
+# imposed a cut Lean would not, and the only path that skipped asking Lean
+# whether the cut was real ("the whole string parses, so Lean must not be
+# asked here"). The steps of REST stopped being REST: measured live, in
+#     have h1 : a + 0 = a := by rw [Nat.add_zero]; rfl
+# the `rw` closed h1, so `rfl` — written as step two of h1's proof — ran
+# against the MAIN goal and reported a type error between two conjuncts it
+# was never meant to compare. The director was then shown that error beside
+# its own original text, with no way to tell the two apart.
+#
+# The justification (347 inlined sub-lemmas on tournament_champion, every
+# sampled failure a small slip inside the `by` block) comes from runs whose
+# logs no longer exist, under a prompt since changed, and asserts something
+# our data has never measured: not "long tactics fail more" but "chopping
+# them up rescues progress". Reinstate it only with a trace that shows the
+# latter, and record that trace here.
 _BY_KEYWORD_RE = re.compile(r"\bby\b")
-# Matches a top-level segment ending in "have NAME : STMT :=" (or the
-# anonymous "have : STMT :="), right before its inline proof's "by" —
-# the shape auto-split into a bare sub-goal, see _split_top_level_tactics.
-# Requires an explicit type annotation (a ':' not immediately
-# followed by '=') between "have" and the trailing ":=" — "have h :=
-# by simp" has no separately-stated type, so there is nothing valid to
-# open as a bare sub-goal; its type only exists once the proof does.
-# Confirmed against a real Lean REPL: bare "have h" with no type at
-# all is rejected outright.
-_HAVE_WITH_INLINE_PROOF_RE = re.compile(r"^have\b(\s+\S+)?\s*:(?!=).*:=$", re.DOTALL)
 # A top-level "=>" opens a body whose ';' sequence that body rather than
 # separating steps — "induction x with | a => …", "case pos => …",
 # "next => …", "conv => …". The one construct where "=>" does NOT open such a
@@ -122,20 +134,6 @@ def _has_error_messages(response: dict) -> bool:
     )
 
 
-def _is_have_decomposition(tactic: str, parts: list[str]) -> bool:
-    """
-    Did the splitter open a bare sub-goal from "have NAME : STMT := by REST"?
-
-    That split is deliberate rather than a parsing workaround — it exists to
-    checkpoint the sub-proof step by step (see _split_top_level_tactics) — and
-    the original string parses whole, so the preflight in `step` would
-    otherwise silently undo it.
-    """
-    stripped = tactic.strip()
-    head = parts[0].strip()
-    if not head.startswith("have") or not stripped.startswith(head):
-        return False
-    return stripped[len(head):].lstrip().startswith(":=")
 
 
 def _candidate_boundaries(tactic: str) -> list[int]:
@@ -165,35 +163,6 @@ def _candidate_boundaries(tactic: str) -> list[int]:
     return out
 
 
-def _peel_bare_have(tactic: str) -> Optional[tuple[str, str]]:
-    """Split "have NAME : STMT := by REST" into ("have NAME : STMT", REST).
-
-    The one decomposition that is deliberate rather than a parsing workaround:
-    the whole string parses fine, so Lean would happily run it as one atomic
-    unit — and that is exactly the problem. Measured on tournament_champion,
-    347 inlined sub-lemmas were proposed and every sampled failure was a small
-    mechanical slip *inside* the `by` block, discarding a correct decomposition
-    each time. Opening the bare `have` instead keeps the sub-goal attackable
-    step by step. Returns None when the tactic is not that shape.
-    """
-    parts = _split_top_level_tactics(tactic)
-    # Not `len(parts) < 2`: "have h : T := by" with an empty body splits to a
-    # single part, and that is exactly the shape worth peeling.
-    if not parts or not _is_have_decomposition(tactic, parts):
-        return None
-    head = parts[0].strip()
-    rest = tactic.strip()[len(head):].lstrip()
-    if not rest.startswith(":="):
-        return None
-    rest = rest[2:].lstrip()
-    if _BY_KEYWORD_RE.match(rest, 0):
-        rest = rest[2:].lstrip()
-    # An empty REST ("have h : T := by" with nothing after it) still peels.
-    # Lean rejects that string outright — an empty `by` block is a syntax
-    # error — so sending it whole costs a turn for nothing, while the bare
-    # `have` is plainly what was intended and opens the sub-goal. 22 recorded
-    # tactics have this shape.
-    return head, rest
 
 
 def _split_top_level_tactics(tactic: str) -> list[str]:
@@ -323,11 +292,8 @@ def _split_top_level_tactics(tactic: str) -> list[str]:
                 parts.append(tactic[start:i].strip())
                 start = i + 1
             elif _BY_KEYWORD_RE.match(tactic, i):
-                segment = tactic[start:i].strip()
-                if segment.endswith(":=") and _HAVE_WITH_INLINE_PROOF_RE.match(segment):
-                    parts.append(segment[:-2].strip())
-                    parts.extend(_split_top_level_tactics(tactic[i + 2:]))
-                    return [p for p in parts if p]
+                # A 'by' opens a proof that runs to the end of the line, so no
+                # ';' after it is a top-level separator. Stop scanning.
                 break
         i += 1
     parts.append(tactic[start:].strip())
@@ -856,16 +822,9 @@ class LeanWorker:
         remaining = tactic.strip()
         current = ps_id
         while remaining:
-            peeled = _peel_bare_have(remaining)
-            if peeled:
-                # Deliberate decomposition, not a parsing question — the whole
-                # string parses, so Lean must not be asked here.
-                text, remaining = peeled
-                response = await self._send({"tactic": text, "proofState": current})
-            else:
-                text, remaining, response = await self._probe_longest_prefix(
-                    remaining, current
-                )
+            text, remaining, response = await self._probe_longest_prefix(
+                remaining, current
+            )
             steps.append((text, response))
             if ("proofState" not in response
                     or "message" in response
@@ -990,11 +949,11 @@ class LeanWorker:
         current_ps_id = repl_ps_id
         response: dict = {}
         intermediate_states: list[ProofState] = []
-        # The sub-steps Lean actually ran, in order. NOT the same as the
-        # tactic the director wrote: _discover_steps splits chains and
-        # _peel_bare_have rewrites `have h : T := by tac` into a bare
-        # `have h : T`. tactic_trace must record what ran, or the trace we
-        # print is not a proof. See the comment at the closed-state build.
+        # The sub-steps Lean actually ran, in order. Still NOT always the
+        # tactic the director wrote: _discover_steps splits a top-level
+        # ';'-chain into one message per step. tactic_trace must record what
+        # ran, or the trace we print is not a proof. See the comment at the
+        # closed-state build.
         executed: list[str] = []
 
         for step_idx, (sub_tactic, response) in enumerate(steps):
@@ -1116,17 +1075,18 @@ class LeanWorker:
             # Proof closed.
             #
             # tactic_trace records `executed`, not `tactic`. These differ
-            # whenever the chain was split or a `have ... := by ...` was
-            # peeled, and recording the director's original string produced a
+            # whenever a top-level ';'-chain was split into one message per
+            # step, and recording the director's original string produced a
             # proof_trace that does not replay: measured on
             # eval_20260902_140914 (imo2005_q3, solved 2/2), pasting the
             # recorded trace back into Lean as one command failed with "No
-            # goals to be solved". The trace said
-            #   have hB : … ≠ 0 := by positivity; have hD : … ; field_simp; ring
-            # while Lean was actually sent the peeled `have hB : … ≠ 0` and
-            # the rest as separate steps against a different goal. Checkpoints
-            # (below) already recorded `sub_tactics`; only the two terminal
-            # states did not, so a single trace mixed both conventions.
+            # goals to be solved". Checkpoints (below) already recorded
+            # `sub_tactics`; only the two terminal states did not, so a single
+            # trace mixed both conventions.
+            #
+            # (The original example was a `have ... := by ...` we peeled apart;
+            # that rewrite is gone, but chains still split, so the invariant
+            # stands.)
             closed_state = ProofState(
                 goals=(),
                 depth=state.depth + 1,
