@@ -341,10 +341,15 @@ class LedgerSearch:
                 # it, and can re-derive the same successful step forever.
                 # Observed live: a DeepSeek run burned 10% of its budget
                 # re-running one nlinarith that succeeded every time.
-                ledger.record_success(resp.chosen_state_id, resp.tactic, new_id)
+                ledger.record_success(
+                    resp.chosen_state_id, resp.tactic, new_id, result.sent
+                )
             else:
                 ledger.record_failure(
-                    resp.chosen_state_id, resp.tactic, result.next_state.error or ""
+                    resp.chosen_state_id,
+                    resp.tactic,
+                    result.next_state.error or "",
+                    result.sent,
                 )
 
         failure_reason = "frontier_exhausted" if not ledger.frontier else "budget_exhausted"

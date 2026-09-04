@@ -23,11 +23,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.executor import SentMessage
 from core.ledger import Ledger
 from core.proof_state import ProofState, make_goal, make_proof_state
 from policy.base import (
     DIRECTOR_SYSTEM_PROMPT,
     DirectorResponse,
+    _format_sent_for_display,
     parse_director_response,
     serialize_ledger,
 )
@@ -561,15 +563,40 @@ class TestDirectorSystemPromptGuidance:
         assert "You are not restricted to it" in DIRECTOR_SYSTEM_PROMPT
 
     def test_prompt_names_the_goal_selection_tactics(self):
-        """Verified against a live REPL: these four act on a chosen goal
-        without permuting the list. pick_goal/rotate_*/swap also work but
-        reorder, and stable_hash is order-sensitive, so they spawn duplicate
-        ledger nodes — the prompt steers away from them rather than hiding
-        them."""
+        """All six are listed as facts, with no preference between them.
+
+        The prompt used to rank them — "prefer" case/on_goal/all_goals/
+        any_goals, "reach for them last" for pick_goal/rotate_left/swap —
+        on the grounds that reordering spawns duplicate ledger nodes. That
+        traded a trivial bookkeeping cost for the model's ability to make
+        incremental progress: `case tag => tacSeq` must CLOSE its goal, so a
+        partial attempt errors and banks nothing, while a rotated goal is
+        worked one tactic at a time with every step banked. imo2026_q5 spent
+        33 of 50 turns re-authoring one all-or-nothing `case mpr =>` block.
+        Name the constructs; let the model choose."""
         for tac in ("case <tag> => tac", "on_goal n => tac",
-                    "all_goals tac", "any_goals tac"):
+                    "all_goals tac", "any_goals tac",
+                    "pick_goal n", "rotate_left"):
             assert tac in DIRECTOR_SYSTEM_PROMPT, tac
-        assert "reach for them last" in DIRECTOR_SYSTEM_PROMPT
+        for steer in ("Prefer these", "reach for them last",
+                      "hedge with this"):
+            assert steer not in DIRECTOR_SYSTEM_PROMPT, steer
+
+    def test_prompt_states_that_case_must_close_its_goal(self):
+        """The one asymmetry between the addressing forms, stated as fact.
+
+        Probed live on a 2-goal state with a tactic that makes progress but
+        does not finish: `case right => constructor` came back "unsolved
+        goals" and kept NOTHING, while on_goal / pick_goal / all_goals /
+        any_goals all kept the partial result. imo2026_q5 turn 27 moved
+        deliberately from on_goal to case for robustness against shifting
+        goal indices — sound reasoning — and unknowingly traded a form that
+        banks progress for one that discards it. It then re-authored a single
+        `case mpr =>` block 33 times. The prompt must say the difference
+        exists; it must not say which to use."""
+        assert "must CLOSE the goal it selects" in DIRECTOR_SYSTEM_PROMPT
+        assert "none of its progress is kept" in DIRECTOR_SYSTEM_PROMPT
+        assert "keep whatever progress they make" in DIRECTOR_SYSTEM_PROMPT
 
     def test_prompt_says_every_goal_must_close(self):
         """A state is a conjunction. Without this the model can read progress
@@ -1063,3 +1090,75 @@ class TestAbandonedStatesAreVisibleAndResumable:
     def test_missing_abandon_reason_defaults_to_empty(self):
         raw = json.dumps({"chosen_state": "abc", "tactic": "simp"})
         assert parse_director_response(raw, "fallback").abandon_reason == ""
+
+
+class TestWhatWasSentToLeanIsShown:
+    """The director must see what Lean was ASKED, not only what it WROTE.
+
+    The REPL's tactic endpoint parses a single tactic, so a top-level
+    ';'-chain is split and sent as several messages. Before this the prompt
+    showed the director's own string beside an error produced by something
+    else, with no way to distinguish them. In imo2026_q5
+    (traces/eval_20260903_123103) the model spent roughly 30 of 50 turns
+    constructing a theory about Lean's parser to explain behaviour that was
+    partly our splitting — it wrote, at turn 28, "Since I can't literally run
+    diagnostics between turns, the safest bet is to guess", and then guessed
+    for seven consecutive turns.
+    """
+
+    def test_unchanged_single_message_is_not_echoed_back(self):
+        """Repeating a short tactic verbatim under itself is pure noise."""
+        assert _format_sent_for_display("simp", (SentMessage("simp", "ok, 1 goal left"),)) == ""
+
+    def test_compound_tactic_sent_whole_is_flagged_as_all_or_nothing(self):
+        """`case tag => a; b; c` goes to Lean as ONE message and must close
+        the goal outright; a partial attempt errors and banks nothing. That
+        the block was atomic is exactly what the model cannot otherwise see,
+        so it is worth a line even though the text is unchanged."""
+        out = _format_sent_for_display(
+            "case mpr => intro x; simp",
+            (SentMessage("case mpr => intro x; simp", "error"),),
+        )
+        assert "ONE message" in out
+        assert "succeed together" in out
+
+    def test_split_chain_lists_each_message_and_its_outcome(self):
+        out = _format_sent_for_display(
+            "intro x; simp; omega",
+            (
+                SentMessage("intro x", "ok, 1 goal left"),
+                SentMessage("simp", "ok, 1 goal left"),
+                SentMessage("omega", "error"),
+            ),
+        )
+        assert "3 separate messages" in out
+        for frag in ("intro x", "simp", "omega", "ok, 1 goal left", "error"):
+            assert frag in out
+
+    def test_overlong_chain_is_elided_in_the_middle_not_truncated(self):
+        """The first and last messages are what locate a failure, so a long
+        chain must not lose its tail — the failing step is usually there."""
+        sent = tuple(SentMessage(f"tac{i}", "ok, 1 goal left") for i in range(20))
+        sent = sent[:-1] + (SentMessage("tac19", "error"),)
+        out = _format_sent_for_display("; ".join(m.text for m in sent), sent)
+        assert "tac0" in out
+        assert "tac19" in out
+        assert "more" in out
+
+    def test_no_sent_record_renders_nothing(self):
+        """Entries recorded without reaching Lean (e.g. a banned tactic)
+        carry no messages and must not produce an empty header."""
+        assert _format_sent_for_display("sorry", ()) == ""
+
+    def test_prompt_shows_the_breakdown_under_the_failed_tactic(self):
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n = n"]))
+        ledger.record_failure(
+            state_id,
+            "intro n; omega",
+            "omega could not prove the goal",
+            (SentMessage("intro n", "ok, 1 goal left"), SentMessage("omega", "error")),
+        )
+        text = serialize_ledger("theorem foo := by", ledger, [])
+        assert "2 separate messages" in text
+        assert "omega could not prove the goal" in text

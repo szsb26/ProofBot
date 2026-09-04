@@ -1597,3 +1597,77 @@ class TestWorkerRestartRecovery:
         state = make_proof_state(["some goal"])          # never cached
         result = await worker.step(state, "simp")
         assert result.next_state.error == WORKER_LOST_ERROR
+
+
+class TestStepRecordsWhatWasSentToLean:
+    """StepResult.sent is the audit trail that makes director feedback honest.
+
+    step() does not necessarily hand Lean the string the director wrote: the
+    REPL's tactic endpoint parses one tactic, so a top-level ';'-chain is
+    split. Without a record of that, the model is shown its own text beside
+    an error produced by something else. imo2026_q5 lost ~30 turns to exactly
+    that ambiguity.
+    """
+
+    def _make_worker_with_cached_state(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])
+        worker._proof_state_cache[state.stable_hash()] = 0
+        return worker, state
+
+    async def test_single_tactic_records_one_message(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ Q"]},
+        ]))
+        result = await worker.step(state, "intro n")
+
+        assert [m.text for m in result.sent] == ["intro n"]
+        assert result.sent[0].outcome == "ok, 1 goal left"
+
+    async def test_split_chain_records_every_message_in_order(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ Q", "⊢ R"]},
+            {"proofStatus": "Completed", "proofState": 2, "goals": []},
+        ]))
+        result = await worker.step(state, "constructor; simp")
+
+        assert [m.text for m in result.sent] == ["constructor", "simp"]
+        assert result.sent[0].outcome == "ok, 2 goals left"
+        assert result.sent[1].outcome == "closed the proof"
+
+    async def test_failing_chain_records_the_message_that_failed(self):
+        """The failing message must appear in the record, not be dropped —
+        it is the one the director most needs to see."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ Q"]},
+            {"message": "Lean error:\nomega could not prove the goal"},
+        ]))
+        result = await worker.step(state, "intro n; omega")
+
+        assert not result.success
+        assert [m.text for m in result.sent] == ["intro n", "omega"]
+        assert result.sent[-1].outcome == "error"
+
+    async def test_atomic_block_records_exactly_one_message(self):
+        """`case tag => a; b` has no TOP-LEVEL ';', so Lean parses it whole
+        and the block is all-or-nothing. The record must show one message,
+        since "this was atomic" is what the director cannot otherwise infer.
+
+        Deliberately NOT using _lean_like_send: that stub parse-rejects any
+        ';' bracket-depth scanning can see, but real Lean only rejects a ';'
+        at top level. Measured on traces/eval_20260903_123103, 51 `case ... =>`
+        blocks containing ';' were sent to a live REPL and not one came back
+        "expected end of input". The stub here answers the way Lean actually
+        did — an ordinary tactic error, not a parse error.
+        """
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(
+            return_value={"message": "Lean error:\nunsolved goals"}
+        )
+        result = await worker.step(state, "case mpr => intro x; simp")
+
+        assert [m.text for m in result.sent] == ["case mpr => intro x; simp"]
+        assert result.sent[0].outcome == "error"

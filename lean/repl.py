@@ -57,7 +57,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from core.executor import LeanExecutor, StepResult
+from core.executor import LeanExecutor, SentMessage, StepResult
 from core.proof_state import Goal, ProofState
 
 logger = logging.getLogger(__name__)
@@ -358,6 +358,24 @@ def _annotate_chain_error(raw_error: str, sub_tactics: list[str], failed_idx: in
         header += f', after "{prefix}" succeeded'
     header += "):\n"
     return header + body
+
+
+def _outcome_label(response: dict) -> str:
+    """One-line label for how a single REPL message came back.
+
+    Deliberately coarse. The full error text is already carried on the
+    LedgerEntry and rendered under the tactic; this only has to tell the
+    director whether a given message landed, and how much was left after it.
+    """
+    if "message" in response or _has_error_messages(response):
+        return "error"
+    if response.get("proofStatus", "") == "Completed":
+        return "closed the proof"
+    goals = response.get("goals")
+    if goals is not None:
+        n = len(goals)
+        return f"ok, {n} goal{'' if n == 1 else 's'} left"
+    return "ok"
 
 
 class LeanREPLError(Exception):
@@ -963,6 +981,12 @@ class LeanWorker:
             )
 
         sub_tactics = [text for text, _ in steps]
+        # What Lean was actually asked, in order. The director wrote one
+        # string; _discover_steps may have sent several messages. Showing
+        # it the difference is the whole point of this field.
+        sent_msgs = tuple(
+            SentMessage(text, _outcome_label(resp)) for text, resp in steps
+        )
         current_ps_id = repl_ps_id
         response: dict = {}
         intermediate_states: list[ProofState] = []
@@ -988,6 +1012,7 @@ class LeanWorker:
                     tactic=tactic,
                     elapsed_ms=(time.perf_counter() - start) * 1000,
                     intermediate_states=tuple(intermediate_states),
+                    sent=sent_msgs,
                 )
 
             # The REPL can also report errors via a "messages" list even when it
@@ -1029,6 +1054,7 @@ class LeanWorker:
                     tactic=tactic,
                     elapsed_ms=(time.perf_counter() - start) * 1000,
                     intermediate_states=tuple(intermediate_states),
+                    sent=sent_msgs,
                 )
 
             # This step succeeded
@@ -1044,6 +1070,7 @@ class LeanWorker:
                     tactic=tactic,
                     elapsed_ms=(time.perf_counter() - start) * 1000,
                     intermediate_states=tuple(intermediate_states),
+                    sent=sent_msgs,
                 )
 
             current_ps_id = response["proofState"]
@@ -1110,6 +1137,7 @@ class LeanWorker:
                 tactic=tactic,
                 elapsed_ms=elapsed,
                 intermediate_states=tuple(intermediate_states),
+                sent=sent_msgs,
             )
 
         if not goals_raw:
@@ -1136,6 +1164,7 @@ class LeanWorker:
                 tactic=tactic,
                 elapsed_ms=elapsed,
                 intermediate_states=tuple(intermediate_states),
+                sent=sent_msgs,
             )
 
         next_state = ProofState(
@@ -1152,6 +1181,7 @@ class LeanWorker:
             tactic=tactic,
             elapsed_ms=elapsed,
             intermediate_states=tuple(intermediate_states),
+            sent=sent_msgs,
         )
 
 
