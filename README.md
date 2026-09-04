@@ -231,21 +231,33 @@ competition problems from the International Mathematical Olympiad.
 
 Measured 2026-08-25, budget 50, temperature 1.0. Rows marked † were
 re-measured 2026-09-01, after a round of harness fixes (goal-text rendering,
-tactic-boundary splitting).
+tactic-boundary splitting). Rows marked ‡ were re-measured 2026-09-03, after
+the harness stopped rewriting the director's tactics and began showing it
+exactly what Lean was sent.
 
 | Problem | DeepSeek v4 Pro | Claude Sonnet 5 |
 |---|---|---|
-| `imo1959_q1` — gcd / coprimality | ✓ 3/3, 14 nodes | ✓ 2/2, 10 nodes † |
-| `imo1964_q1a` — modular arithmetic | ✓ 3/3, 41 nodes | ✓ 2/2, **8 nodes** † |
-| `imo1963_q5` — trigonometric identity | ~ 1/3, 47 nodes | ✓ 2/2, 17 nodes † |
-| `imo2005_q3` — algebraic inequality | ✗ 0/3 | ✓ 2/2, 27 nodes |
-| `imo2011_q3` — functional equation | ✗ 0/3 | ✗ 0/1, budget exhausted † |
+| `imo1959_q1` — gcd / coprimality | ✓ 3/3, 14 nodes | ✓ 1/1, 10 nodes ‡ |
+| `imo1964_q1a` — modular arithmetic | ✓ 3/3, 41 nodes | ✓ 1/1, **6 nodes** ‡ |
+| `imo1963_q5` — trigonometric identity | ~ 1/3, 47 nodes | ✓ 1/1, **6 nodes** ‡ |
+| `imo2005_q3` — algebraic inequality | ✗ 0/3 | ✓ 1/1, 23 nodes ‡ |
+| `imo2011_q3` — functional equation | ✗ 0/3 | ✓ 1/1, **23 nodes** ‡ |
 
-This is a **small sample** — 5 of the 22 problems in the `imo` tier, and 5 of
-45 in the repo overall — chosen to span domains rather than to be
-representative, and with uneven trial counts between the two columns. Read
-solved/not-solved and node counts as the signal, not the rates. Run
-`--problems imo` for the full tier.
+`imo2011_q3` had never been solved before 2026-09-03; it exhausted its budget
+on every prior attempt. Its 47-step proof was replayed into Lean and closes
+with zero errors and no `sorry`.
+
+Read these numbers with their caveats. This is a **small sample** — 5 of the
+22 problems in the `imo` tier, 5 of 45 in the repo — chosen to span domains
+rather than to be representative, and the two columns have uneven trial
+counts. All five ‡ rows are single trials at temperature 1.0, where node
+counts vary a lot run to run (`imo2005_q3` alone has ranged 15–27 across
+earlier runs). The `imo1963_q5`, `imo2005_q3` and `imo2011_q3` ‡ rows were
+measured through the `claude-cli` policy while most earlier rows used the
+API, and the two paths differ in sampling temperature, token limits, and the
+context the CLI injects per call — so the comparison is suggestive, not
+controlled. Read solved/not-solved as the signal. Run `--problems imo` for
+the full tier.
 
 ---
 

@@ -26,9 +26,7 @@ from lean.repl import (
     _annotate_chain_error,
     _parse_goals,
     _candidate_boundaries,
-    _peel_bare_have,
     _is_parse_error,
-    _is_have_decomposition,
     LEAN_PROJECT_DIR,
 )
 from core.executor import StepResult
@@ -167,10 +165,10 @@ class TestStateIdentityUsesLeansText:
 #
 # SCOPE NOTE. _split_top_level_tactics is no longer the harness's splitter —
 # since 091226cd, Lean decides where a chain is cut (_discover_steps offers it
-# progressively shorter prefixes). The only surviving caller is
-# _peel_bare_have, which reads `parts[0]` and whether `parts` is empty; nothing
-# reads parts[1:]. So roughly twenty of the assertions below check more surface
-# than any caller depends on.
+# progressively shorter prefixes). Its last production caller, _peel_bare_have,
+# has since been deleted too, so nothing in the execution path reads its output
+# at all: the assertions below now document a grammar model that only tests
+# consult.
 #
 # They are kept deliberately, not by neglect: each protection rule here (the
 # `case`/`next`/`conv` bodies, `fun x =>`, focus blocks, anonymous-constructor
@@ -210,30 +208,44 @@ class TestCandidateBoundaries:
         assert _candidate_boundaries("simp") == []
 
 
-class TestPeelBareHave:
-    """"have NAME : STMT := by REST" is decomposed deliberately, not to work
-    around parsing — the whole string parses fine. Lean must not be consulted
-    here or it would run the sub-proof atomically, which is the behaviour this
-    replaced: 347 inlined sub-lemmas on tournament_champion, every sampled
-    failure a mechanical slip inside the `by` block discarding a correct
-    decomposition."""
+class TestHaveWithInlineProofIsLeftAlone:
+    """`have NAME : STMT := by REST` goes to Lean exactly as written.
 
-    def test_have_with_inline_proof_is_peeled(self):
-        assert _peel_bare_have("have h : P := by intro y; simp") == (
-            "have h : P", "intro y; simp")
+    It used to be cut into a bare `have NAME : STMT` plus REST as free-standing
+    steps, so a slip inside REST would not also discard the statement. That was
+    the only cut we imposed that Lean would not, and the only path that skipped
+    asking Lean whether the cut was real. The steps of REST stopped being REST:
+    measured live, in
 
-    def test_have_ending_in_a_bare_by_still_peels(self):
-        """"have h : T := by" with nothing after it is a syntax error in Lean,
-        so sending it whole burns a turn. The bare `have` is plainly the
-        intent and opens the sub-goal. 22 recorded tactics have this shape."""
-        assert _peel_bare_have("have hmod : 2 ^ n % 7 = 1 := by") == (
-            "have hmod : 2 ^ n % 7 = 1", "")
+        have h1 : a + 0 = a := by rw [Nat.add_zero]; rfl
 
-    def test_have_without_a_stated_type_is_not_peeled(self):
-        assert _peel_bare_have("have h := by simp") is None
+    the `rw` closed h1, so `rfl` ran against the MAIN goal and reported a type
+    error between two conjuncts it was never meant to compare — and the
+    director was shown that error beside its own original text.
 
-    def test_a_plain_chain_is_not_peeled(self):
-        assert _peel_bare_have("intro n; simp") is None
+    Deleted rather than repaired: `have` is not special in Lean, and a
+    special case for one keyword invites one for `let`, `suffices`, `obtain`
+    and the rest, each a new way to mangle correct input. The evidence that
+    justified it (347 inlined sub-lemmas on tournament_champion) is from runs
+    whose logs are gone, and asserts something never actually measured — not
+    "long tactics fail more" but "chopping them up rescues progress".
+    """
+
+    def test_inline_proof_is_not_split_off(self):
+        assert _split_top_level_tactics("have h : P := by intro y; simp") == [
+            "have h : P := by intro y; simp"]
+
+    def test_semicolons_after_by_are_not_top_level(self):
+        """A `by` runs to the end of the line, so nothing after it separates
+        top-level steps. Confirmed against a live REPL: the whole string is
+        accepted as one tactic."""
+        assert _split_top_level_tactics(
+            "have h : P := by simp; have k : Q := by simp; exact ⟨h, k⟩"
+        ) == ["have h : P := by simp; have k : Q := by simp; exact ⟨h, k⟩"]
+
+    def test_a_genuine_top_level_chain_still_splits(self):
+        assert _split_top_level_tactics("intro n; simp; omega") == [
+            "intro n", "simp", "omega"]
 
 
 class TestDiscoverStepsAsksLeanWhereToCut:
@@ -561,74 +573,6 @@ class TestSplitTracksAnonymousConstructorBrackets:
         ]
 
 
-class TestSplitHaveWithInlineProof:
-    """
-    "have NAME : STMT := by REST" is deliberately split into the bare
-    "have NAME : STMT" plus REST (recursively split), instead of being kept
-    atomic like every other "... := by ..." construct. Measured motivation:
-    347 inlined sub-lemmas of exactly this shape were proposed against
-    tournament_champion, and every sampled failure was a mechanical error
-    *inside* REST — discarding a correct decomposition on every one, since
-    the whole block previously passed or failed as a single unit.
-
-    Confirmed against a real Lean REPL: sending the bare "have NAME : STMT"
-    alone opens STMT as a new first goal and keeps the original goal
-    available with NAME as a hypothesis, and Lean's default "operate on the
-    first goal" behavior then routes REST's own steps onto that new
-    sub-goal automatically — no separate goal-targeting logic needed.
-    """
-
-    def test_have_with_type_and_inline_proof_is_split(self):
-        tactic = "have hsub : ∀ y, beats c y → beats p y := by intro y hy; simp; exact h"
-        assert _split_top_level_tactics(tactic) == [
-            "have hsub : ∀ y, beats c y → beats p y",
-            "intro y hy",
-            "simp",
-            "exact h",
-        ]
-
-    def test_top_level_chain_before_a_have_still_splits_the_have_too(self):
-        tactic = "by_contra h; push_neg at h; have hcardp : X := by exact hmax p"
-        assert _split_top_level_tactics(tactic) == [
-            "by_contra h",
-            "push_neg at h",
-            "have hcardp : X",
-            "exact hmax p",
-        ]
-
-    def test_nested_have_inside_the_proof_is_also_unrolled(self):
-        """A have-with-inline-proof inside REST is itself split the same
-        way, recursively — fully flattening any depth of nesting."""
-        tactic = "have h1 : P := by have h2 : Q := by tac_a; tac_b; tac_c"
-        assert _split_top_level_tactics(tactic) == [
-            "have h1 : P", "have h2 : Q", "tac_a", "tac_b", "tac_c",
-        ]
-
-    def test_anonymous_have_with_inline_proof_is_split(self):
-        tactic = "have : p ≠ c := by intro h; exact hp h"
-        assert _split_top_level_tactics(tactic) == [
-            "have : p ≠ c", "intro h", "exact hp h",
-        ]
-
-    def test_have_with_no_type_annotation_is_not_split(self):
-        """"have h := by simp" states no separate type — h's type is only
-        inferred once the proof exists, so there is nothing valid to open
-        as a bare sub-goal. Confirmed against a real Lean REPL: bare
-        "have h" with no type at all is rejected outright."""
-        tactic = "have h := by simp"
-        assert _split_top_level_tactics(tactic) == [tactic]
-
-    def test_have_used_as_a_plain_rewrite_target_is_unaffected(self):
-        """"have" appearing without ":=" at all (e.g. referencing an
-        existing hypothesis) must not trip the have-split path."""
-        tactic = "have hp; simp"
-        assert _split_top_level_tactics(tactic) == ["have hp", "simp"]
-
-    def test_single_have_with_inline_proof_and_no_chain_before_it(self):
-        tactic = "have h : True := by trivial"
-        assert _split_top_level_tactics(tactic) == ["have h : True", "trivial"]
-
-
 class TestAnnotateChainError:
 
     def test_single_step_returns_error_unchanged(self):
@@ -775,13 +719,15 @@ class TestLeanWorkerStepChaining:
         """proof_trace must be the executed steps, or it is not a proof.
 
         Measured on eval_20260902_140914 (imo2005_q3, solved 2/2): pasting the
-        recorded trace back into Lean failed with "No goals to be solved".
-        The trace held the director's original
-            have hB : ... := by positivity; ...; field_simp; ring
-        while Lean had actually been sent the PEELED `have hB : ...` and the
-        rest as separate steps against a different goal. Checkpoints already
-        recorded the executed steps; the two terminal states recorded the raw
-        string, so one trace mixed both conventions.
+        recorded trace back into Lean failed with "No goals to be solved",
+        because the two terminal states recorded the director's raw string
+        while the checkpoints recorded the steps Lean actually ran — one trace
+        mixing both conventions.
+
+        The original example was a PEELED `have ... := by ...`; that rewrite
+        has since been deleted, so the case is now demonstrated with a genuine
+        top-level ';'-chain, which Lean's REPL still requires be sent one
+        message at a time.
         """
         worker, state = self._make_worker_with_cached_state()
         worker._send = AsyncMock(side_effect=_lean_like_send([
@@ -789,12 +735,12 @@ class TestLeanWorkerStepChaining:
             {"proofStatus": "", "proofState": 2, "goals": ["⊢ Q"]},
             {"proofStatus": "Completed", "proofState": 3, "goals": []},
         ]))
-        result = await worker.step(state, "have h : P := by simp; exact h")
+        result = await worker.step(state, "constructor; simp; exact h")
 
         assert result.proof_closed
         trace = list(result.next_state.tactic_trace)
-        assert trace == ["have h : P", "simp", "exact h"], trace
-        assert "have h : P := by simp; exact h" not in trace, (
+        assert trace == ["constructor", "simp", "exact h"], trace
+        assert "constructor; simp; exact h" not in trace, (
             "the unsplit original must not appear — it is not what Lean ran"
         )
 
@@ -936,19 +882,26 @@ class TestPreflightWholeTactic:
         await worker.step(state, "simp")
         assert worker._send.await_count == 1
 
-    async def test_have_decomposition_is_never_preflighted(self):
-        """"have NAME : STMT := by REST" parses whole, so preflighting it
-        would silently undo the deliberate bare-sub-goal split — the one
-        split that exists for checkpointing rather than for parsing."""
+    async def test_have_with_inline_proof_is_sent_whole(self):
+        """"have NAME : STMT := by REST" parses whole, so Lean gets it whole.
+
+        This asserts the inverse of what it used to: the string was once cut
+        into a bare `have NAME : STMT` plus REST as free-standing steps, and
+        that path deliberately skipped the preflight so Lean could not undo
+        the cut. It was the only cut we imposed that Lean would not make, and
+        REST's steps stopped belonging to REST — a step that ran after the
+        sub-goal had already closed landed on the main goal instead. Deleted:
+        `have` is not special in Lean, and one keyword's special case invites
+        the same for `let`, `suffices`, `obtain` and the rest.
+        """
         worker, state = self._make_worker_with_cached_state()
         worker._send = AsyncMock(side_effect=[
-            {"proofStatus": "", "proofState": 1, "goals": ["⊢ P", "⊢ Q"]},
-            {"proofStatus": "", "proofState": 2, "goals": ["⊢ Q"]},
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ Q"]},
         ])
         await worker.step(state, "have h : P := by simp")
 
         sent = [c.args[0]["tactic"] for c in worker._send.await_args_list]
-        assert sent == ["have h : P", "simp"]
+        assert sent == ["have h : P := by simp"]
 
     async def test_elaboration_failure_is_not_mistaken_for_a_parse_error(self):
         """"unknown identifier" means Lean parsed and ran it — the string is
@@ -976,27 +929,6 @@ class TestIsParseError:
 
     def test_successful_response_is_not_a_parse_error(self):
         assert not _is_parse_error({"proofState": 1, "goals": []})
-
-
-class TestIsHaveDecomposition:
-
-    def test_have_with_inline_proof_is_a_decomposition(self):
-        t = "have h : P := by intro y; simp"
-        assert _is_have_decomposition(t, _split_top_level_tactics(t))
-
-    def test_have_without_inline_proof_is_not(self):
-        t = "have hp; simp"
-        assert not _is_have_decomposition(t, _split_top_level_tactics(t))
-
-    def test_plain_chain_is_not(self):
-        t = "intro k; simp"
-        assert not _is_have_decomposition(t, _split_top_level_tactics(t))
-
-    def test_have_later_in_a_chain_is_not_the_leading_construct(self):
-        """The split there begins with the chain, not the have, so the whole
-        string is a genuine chain and Lean will reject it anyway."""
-        t = "intro k; have h : P := by simp"
-        assert not _is_have_decomposition(t, _split_top_level_tactics(t))
 
 
 class TestLeanWorkerStepIntermediateStates:
@@ -1597,3 +1529,77 @@ class TestWorkerRestartRecovery:
         state = make_proof_state(["some goal"])          # never cached
         result = await worker.step(state, "simp")
         assert result.next_state.error == WORKER_LOST_ERROR
+
+
+class TestStepRecordsWhatWasSentToLean:
+    """StepResult.sent is the audit trail that makes director feedback honest.
+
+    step() does not necessarily hand Lean the string the director wrote: the
+    REPL's tactic endpoint parses one tactic, so a top-level ';'-chain is
+    split. Without a record of that, the model is shown its own text beside
+    an error produced by something else. imo2026_q5 lost ~30 turns to exactly
+    that ambiguity.
+    """
+
+    def _make_worker_with_cached_state(self):
+        worker = LeanWorker(LEAN_PROJECT_DIR, load_mathlib=False)
+        state = make_proof_state(["some goal"])
+        worker._proof_state_cache[state.stable_hash()] = 0
+        return worker, state
+
+    async def test_single_tactic_records_one_message(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ Q"]},
+        ]))
+        result = await worker.step(state, "intro n")
+
+        assert [m.text for m in result.sent] == ["intro n"]
+        assert result.sent[0].outcome == "ok, 1 goal left"
+
+    async def test_split_chain_records_every_message_in_order(self):
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ Q", "⊢ R"]},
+            {"proofStatus": "Completed", "proofState": 2, "goals": []},
+        ]))
+        result = await worker.step(state, "constructor; simp")
+
+        assert [m.text for m in result.sent] == ["constructor", "simp"]
+        assert result.sent[0].outcome == "ok, 2 goals left"
+        assert result.sent[1].outcome == "closed the proof"
+
+    async def test_failing_chain_records_the_message_that_failed(self):
+        """The failing message must appear in the record, not be dropped —
+        it is the one the director most needs to see."""
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(side_effect=_lean_like_send([
+            {"proofStatus": "", "proofState": 1, "goals": ["⊢ Q"]},
+            {"message": "Lean error:\nomega could not prove the goal"},
+        ]))
+        result = await worker.step(state, "intro n; omega")
+
+        assert not result.success
+        assert [m.text for m in result.sent] == ["intro n", "omega"]
+        assert result.sent[-1].outcome == "error"
+
+    async def test_atomic_block_records_exactly_one_message(self):
+        """`case tag => a; b` has no TOP-LEVEL ';', so Lean parses it whole
+        and the block is all-or-nothing. The record must show one message,
+        since "this was atomic" is what the director cannot otherwise infer.
+
+        Deliberately NOT using _lean_like_send: that stub parse-rejects any
+        ';' bracket-depth scanning can see, but real Lean only rejects a ';'
+        at top level. Measured on traces/eval_20260903_123103, 51 `case ... =>`
+        blocks containing ';' were sent to a live REPL and not one came back
+        "expected end of input". The stub here answers the way Lean actually
+        did — an ordinary tactic error, not a parse error.
+        """
+        worker, state = self._make_worker_with_cached_state()
+        worker._send = AsyncMock(
+            return_value={"message": "Lean error:\nunsolved goals"}
+        )
+        result = await worker.step(state, "case mpr => intro x; simp")
+
+        assert [m.text for m in result.sent] == ["case mpr => intro x; simp"]
+        assert result.sent[0].outcome == "error"

@@ -36,8 +36,19 @@ node. Deliberate — see the `stable_hash` docstring.
   `pick_goal 3` reorders; `on_goal 3 => omega` closes goal 3 in place leaving
   1 and 2; `rotate_left` cycles; `all_goals tac` hits every goal.
 - **`case name => tac` works only when goals are named.** A bare `have foo :`
-  produces `case foo`; `refine ⟨?_, ?_⟩` produces anonymous goals and `case`
-  fails with "Case tag not found".
+  produces `case foo`. `refine ⟨?_, ?_⟩` names its holes `refine_1`,
+  `refine_2`, … — an earlier draft of this note claimed they were anonymous
+  and that `case` failed on them; that is wrong. Observed directly in
+  `traces/eval_20260903_123103`, where Lean reported `case refine_1` /
+  `case refine_2` and the director addressed them by those tags.
+- **`case tag => tac` must CLOSE the goal it selects.** Probed 2026-09-03 on
+  a 2-goal state with a tactic that progresses without finishing
+  (`constructor` on `P ∧ P`): `case right => constructor` returned
+  "unsolved goals" and banked NOTHING, while `on_goal 2 =>`, `pick_goal 2`,
+  `all_goals` and `any_goals` all kept the partial result. `case` is the only
+  form of the six with this property, and it is why a multi-goal state can
+  become a turn sink: every attempt at a non-first goal must be a complete
+  proof of that branch, written from scratch.
 - **The tactic endpoint gives no per-goal handle.** After `constructor`:
   `goals=2, proofState=6, sorries=None`. One handle, whole list.
 - **The `cmd` endpoint does.** A command containing several `sorry` holes
@@ -84,10 +95,21 @@ Behaviour matches: across **3,025 tactics ever sent**, goal-selection
 constructs appear 9 times (`pick_goal` 1, `on_goal` 0, `rotate_left` 3,
 `case … =>` 1, `swap` 4).
 
-**Open question:** is this fixed by telling the model, by changing the data
-structure, or both? They are independent. Telling the model costs a few lines
-and no commitment; it does not give the *ledger* any ability to attribute
-failure per goal or prune one branch.
+**Update 2026-09-03 — partly answered, and not by the data structure.**
+The prompt's ranking was deleted: it had said "prefer" case/on_goal/
+all_goals/any_goals and "reach for [pick_goal/rotate_left/swap] last" on the
+duplicate-node grounds above. That traded a trivial bookkeeping cost for the
+model's ability to make incremental progress, since only `case` requires
+closing its goal. imo2026_q5 (`traces/eval_20260903_123103`) spent 33 of 50
+turns re-authoring one all-or-nothing `case mpr =>` block; at turn 27 it
+moved deliberately from `on_goal` to `case` for robustness against shifting
+indices — sound reasoning — and unknowingly gave up progress-banking, with
+nothing in the system able to tell it. The six constructs are now listed as
+facts, the closure asymmetry stated, and nothing ranked.
+
+**Still open:** whether the *ledger* should be able to attribute failure per
+goal or prune one branch. That is the data-structure question below, and
+nothing measured so far requires it.
 
 ## 5. The design question we have not answered
 

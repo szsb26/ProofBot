@@ -95,6 +95,18 @@ DIRECTOR_SYSTEM_PROMPT = (
     # case/on_goal/all_goals/any_goals act without reordering, while
     # pick_goal/rotate_*/swap permute the tuple — and stable_hash is
     # order-sensitive, so those spawn duplicate nodes.
+    #
+    # That last fact was then turned into "prefer these ... reach for
+    # [pick_goal/rotate/swap] last", which was a mistake: a few extra
+    # nodes is a trivial cost, and the discouraged option is the one
+    # that works for incremental progress. `case tag => tacSeq` must
+    # CLOSE its goal — a partial attempt is an "unsolved goals" error
+    # and banks nothing (verified: `case left => skip`) — whereas a
+    # rotated goal is worked one ordinary tactic at a time, each
+    # banking a state. imo2026_q5 (eval_20260903_123103) spent 33 of
+    # 50 turns re-authoring one all-or-nothing `case mpr =>` block.
+    # The constructs are listed here as facts; the choice is the
+    # model's.
     "- A state may hold SEVERAL goals, shown as \"Goal 1/3\", \"Goal 2/3\", … "
     "and often carrying a Lean case tag such as \"case hconst\". ALL of "
     "them must eventually be proved — the state is finished only when "
@@ -106,14 +118,19 @@ DIRECTOR_SYSTEM_PROMPT = (
     "      on_goal n => tac     act on goal n\n"
     "      all_goals tac        act on every goal; fails unless it works on all\n"
     "      any_goals tac        act on every goal; keeps whatever succeeds\n"
-    "  Prefer these: they leave the goal order alone. `pick_goal n`, "
-    "`rotate_left` and `swap` also work but reorder the list, which "
-    "produces a state that duplicates work already recorded elsewhere, so "
-    "reach for them last.\n"
+    "      pick_goal n          move goal n to the front of the list\n"
+    "      rotate_left / swap   cycle, or exchange, goals in the list\n"
+    "  `case <tag> => tac` must CLOSE the goal it selects — if tac "
+    "leaves anything open, the whole tactic is an error and none of "
+    "its progress is kept. The others keep whatever progress they "
+    "make, so they can be used one small step at a time.\n"
+    "  The first four leave the goal order unchanged; the last two "
+    "reorder it, and the search records a reordered list as a separate "
+    "state. Which you use is your call.\n"
     "- To combine several steps inside your one tactic:\n"
     "      tac1; tac2           run tac1, then tac2 on whatever goal is FIRST afterwards — which may be a different goal, e.g. if tac1 closed the one it acted on\n"
     "      tac1 <;> tac2        run tac2 on every goal tac1 PRODUCED (none, if tac1 produced none — not the same as all_goals)\n"
-    "      first | tac1 | tac2  try alternatives in order; hedge with this rather than describing several plans, as there is one slot\n"
+    "      first | tac1 | tac2  try alternatives in order, keeping the first that works\n"
     "      try tac              run tac, tolerate failure\n"
     "      (tac1; tac2)         group, e.g. inside `on_goal n => (…)`\n"
     "  If a step in a ';' chain fails, the error you see next turn says "
@@ -238,6 +255,67 @@ _SHORT_TACTIC_MAX_LEN = 30
 # normally well under this), truncated only for pathological outliers like
 # apply?/exact? dumping dozens of "Try this" suggestions onto one line.
 _MAX_ERROR_DISPLAY_LEN = 2000
+
+
+# Per-message cap inside a "sent to Lean as N messages" breakdown. Shorter
+# than a whole tactic's cap because a split chain can produce many of them
+# and they are shown together — the point is which step, not its full text.
+_MAX_SENT_MESSAGE_DISPLAY_LEN = 200
+# Ceiling on messages listed for one tactic. Chains this long are rare; the
+# first and last are what locate a failure, so an over-long list is elided
+# in the middle rather than truncated at the end.
+_MAX_SENT_MESSAGES_SHOWN = 8
+
+
+def _format_sent_for_display(tactic: str, sent) -> str:
+    """Show what Lean was actually ASKED, when that differs from what was WRITTEN.
+
+    The director writes one tactic string; the REPL's tactic endpoint parses
+    a single tactic, so a top-level ';'-chain is split and sent as several
+    messages. Without this the model sees its own text next to an error
+    produced by something else and has no way to tell them apart — in
+    imo2026_q5 it spent ~30 turns building a theory about Lean's parser to
+    explain what was really our splitting, because the evidence it needed
+    was never shown to it.
+
+    Silent when the tactic went to Lean unchanged as one message AND was not
+    written as a chain: repeating a short tactic back verbatim is noise. A
+    compound tactic that went whole DOES get a line, because "this was
+    all-or-nothing" is exactly what the model cannot otherwise see.
+    """
+    if not sent:
+        return ""
+    if len(sent) == 1:
+        only = sent[0].text.strip()
+        if only == tactic.strip():
+            if ";" in tactic:
+                return ("\n    ⤷ sent to Lean as ONE message, unsplit — every part "
+                        "had to succeed together for any of it to be kept")
+            return ""
+        return f"\n    ⤷ sent to Lean as: {_clip(only, _MAX_SENT_MESSAGE_DISPLAY_LEN)}"
+
+    shown = list(sent)
+    elided = 0
+    if len(shown) > _MAX_SENT_MESSAGES_SHOWN:
+        half = _MAX_SENT_MESSAGES_SHOWN // 2
+        elided = len(shown) - _MAX_SENT_MESSAGES_SHOWN
+        shown = shown[:half] + shown[-(_MAX_SENT_MESSAGES_SHOWN - half):]
+
+    out = [f"\n    ⤷ sent to Lean as {len(sent)} separate messages:"]
+    for i, m in enumerate(shown, 1):
+        if elided and i == (_MAX_SENT_MESSAGES_SHOWN // 2) + 1:
+            out.append(f"\n        … {elided} more …")
+        out.append(
+            f"\n        {_clip(m.text.strip(), _MAX_SENT_MESSAGE_DISPLAY_LEN)}"
+            f"   → {m.outcome}"
+        )
+    return "".join(out)
+
+
+def _clip(text: str, limit: int) -> str:
+    """Collapse to one line and truncate with an ellipsis marker."""
+    oneline = " ".join(text.split())
+    return oneline if len(oneline) <= limit else oneline[:limit] + "…"
 
 
 def _format_tactic_for_display(tactic: str) -> str:
@@ -408,10 +486,12 @@ def serialize_ledger(
 
             seen: list[str] = []
             errors_by_tactic: dict[str, str] = {}
+            sent_by_tactic: dict[str, tuple] = {}
             for f in failures:
                 if f.tactic not in seen:
                     seen.append(f.tactic)
                     errors_by_tactic[f.tactic] = f.error
+                    sent_by_tactic[f.tactic] = f.sent
 
             # Short/generic tactics are never evicted — they're cheap to
             # keep and exactly the ones a recency cap would otherwise drop
@@ -430,6 +510,7 @@ def serialize_ledger(
             tactic_lines = []
             for t in shown:
                 line = f"  - {_format_tactic_for_display(t)}"
+                line += _format_sent_for_display(t, sent_by_tactic.get(t, ()))
                 err = errors_by_tactic.get(t, "")
                 if err:
                     line += f"\n    → {_format_error_for_display(err)}"

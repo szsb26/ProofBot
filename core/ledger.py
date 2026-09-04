@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from core.executor import SentMessage
 from core.proof_state import ProofState
 
 
@@ -37,12 +38,21 @@ class LedgerEntry:
                    (the caller is responsible for capping pathological sizes,
                    e.g. apply?/exact? "Try this" dumps) so the director sees
                    what Lean actually said, uncompressed.
+        sent:      The messages actually handed to the Lean REPL for this
+                   tactic, in order, with how each came back. `tactic` is
+                   what the director WROTE; this is what Lean was ASKED.
+                   They differ whenever a ';'-chain is split into several
+                   messages, and the director cannot otherwise tell — which
+                   is how imo2026_q5 spent ~30 turns attributing a harness
+                   behaviour to Lean's parser. Empty for entries recorded
+                   without reaching Lean (e.g. a banned tactic).
     """
     parent_id: str
     tactic: str
     outcome: str
     child_id: str | None = None
     error: str = ""
+    sent: tuple[SentMessage, ...] = ()
 
 
 @dataclass
@@ -124,11 +134,27 @@ class Ledger:
         self.abandon_reasons.pop(state_id, None)
         return state_id
 
-    def record_success(self, parent_id: str, tactic: str, child_id: str) -> None:
-        self.entries.append(LedgerEntry(parent_id, tactic, "success", child_id))
+    def record_success(
+        self,
+        parent_id: str,
+        tactic: str,
+        child_id: str,
+        sent: tuple[SentMessage, ...] = (),
+    ) -> None:
+        self.entries.append(
+            LedgerEntry(parent_id, tactic, "success", child_id, sent=sent)
+        )
 
-    def record_failure(self, parent_id: str, tactic: str, error: str = "") -> None:
-        self.entries.append(LedgerEntry(parent_id, tactic, "failed", None, error))
+    def record_failure(
+        self,
+        parent_id: str,
+        tactic: str,
+        error: str = "",
+        sent: tuple[SentMessage, ...] = (),
+    ) -> None:
+        self.entries.append(
+            LedgerEntry(parent_id, tactic, "failed", None, error, sent=sent)
+        )
 
     def abandon(self, state_ids: list[str], reason: str = "") -> None:
         """

@@ -18,6 +18,29 @@ from core.proof_state import ProofState
 
 
 @dataclass(frozen=True)
+class SentMessage:
+    """One message actually handed to the Lean REPL, and how it came back.
+
+    The director writes ONE tactic string, but that is not necessarily what
+    Lean sees: the REPL's tactic endpoint parses a single tactic, so a
+    top-level ';'-chain is split and sent as several messages (see
+    LeanWorker._discover_steps). Until this existed the model was shown its
+    own text beside an error produced by something else, with no way to tell
+    the two apart — imo2026_q5 spent ~30 turns theorising about Lean's
+    parser as a result. Recording what was sent is what makes the feedback
+    honest.
+
+    Attributes:
+        text:    The exact string sent to Lean as one message.
+        outcome: Short result label — "ok, N goals", "closed", or "error".
+                 The full error text lives on the LedgerEntry, so this is a
+                 label, not the payload.
+    """
+    text: str
+    outcome: str
+
+
+@dataclass(frozen=True)
 class StepResult:
     """
     The result of applying a single tactic to a proof state. It is what you get back every time
@@ -44,11 +67,17 @@ class StepResult:
                       as its own state — not just the end result of the
                       whole chain — giving it somewhere real to backtrack
                       to instead of only the final outcome.
+        sent:         Every message actually handed to the Lean REPL for
+                      this tactic, in order, with how each came back.
+                      Usually one entry; more when a chain was split.
+                      Surfaced to the director so it can see what Lean was
+                      really asked, not only what it wrote.
     """
     next_state: ProofState
     tactic: str
     elapsed_ms: float = 0.0
     intermediate_states: tuple[ProofState, ...] = ()
+    sent: tuple[SentMessage, ...] = ()
 
     @property
     def success(self) -> bool:
