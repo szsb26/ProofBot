@@ -176,6 +176,41 @@ DIRECTOR_SYSTEM_PROMPT = (
 )
 
 
+class DirectorProducedNoText(Exception):
+    """The provider returned a well-formed response containing no text.
+
+    Not a transport failure — the request succeeded and the model ran. With
+    adaptive thinking, thinking tokens and output tokens share one max_tokens
+    budget, so a model that thinks deeply enough can exhaust the allowance
+    before writing a single character of answer: a `thinking` block, no
+    `text` block, stop_reason="max_tokens". Confirmed live for the one-shot
+    prover on imo1968_tetrahedron (see search/one_shot.py), where a hard
+    proof burned 8K, 20K, even 60K tokens of thinking without finishing.
+
+    Raised so the turn can be RECORDED for what it is. Returning "" instead
+    let parse_director_response fall through to its blind "simp" default,
+    which is indistinguishable in the ledger and the trace from the model
+    deliberately proposing simp — and, raising nothing, never counted toward
+    the consecutive-failure guard either. A run could spend turns on
+    invisible simps and finish looking like an ordinary failure.
+    """
+
+    def __init__(self, stop_reason: str | None, output_tokens: int,
+                 thinking_tokens: int | None, max_tokens: int):
+        self.stop_reason = stop_reason
+        self.output_tokens = output_tokens
+        self.thinking_tokens = thinking_tokens
+        self.max_tokens = max_tokens
+        thought = (f", {thinking_tokens} of them thinking"
+                   if thinking_tokens is not None else "")
+        super().__init__(
+            f"director produced no tactic: the model used {output_tokens} "
+            f"output tokens{thought} against a max_tokens of {max_tokens} "
+            f"and stopped with stop_reason={stop_reason!r} before writing "
+            f"any answer"
+        )
+
+
 @dataclass
 class DirectorResponse:
     """
@@ -201,6 +236,11 @@ class DirectorResponse:
     abandoned_state_ids: list[str]
     tactic: str
     reasoning: str = ""
+    # Set when the director returned no tactic at all (see
+    # DirectorProducedNoText). Holds the explanation to record against the
+    # chosen state, so the turn appears in the ledger as what it was rather
+    # than as a deliberate "simp".
+    no_tactic_reason: str = ""
     # Why the abandoned states were given up on. The prompt has always asked
     # for this field; until now it was parsed nowhere and discarded, so the
     # information was requested from the model every turn and thrown away.
@@ -761,6 +801,19 @@ class BaseLLMPolicy:
                 system_prompt=DIRECTOR_SYSTEM_PROMPT,
                 max_tokens=self._director_max_tokens,
                 enable_thinking=self._director_thinking,
+            )
+        except DirectorProducedNoText as e:
+            # NOT counted as an API failure: nothing went wrong in transport,
+            # and the consecutive-failure guard exists for conditions that
+            # fail every call. This one is budget-dependent and can resolve
+            # on the next turn against a different state.
+            self._consecutive_api_failures = 0
+            logger.warning("%s", e)
+            return DirectorResponse(
+                chosen_state_id=fallback_id,
+                abandoned_state_ids=[],
+                tactic="",
+                no_tactic_reason=str(e),
             )
         except Exception as e:
             self._consecutive_api_failures += 1

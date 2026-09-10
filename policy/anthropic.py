@@ -10,12 +10,19 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 
 import httpx
 from anthropic import AsyncAnthropic
 
-from policy.base import BaseLLMPolicy, DIRECTOR_SYSTEM_PROMPT
+logger = logging.getLogger(__name__)
+
+from policy.base import (
+    BaseLLMPolicy,
+    DIRECTOR_SYSTEM_PROMPT,
+    DirectorProducedNoText,
+)
 
 # The SDK's own default read timeout (600s) is measured between bytes
 # received, but a *non-streaming* call gives httpx nothing to measure until
@@ -27,6 +34,17 @@ from policy.base import BaseLLMPolicy, DIRECTOR_SYSTEM_PROMPT
 # progress to measure against, so a genuine stall fails fast instead of
 # hanging indefinitely.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=60.0, pool=60.0)
+# Extended thinking breaks the assumption above. The between-bytes read
+# timeout only protects us if bytes actually flow while the model works, and
+# with thinking enabled they do not: a director call measured 155s of wall
+# time for 15,897 output tokens (14,926 of them thinking) with no
+# intervening delta, so the 180s ceiling is close enough to trip. Measured
+# 2026-09-04: three of three thinking calls raised httpx.ReadTimeout under
+# _TIMEOUT and none did at 900s. Since a director turn that raises is
+# absorbed as a blind "simp" — and three in a row abort the run entirely
+# (_MAX_CONSECUTIVE_API_FAILURES) — --director-thinking was unusable on this
+# path until this existed.
+_THINKING_TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=60.0)
 
 
 class AnthropicPolicy(BaseLLMPolicy):
@@ -104,12 +122,55 @@ class AnthropicPolicy(BaseLLMPolicy):
             ],
             messages=[{"role": "user", "content": user_prompt}],
             thinking={"type": "adaptive"} if enable_thinking else {"type": "disabled"},
+            timeout=_THINKING_TIMEOUT if enable_thinking else _TIMEOUT,
         ) as stream:
             message = await stream.get_final_message()
         # Even with thinking disabled, find text block(s) by type rather
         # than assuming content[0] — cheap insurance against relying on
         # positional assumptions that already broke once.
-        return "".join(block.text for block in message.content if block.type == "text")
+        # Logged on EVERY call, not only the empty ones. stop_reason is a
+        # typed enum from the API, not prose we classify — nothing branches on
+        # it (the raise below triggers on the absence of text, which is ground
+        # truth). It is recorded so the distribution can be checked against
+        # reality rather than inferred from a 10-call sample: the only values
+        # observed so far are "end_turn" and "max_tokens", and "refusal" or
+        # "pause_turn" appearing would be worth knowing about. Anything other
+        # than a plain end_turn is surfaced at WARNING so it cannot pass
+        # unnoticed in a normal run.
+        stop_reason = getattr(message, "stop_reason", None)
+        usage = getattr(message, "usage", None)
+        details = getattr(usage, "output_tokens_details", None)
+        out_tokens = getattr(usage, "output_tokens", 0) or 0
+        think_tokens = getattr(details, "thinking_tokens", None)
+        logger.debug(
+            "director call: stop_reason=%r output_tokens=%d thinking_tokens=%s "
+            "max_tokens=%d", stop_reason, out_tokens, think_tokens,
+            max_tokens or self._max_tokens,
+        )
+        if stop_reason != "end_turn":
+            logger.warning(
+                "director call ended with stop_reason=%r (not 'end_turn'): "
+                "output_tokens=%d thinking_tokens=%s max_tokens=%d",
+                stop_reason, out_tokens, think_tokens,
+                max_tokens or self._max_tokens,
+            )
+
+        text = "".join(
+            block.text for block in message.content if block.type == "text"
+        )
+        if not text.strip():
+            # A well-formed response with no answer in it. Thinking tokens and
+            # output tokens share one max_tokens budget, so a model that
+            # thinks deeply enough never reaches the text. Surfaced rather
+            # than returned as "", which parse_director_response silently
+            # turns into a blind "simp" (see DirectorProducedNoText).
+            raise DirectorProducedNoText(
+                stop_reason=stop_reason,
+                output_tokens=out_tokens,
+                thinking_tokens=think_tokens,
+                max_tokens=max_tokens or self._max_tokens,
+            )
+        return text
 
     async def close(self) -> None:
         await self._client.close()

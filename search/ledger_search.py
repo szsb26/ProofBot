@@ -277,6 +277,18 @@ class LedgerSearch:
 
             ledger.set_reasoning(resp.chosen_state_id, resp.reasoning, calls)
 
+            if resp.no_tactic_reason:
+                # The director returned no tactic at all — it exhausted its
+                # token budget while thinking and never wrote an answer. Record
+                # it against the chosen state so the turn is visible as what it
+                # was; previously this arrived as a blind "simp" and was
+                # indistinguishable from the model proposing simp on purpose.
+                ledger.record_failure(
+                    resp.chosen_state_id, "(no tactic returned)",
+                    resp.no_tactic_reason,
+                )
+                continue
+
             if _contains_banned_tactic(resp.tactic):
                 # Nothing legitimate to run, but the turn must still leave a
                 # trace: record it as a failure so the next prompt shows the

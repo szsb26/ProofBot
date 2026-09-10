@@ -16,7 +16,13 @@ eval/harness.py's --trace flag (renders only for trials that fail).
 from __future__ import annotations
 
 from core.ledger import Ledger
-from policy.base import DIRECTOR_SYSTEM_PROMPT, DirectorResponse, parse_director_response, serialize_ledger
+from policy.base import (
+    DIRECTOR_SYSTEM_PROMPT,
+    DirectorProducedNoText,
+    DirectorResponse,
+    parse_director_response,
+    serialize_ledger,
+)
 
 
 class TracingPolicy:
@@ -69,12 +75,32 @@ class TracingPolicy:
         self._emit(prompt)
 
         fallback_id = next(iter(ledger.frontier))
-        raw_text = await self._inner._call_api(
-            prompt,
-            system_prompt=DIRECTOR_SYSTEM_PROMPT,
-            max_tokens=self._inner._director_max_tokens,
-            enable_thinking=self._inner._director_thinking,
-        )
+        try:
+            raw_text = await self._inner._call_api(
+                prompt,
+                system_prompt=DIRECTOR_SYSTEM_PROMPT,
+                max_tokens=self._inner._director_max_tokens,
+                enable_thinking=self._inner._director_thinking,
+            )
+        except DirectorProducedNoText as e:
+            # This wrapper calls _call_api directly rather than delegating to
+            # the inner get_next_action, so it does NOT inherit that method's
+            # handling — without this branch the exception escapes and kills
+            # the run, and only for TRACED runs, i.e. exactly the ones being
+            # analysed. Mirror the inner behaviour and record the turn.
+            self._emit(f"\n{'-' * 80}\nTURN {self.turn} — NO RESPONSE TEXT\n{'-' * 80}")
+            self._emit(str(e))
+            self._emit(f"\n{'-' * 80}\nTURN {self.turn} — PARSED DECISION\n{'-' * 80}")
+            self._emit(f"chosen_state: {fallback_id}")
+            self._emit("abandoned: []")
+            self._emit("reasoning: ")
+            self._emit("tactic: (none — see NO RESPONSE TEXT above)")
+            return DirectorResponse(
+                chosen_state_id=fallback_id,
+                abandoned_state_ids=[],
+                tactic="",
+                no_tactic_reason=str(e),
+            )
         self._emit(f"\n{'-' * 80}\nTURN {self.turn} — RAW RESPONSE FROM LLM\n{'-' * 80}")
         self._emit(raw_text)
 

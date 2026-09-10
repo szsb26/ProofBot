@@ -159,3 +159,48 @@ class TestTracingPolicyRecordsSystemPrompt:
 
         text = policy.render()
         assert text.index("SYSTEM PROMPT") < text.index("TURN 1 — PROMPT SENT TO LLM")
+
+
+class TestTracingPolicyRecordsANoTextTurn:
+    """A response carrying no answer must be recorded, not allowed to escape.
+
+    TracingPolicy calls the inner policy's _call_api DIRECTLY rather than
+    delegating to its get_next_action, so it does not inherit that method's
+    handling of DirectorProducedNoText. Without an explicit branch here the
+    exception propagates out of the search and kills the run — and only for
+    TRACED runs, which are exactly the ones being analysed.
+
+    Cause, measured 2026-09-04: thinking tokens and output tokens share one
+    max_tokens budget, so a deeply-thinking model stops at the ceiling before
+    writing anything. Two of ten director-shaped calls at max_tokens=16000
+    came back stop_reason='max_tokens', output_tokens=16000 exactly, a
+    thinking block and no text block.
+    """
+
+    async def test_turn_is_recorded_in_the_trace_and_does_not_raise(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from core.ledger import Ledger
+        from core.proof_state import make_proof_state
+        from core.trace import TracingPolicy
+        from policy.base import DirectorProducedNoText
+
+        inner = MagicMock()
+        inner._director_max_tokens = 16000
+        inner._director_thinking = True
+        inner._call_api = AsyncMock(side_effect=DirectorProducedNoText(
+            stop_reason="max_tokens", output_tokens=16000,
+            thinking_tokens=15980, max_tokens=16000,
+        ))
+        ledger = Ledger()
+        state_id = ledger.add_state(make_proof_state(["n + 0 = n"]))
+
+        tracer = TracingPolicy(inner)
+        resp = await tracer.get_next_action("theorem foo := by", ledger, [])
+
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
+        assert resp.chosen_state_id == state_id
+        rendered = tracer.render()
+        assert "NO RESPONSE TEXT" in rendered
+        assert "max_tokens" in rendered
+        assert "16000" in rendered

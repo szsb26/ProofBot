@@ -40,6 +40,28 @@ def _make_api_response(text: str) -> MagicMock:
     return response
 
 
+def _make_budget_exhausted_response(
+    output_tokens: int = 16000, thinking_tokens: int = 15980,
+    stop_reason: str = "max_tokens",
+) -> MagicMock:
+    """A well-formed response that contains no answer.
+
+    Thinking tokens and output tokens share one max_tokens budget, so a model
+    that thinks deeply enough hits the ceiling before writing any text: a
+    `thinking` block, no `text` block, stop_reason="max_tokens". Documented
+    live for the one-shot prover on imo1968_tetrahedron (search/one_shot.py).
+    Real ints, not MagicMocks, because the diagnosis message quotes them.
+    """
+    thinking_block = MagicMock()
+    thinking_block.type = "thinking"
+    response = MagicMock()
+    response.content = [thinking_block]
+    response.stop_reason = stop_reason
+    response.usage.output_tokens = output_tokens
+    response.usage.output_tokens_details.thinking_tokens = thinking_tokens
+    return response
+
+
 class _FakeStreamManager:
     """
     Fake for the object returned by client.messages.stream(...) -- an async
@@ -217,15 +239,70 @@ class TestAnthropicPolicyGetNextAction:
         assert resp.tactic == "simp"
         assert resp.abandoned_state_ids == []
 
-    async def test_empty_response_falls_back_to_simp(self, mock_policy):
+    async def test_response_with_no_text_is_reported_not_disguised_as_simp(
+        self, mock_policy
+    ):
+        """A response carrying no answer must not arrive as a deliberate simp.
+
+        Thinking tokens and output tokens share one max_tokens budget, so a
+        model that thinks deeply enough stops at the ceiling before writing
+        anything: a thinking block, no text block, stop_reason="max_tokens"
+        (documented live for the one-shot prover on imo1968_tetrahedron).
+        _call_api used to return "" for this, and parse_director_response
+        turned "" into its blind "simp" default — indistinguishable in the
+        ledger and the trace from the model proposing simp on purpose, and
+        raising nothing, so it never counted toward the consecutive-failure
+        guard either. A run could spend turns on invisible simps and finish
+        looking like an ordinary failure.
+        """
         policy, client = mock_policy
-        client.messages.stream.return_value = _FakeStreamManager(_make_api_response(""))
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_budget_exhausted_response()
+        )
         ledger, state_id = _ledger_with_one_state()
 
         resp = await policy.get_next_action("theorem foo := by", ledger, [])
 
+        assert resp.tactic == "", "must not invent a tactic the model never sent"
+        assert resp.no_tactic_reason, "the turn must carry its own explanation"
+        # the diagnosis has to name the cause, not just say "empty"
+        assert "max_tokens" in resp.no_tactic_reason
+        assert "16000" in resp.no_tactic_reason
+        assert "15980" in resp.no_tactic_reason
         assert resp.chosen_state_id == state_id
-        assert resp.tactic == "simp"
+
+    async def test_text_block_of_only_whitespace_counts_as_no_text(
+        self, mock_policy
+    ):
+        """The same condition can present as a present-but-empty text block."""
+        policy, client = mock_policy
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_api_response("   \n  ")
+        )
+        ledger, _ = _ledger_with_one_state()
+
+        resp = await policy.get_next_action("theorem foo := by", ledger, [])
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
+
+    async def test_a_no_text_turn_does_not_trip_the_failure_guard(
+        self, mock_policy
+    ):
+        """It is not a transport failure — the request succeeded and the model
+        ran. The consecutive-failure guard exists for conditions that fail
+        every call (spent credits, bad key); this one is budget-dependent and
+        can resolve next turn against a different state, so aborting the run
+        after three would be wrong."""
+        policy, client = mock_policy
+        client.messages.stream.return_value = _FakeStreamManager(
+            _make_budget_exhausted_response()
+        )
+        ledger, _ = _ledger_with_one_state()
+
+        for _ in range(5):
+            resp = await policy.get_next_action("theorem foo := by", ledger, [])
+            assert resp.no_tactic_reason
+        assert policy._consecutive_api_failures == 0
 
     async def test_close_delegates_to_client(self, mock_policy):
         policy, client = mock_policy
@@ -264,3 +341,60 @@ class TestAnthropicPolicyIntegration:
         assert isinstance(resp, DirectorResponse)
         assert isinstance(resp.tactic, str) and resp.tactic
         await policy.close()
+
+
+class TestStopReasonIsLoggedEveryCall:
+    """stop_reason is recorded on every call, not only the failing ones.
+
+    It is a typed enum from the API (end_turn / max_tokens / stop_sequence /
+    tool_use / pause_turn / refusal), not prose we classify, and NOTHING
+    branches on it — the no-text raise triggers on the absence of text, which
+    is ground truth. It is logged so its distribution can be checked against
+    reality instead of inferred from a small sample. This repo has been burned
+    once by heuristics over provider text: an error categoriser audited across
+    2847 real Lean errors had two of nine branches that never fired and a
+    catch-all holding a third of everything, and a wrong label was worse than
+    none. Pass the value through; classify nothing.
+    """
+
+    async def test_ordinary_call_logs_stop_reason_at_debug(self, mock_policy, caplog):
+        import logging
+        policy, client = mock_policy
+        msg = _make_api_response(_director_json())
+        msg.stop_reason = "end_turn"
+        msg.usage.output_tokens = 812
+        msg.usage.output_tokens_details.thinking_tokens = None
+        client.messages.stream.return_value = _FakeStreamManager(msg)
+        ledger, _ = _ledger_with_one_state()
+
+        with caplog.at_level(logging.DEBUG, logger="policy.anthropic"):
+            await policy.get_next_action("theorem foo := by", ledger, [])
+
+        ours = [r for r in caplog.records if r.name == "policy.anthropic"]
+        assert any("stop_reason='end_turn'" in r.getMessage()
+                   for r in ours if r.levelno == logging.DEBUG)
+        # a normal turn must not raise a warning, or warnings become noise
+        assert not [r for r in ours if r.levelno >= logging.WARNING]
+
+    async def test_unexpected_stop_reason_is_warned_even_with_text(
+        self, mock_policy, caplog
+    ):
+        """A truncated-but-parseable response is the dangerous case: the turn
+        looks fine, so nothing else flags it."""
+        import logging
+        policy, client = mock_policy
+        msg = _make_api_response(_director_json())
+        msg.stop_reason = "max_tokens"
+        msg.usage.output_tokens = 16000
+        msg.usage.output_tokens_details.thinking_tokens = 15000
+        client.messages.stream.return_value = _FakeStreamManager(msg)
+        ledger, _ = _ledger_with_one_state()
+
+        with caplog.at_level(logging.DEBUG, logger="policy.anthropic"):
+            resp = await policy.get_next_action("theorem foo := by", ledger, [])
+
+        assert resp.tactic == "simp"  # text was present and parsed
+        warned = [r for r in caplog.records
+                  if r.name == "policy.anthropic" and r.levelno >= logging.WARNING]
+        assert warned, "a non-end_turn stop must not pass unnoticed"
+        assert "max_tokens" in warned[0].getMessage()
