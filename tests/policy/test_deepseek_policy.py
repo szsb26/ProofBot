@@ -113,7 +113,14 @@ class TestDeepSeekPolicyGetNextAction:
         assert resp.chosen_state_id == state_id
         assert resp.tactic == "simp"
 
-    async def test_empty_response_falls_back_to_simp(self, mock_policy):
+    async def test_empty_response_is_reported_not_replaced_with_simp(
+        self, mock_policy
+    ):
+        """DeepSeek gets the same protection: parse_director_response is
+        shared by all three policies, so an unreadable response is recorded
+        rather than turned into a tactic the model never proposed. Only the
+        Anthropic path can use constrained decoding, which is why this
+        safety net lives in the shared parser."""
         policy, client = mock_policy
         client.chat.completions.create.return_value = _make_api_response("")
         ledger, state_id = _ledger_with_one_state()
@@ -121,7 +128,8 @@ class TestDeepSeekPolicyGetNextAction:
         resp = await policy.get_next_action("theorem foo := by", ledger, [])
 
         assert resp.chosen_state_id == state_id
-        assert resp.tactic == "simp"
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
 
     async def test_close_delegates_to_client(self, mock_policy):
         policy, client = mock_policy

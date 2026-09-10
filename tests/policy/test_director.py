@@ -684,26 +684,41 @@ class TestParseDirectorResponse:
         resp = parse_director_response(raw, fallback_state_id="fallback")
         assert resp.abandoned_state_ids == ["dead1", "dead2"]
 
-    def test_falls_back_on_malformed_json(self):
+    def test_malformed_json_is_reported_not_replaced_with_simp(self):
+        """A response we cannot read must not arrive as a tactic the model
+        never proposed. This used to return tactic="simp" plus an arbitrary
+        frontier state, and the ledger recorded both as the director's
+        choices — a harness failure wearing the model's face, and able to
+        silently redirect the search to a state it never chose."""
         resp = parse_director_response("not json at all", fallback_state_id="fb")
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
+        assert "could not be parsed" in resp.no_tactic_reason
+        assert "no fields recovered" in resp.no_tactic_reason
+        # the state was a fallback too, and must say so
+        assert "arbitrary open state" in resp.no_tactic_reason
         assert resp.chosen_state_id == "fb"
         assert resp.abandoned_state_ids == []
-        assert resp.tactic == "simp"
 
     def test_falls_back_when_chosen_state_missing(self):
         raw = json.dumps({"tactic": "simp"})
         resp = parse_director_response(raw, fallback_state_id="fb")
         assert resp.chosen_state_id == "fb"
 
-    def test_falls_back_tactic_to_simp_when_tactic_missing(self):
+    def test_missing_tactic_field_is_reported(self):
         raw = json.dumps({"chosen_state": "abc"})
         resp = parse_director_response(raw, fallback_state_id="fb")
-        assert resp.tactic == "simp"
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
+        # the state WAS recoverable, so no arbitrary-state note
+        assert resp.chosen_state_id == "abc"
+        assert "arbitrary open state" not in resp.no_tactic_reason
 
-    def test_falls_back_tactic_to_simp_when_tactic_blank(self):
+    def test_blank_tactic_field_is_reported(self):
         raw = json.dumps({"chosen_state": "abc", "tactic": ""})
         resp = parse_director_response(raw, fallback_state_id="fb")
-        assert resp.tactic == "simp"
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
 
     def test_allows_semicolon_chained_tactic(self):
         raw = json.dumps({"chosen_state": "abc", "tactic": "intro n; simp; ring"})
@@ -742,10 +757,11 @@ class TestParseDirectorResponse:
         resp = parse_director_response("not json at all", fallback_state_id="fb")
         assert resp.reasoning == ""
 
-    def test_tactic_field_not_a_string_falls_back_to_simp(self):
+    def test_tactic_field_of_the_wrong_type_is_reported(self):
         raw = json.dumps({"chosen_state": "abc", "tactic": ["simp", "ring"]})
         resp = parse_director_response(raw, fallback_state_id="fb")
-        assert resp.tactic == "simp"
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
 
 
 # ---------------------------------------------------------------------------
@@ -803,29 +819,47 @@ class TestParseDirectorResponseRecovery:
         assert resp.reasoning == (
             "The key insight is to use wlog on the maximal edge and then"
         )
-        # No tactic ever came through — still falls back to simp.
-        assert resp.tactic == "simp"
+        # No tactic ever came through — reported, not replaced. The partial
+        # reasoning is still kept: it is what the director can pass forward.
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
+        assert "reasoning" in resp.no_tactic_reason  # says what WAS recovered
         assert resp.chosen_state_id == "fb"
 
-    def test_recovers_tactic_cut_off_mid_string_falls_back_to_simp(self):
-        """A tactic string with no closing quote (cut off mid-write by the
-        token budget) has no complete value to recover — falls back to
-        simp rather than yielding a truncated, likely-invalid tactic."""
+    def test_tactic_cut_off_mid_string_is_reported_not_guessed(self):
+        """A tactic with no closing quote (cut off by the token budget) has no
+        complete value to recover. It must not be truncated into a
+        likely-invalid tactic, and must not be replaced by simp either.
+
+        This is the shape constrained decoding produces under max_tokens:
+        verified live, output_config with max_tokens=150 and 400 both returned
+        INVALID JSON cut mid-string. DirectorProducedNoText does not catch
+        those — it triggers on the absence of text, and here there is plenty.
+        """
         raw = (
             '{"reasoning": "ok", "chosen_state": "s1", '
             '"tactic": "have h : AB < AC + AD := by nlinari'
         )
         resp = parse_director_response(raw, fallback_state_id="fb")
-        assert resp.tactic == "simp"
+        assert resp.tactic == ""
+        assert resp.no_tactic_reason
+        # everything that DID survive is kept and reported
+        assert resp.reasoning == "ok"
+        assert resp.chosen_state_id == "s1"
+        assert "chosen_state" in resp.no_tactic_reason
 
-    def test_completely_unparseable_text_still_falls_back_cleanly(self):
+    def test_completely_unparseable_text_is_reported_with_an_excerpt(self):
+        """The excerpt is what makes the failure diagnosable from the ledger
+        alone — a refusal, a truncation and plain prose all look identical
+        without it."""
         resp = parse_director_response(
             "The model wrote prose instead of JSON this time.",
             fallback_state_id="fb",
         )
         assert resp.chosen_state_id == "fb"
         assert resp.reasoning == ""
-        assert resp.tactic == "simp"
+        assert resp.tactic == ""
+        assert "The model wrote prose instead of JSON" in resp.no_tactic_reason
 
 
 # ---------------------------------------------------------------------------

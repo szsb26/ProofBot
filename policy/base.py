@@ -248,6 +248,11 @@ class DirectorResponse:
     abandon_reason: str = ""
 
 
+# How much of an unparseable response to quote back in the failure record.
+# Enough to recognise what went wrong (a refusal, a truncation, prose with no
+# JSON at all) without pasting a whole turn into the next prompt.
+_MAX_UNPARSED_EXCERPT_LEN = 300
+
 _MAX_TRIED_TACTICS_SHOWN = 15
 # Outlier guard, not a routine trim. This was 100, which truncated 18% of all
 # tactics ever sent (486 of 2688) while the prompt tells the director "do not
@@ -734,10 +739,59 @@ def parse_director_response(text: str, fallback_state_id: str) -> DirectorRespon
     if abandon_reason is None:
         abandon_reason = _extract_json_string_field(text, "abandon_reason")
 
+    if not tactic or not tactic.strip():
+        # Neither the strict parse nor per-field recovery found a tactic.
+        # This used to substitute "simp" — and a frontier state — and the
+        # ledger then recorded both as the director's choices. That is a
+        # harness failure wearing the model's face: indistinguishable in the
+        # ledger and the trace from the model proposing simp on purpose, and
+        # able to silently redirect the search to a state it never chose.
+        # Measured across 7,436 recorded director turns it happened once, but
+        # the rate is about to change: constrained decoding (output_config)
+        # keeps the JSON well-formed only as far as it got, so a response
+        # truncated at max_tokens arrives here as an incomplete document
+        # rather than as no text at all — verified live, max_tokens=150 and
+        # 400 both returned invalid JSON under a schema. DirectorProducedNoText
+        # does not catch those; it triggers on the absence of text.
+        #
+        # Deliberately no third recovery tier. Guessing at provider output has
+        # a record here: the Lean error categoriser, audited over 2847 real
+        # errors, had two of nine branches that never fired and a catch-all
+        # holding a third of everything, and a wrong label proved worse than
+        # none. Report what happened and let the director see it.
+        recovered = [
+            name for name, value in (
+                ("chosen_state", chosen), ("reasoning", reasoning),
+                ("abandon_reason", abandon_reason),
+            ) if value
+        ]
+        detail = (
+            f"partial fields recovered ({', '.join(recovered)})"
+            if recovered else "no fields recovered"
+        )
+        state_note = (
+            "" if chosen else
+            "; the state id was not recoverable either, so this was filed "
+            "against an arbitrary open state rather than one you chose"
+        )
+        excerpt = " ".join(text.split())[:_MAX_UNPARSED_EXCERPT_LEN]
+        return DirectorResponse(
+            chosen_state_id=chosen or fallback_state_id,
+            abandoned_state_ids=abandoned,
+            tactic="",
+            reasoning=reasoning or "",
+            abandon_reason=abandon_reason or "",
+            no_tactic_reason=(
+                f"director response could not be parsed: no tactic field was "
+                f"recoverable from {len(text)} characters of response "
+                f"({detail}){state_note}. Response began: {excerpt!r}"
+            ),
+        )
+
     return DirectorResponse(
         chosen_state_id=chosen or fallback_state_id,
         abandoned_state_ids=abandoned,
-        tactic=tactic or "simp",
+        tactic=tactic,
         reasoning=reasoning or "",
         abandon_reason=abandon_reason or "",
     )

@@ -204,3 +204,42 @@ class TestTracingPolicyRecordsANoTextTurn:
         assert "NO RESPONSE TEXT" in rendered
         assert "max_tokens" in rendered
         assert "16000" in rendered
+
+
+class TestTracingPolicyRecordsAParseFailure:
+    """An unreadable response must be explained in the trace, not left blank.
+
+    TracingPolicy calls parse_director_response directly, so it sees the
+    no_tactic_reason path too. Without an explicit branch the trace prints an
+    empty "tactic:" line with nothing to explain it — which reads as the model
+    declining to propose anything, rather than as the harness being unable to
+    read what it sent.
+    """
+
+    async def test_parse_failure_is_explained_in_the_trace(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from core.ledger import Ledger
+        from core.proof_state import make_proof_state
+        from core.trace import TracingPolicy
+
+        inner = MagicMock()
+        inner._director_max_tokens = 16000
+        inner._director_thinking = False
+        # truncated mid-JSON: the shape constrained decoding produces when it
+        # runs out of max_tokens
+        inner._call_api = AsyncMock(return_value=(
+            '{"reasoning": "plan", "chosen_state": "s1", '
+            '"tactic": "have h : P := by nlinari'
+        ))
+        ledger = Ledger()
+        ledger.add_state(make_proof_state(["n + 0 = n"]))
+
+        tracer = TracingPolicy(inner)
+        resp = await tracer.get_next_action("theorem foo := by", ledger, [])
+
+        assert resp.tactic == ""
+        rendered = tracer.render()
+        assert "could not be parsed" in rendered
+        assert "parse failure:" in rendered
+        # what survived is still shown
+        assert "reasoning: plan" in rendered

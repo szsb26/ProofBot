@@ -109,7 +109,16 @@ class TracingPolicy:
         self._emit(f"chosen_state: {resp.chosen_state_id}")
         self._emit(f"abandoned: {resp.abandoned_state_ids}")
         self._emit(f"reasoning: {resp.reasoning}")
-        self._emit(f"tactic: {resp.tactic}")
+        if resp.no_tactic_reason:
+            # The response arrived but no tactic could be read out of it —
+            # truncated mid-JSON, a refusal, or prose with no JSON at all.
+            # Without this line the trace shows a blank "tactic:" and nothing
+            # to explain it, which is how a parse failure would read as the
+            # model simply not proposing anything.
+            self._emit("tactic: (none — response could not be parsed)")
+            self._emit(f"parse failure: {resp.no_tactic_reason}")
+        else:
+            self._emit(f"tactic: {resp.tactic}")
         return resp
 
     async def close(self) -> None:
